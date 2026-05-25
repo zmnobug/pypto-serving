@@ -182,6 +182,9 @@ class PrefillBatch:
     input_embeddings: torch.Tensor
     seq_lens: torch.Tensor
     kv_allocations: list[KvAllocation]
+    positions: torch.Tensor | None = None
+    block_table: torch.Tensor | None = None
+    slot_mapping: torch.Tensor | None = None
 
 
 @dataclass
@@ -220,3 +223,18 @@ class GenerateResult:
     text: str
     token_ids: list[int]
     finish_reason: str
+
+
+@dataclass
+class WorkerCommand:
+    """Command sent from main process to worker process."""
+    type: str  # "step" | "shutdown"
+    scheduler_output: object | None = None
+    finished_request_ids: list | None = None
+
+
+@dataclass
+class StepOutput:
+    """Result returned from worker process after executing a batch step."""
+    new_tokens: dict  # {request_id: int}
+    error: str | None = None

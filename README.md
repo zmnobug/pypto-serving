@@ -10,16 +10,18 @@ handling.
 ```text
 python/
   cli/                         pypto-serving CLI implementation
-  core/                        engine, scheduler, KV cache, model loading
+  core/                        engine, scheduler, KV cache, model loading, async serving
+  runtime/                     Simpler worker wrapper for NPU dispatch
 pypto-lib/                     submodule providing Qwen3-14B PyPTO kernels
 examples/
   pypto-serving                executable CLI wrapper
   model/qwen3_14b/
     cpu_generate.py            CPU reference generation example
     npu_generate.py            NPU generation/profiling example
-    npu_serving.json           sample interactive serving config
+    npu_serving.json           sample serving config
     runner/                    Qwen3 executors and runner glue
-tests/                         CLI and batching tests
+    src/                       PyPTO kernel/program builders
+tests/                         CLI, batching, E2E serving, and benchmark tests
 ```
 
 ## Quick Checks
@@ -48,42 +50,75 @@ python -m python.cli --help
 One-shot generation, non-L3 path:
 
 ```bash
-task-submit --device auto --max-time 0 --run \
-  "PTO2_RING_HEAP=536870912 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072 \
-  python examples/model/qwen3_14b/npu_generate.py \
-    --model-dir /data/linyifan/models/Qwen3-14B \
-    --prompt 'Huawei is' \
-    --platform a2a3 \
-    --max-seq-len 512 \
-    --max-new-tokens 5"
+python examples/model/qwen3_14b/npu_generate.py \
+  --model-dir /data/linyifan/models/Qwen3-14B \
+  --prompt 'Huawei is' \
+  --platform a2a3 \
+  --max-seq-len 512 \
+  --max-new-tokens 5
 ```
 
 One-shot generation, L3 path:
 
 ```bash
-task-submit --device auto --max-time 0 --run \
-  "PTO2_RING_HEAP=536870912 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072 \
-  python examples/model/qwen3_14b/npu_generate.py \
-    --model-dir /data/linyifan/models/Qwen3-14B \
-    --prompt 'Huawei is' \
-    --platform a2a3 \
-    --max-seq-len 512 \
-    --max-new-tokens 5 \
-    --l3"
+python examples/model/qwen3_14b/npu_generate.py \
+  --model-dir /data/linyifan/models/Qwen3-14B \
+  --prompt 'Huawei is' \
+  --platform a2a3 \
+  --max-seq-len 512 \
+  --max-new-tokens 5 \
+  --l3
 ```
 
 Interactive generation:
 
 ```bash
-task-submit --run -i \
-  "./examples/pypto-serving \
-    --config examples/model/qwen3_14b/npu_serving.json \
-    --device 0 \
-    --interactive"
+./examples/pypto-serving \
+  --config examples/model/qwen3_14b/npu_serving.json \
+  --device 0 \
+  --interactive
 ```
 
 At the `[user]` prompt, enter a prompt such as `Huawei is`; use `/exit` or
 `/quit` to leave the interactive session.
+
+## HTTP Serving (OpenAI-compatible API)
+
+Start the serving server with multiprocess worker:
+
+```bash
+python -m python.cli.main \
+  --config examples/model/qwen3_14b/npu_serving.json \
+  --serve --port 8899 --device {}
+```
+
+Test with curl:
+
+```bash
+# Health check
+curl http://localhost:8899/health
+
+# Completion
+curl http://localhost:8899/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Huawei is", "max_tokens": 32, "temperature": 0.0}'
+
+# Streaming
+curl http://localhost:8899/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Huawei is", "max_tokens": 32, "stream": true}'
+
+# Chat completion
+curl http://localhost:8899/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "What is 1+1?"}], "max_tokens": 32}'
+```
+
+Run the serving benchmark:
+
+```bash
+python tests/bench_serving.py --port 8899 --stream -n 8 -c 4 --max-tokens 16
+```
 
 ## Notes
 
@@ -97,3 +132,5 @@ At the `[user]` prompt, enter a prompt such as `Huawei is`; use `/exit` or
 - This repository expects PyPTO, CANN, torch, safetensors, transformers, and the
   local Ascend runtime environment to be available in the active Python
   environment.
+- HTTP serving mode additionally requires `fastapi`, `uvicorn`, and `pydantic`.
+  The benchmark script requires `aiohttp`.
