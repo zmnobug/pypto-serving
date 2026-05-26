@@ -16,7 +16,7 @@ import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
-from .block_pool import BlockPool
+from .kv_cache import KvCacheManager
 from .scheduler import Request, RequestStatus, Scheduler, SchedulerConfig, SchedulerOutput
 from .types import StepOutput, WorkerCommand
 from .serving_worker import WorkerConfig, WorkerProcess, spawn_worker
@@ -77,12 +77,22 @@ class AsyncLLMEngine:
         self.bos_token_id = bos_token_id
         self._in_process = in_process
 
-        num_blocks = self.config.num_blocks or (
-            self.config.max_num_running_reqs
-            * (self.config.max_seq_len // self.config.block_size + 1)
-        )
-        self.block_pool = BlockPool(
-            num_blocks=num_blocks, block_size=self.config.block_size
+        block_size = self.config.block_size
+        num_blocks = self.config.num_blocks
+        if self.worker_config.runtime_config is not None:
+            runtime = self.worker_config.runtime_config
+            block_size = runtime.page_size
+            max_blocks_per_seq = (runtime.max_seq_len + runtime.page_size - 1) // runtime.page_size
+            num_blocks = runtime.total_kv_pages or runtime.max_batch_size * max_blocks_per_seq
+        if num_blocks is None:
+            num_blocks = self.config.max_num_running_reqs * (
+                (self.config.max_seq_len + block_size - 1) // block_size
+            )
+        self.config.block_size = block_size
+        self.kv_cache_manager = KvCacheManager(
+            num_blocks=num_blocks,
+            block_size=block_size,
+            enable_prefix_cache=self.config.enable_prefix_cache,
         )
 
         scheduler_config = SchedulerConfig(
@@ -93,7 +103,7 @@ class AsyncLLMEngine:
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_chunk_prefill=self.config.enable_chunk_prefill,
         )
-        self.scheduler = Scheduler(config=scheduler_config, block_pool=self.block_pool)
+        self.scheduler = Scheduler(config=scheduler_config, kv_cache_manager=self.kv_cache_manager)
 
         self._request_contexts: dict[str, _RequestContext] = {}
         self._running = False

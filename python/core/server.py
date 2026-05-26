@@ -9,22 +9,20 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass
 
-from .async_engine import AsyncLLMEngine, ServingConfig, TokenOutput
+from .async_engine import AsyncLLMEngine
 from .types import GenerateConfig
 
 logger = logging.getLogger(__name__)
 
 try:
-    from fastapi import FastAPI, Request
+    from fastapi import FastAPI
     from fastapi.responses import JSONResponse, StreamingResponse
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel
 except ImportError as e:
     raise ImportError(
         "Serving requires fastapi and pydantic. Install with: pip install fastapi uvicorn sse-starlette pydantic"

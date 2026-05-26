@@ -1,3 +1,12 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
 """Verify prefix cache and chunk prefill work on NPU."""
 
 import asyncio
@@ -11,6 +20,20 @@ from python.core.async_engine import AsyncLLMEngine, ServingConfig
 from python.core.tokenizer import TransformersTokenizerAdapter
 from python.core.types import GenerateConfig, RuntimeConfig
 from python.core.serving_worker import WorkerConfig
+
+
+def build_prompt_with_min_tokens(tokenizer, min_tokens: int, max_tokens: int) -> str:
+    words = []
+    while True:
+        words.append(f"prefixword{len(words)}")
+        prompt = " ".join(words)
+        num_tokens = len(tokenizer.encode(prompt))
+        if num_tokens >= min_tokens:
+            if num_tokens > max_tokens:
+                raise RuntimeError(
+                    f"Unable to build prompt within token budget: {num_tokens} > {max_tokens}"
+                )
+            return prompt
 
 
 async def main():
@@ -60,8 +83,26 @@ async def main():
         tokenizer=tokenizer,
         eos_token_id=tokenizer.eos_token_id,
         bos_token_id=tokenizer.bos_token_id,
-        in_process=True,
     )
+
+    original_schedule = engine.scheduler.schedule
+    first_scheduled_computed_tokens: dict[str, int] = {}
+    prefill_step_counts: dict[str, int] = {}
+
+    def counted_schedule():
+        scheduler_output = original_schedule()
+        for scheduled in scheduler_output.scheduled_requests:
+            if scheduled.is_prefill:
+                prefill_step_counts[scheduled.request.request_id] = (
+                    prefill_step_counts.get(scheduled.request.request_id, 0) + 1
+                )
+                first_scheduled_computed_tokens.setdefault(
+                    scheduled.request.request_id,
+                    scheduled.num_computed_tokens,
+                )
+        return scheduler_output
+
+    engine.scheduler.schedule = counted_schedule
 
     await engine.start()
     print("Engine started\n")
@@ -70,10 +111,16 @@ async def main():
 
     # --- Test 1: Prefix Cache ---
     print("=== Test 1: Prefix Cache ===")
-    prompt = "The capital of France is"
+    prompt = build_prompt_with_min_tokens(
+        tokenizer,
+        min_tokens=page_size + 32,
+        max_tokens=360,
+    )
+    prompt_tokens = len(tokenizer.encode(prompt))
+    print(f"Shared prefix token count: {prompt_tokens} (block_size={page_size})")
 
     # First request: full prefill
-    print(f"Request 1: '{prompt}'")
+    print("Request 1: long shared prefix")
     t0 = time.time()
     async for output in engine.add_request("req-1", prompt, gen_config):
         if output.finished:
@@ -82,12 +129,15 @@ async def main():
     print(f"  Time: {t1 - t0:.2f}s, Output: {output.text[:50]}")
 
     # Check scheduler state: how many blocks are cached
-    cached_count = len(engine.block_pool.hash_to_block)
+    cached_count = len(engine.kv_cache_manager.hash_to_block)
     print(f"  Cached blocks in pool: {cached_count}")
+    if cached_count <= 0:
+        raise AssertionError("Prefix cache did not retain any full prompt blocks")
 
     # Second request with same prefix + extra
-    prompt2 = "The capital of France is Paris. The capital of Germany is"
-    print(f"Request 2: '{prompt2}'")
+    prompt2 = prompt + " continuation tokens for the second request"
+    prompt2_tokens = len(tokenizer.encode(prompt2))
+    print(f"Request 2: shared prefix + continuation ({prompt2_tokens} tokens)")
     t2 = time.time()
     async for output in engine.add_request("req-2", prompt2, gen_config):
         if output.finished:
@@ -95,11 +145,11 @@ async def main():
     t3 = time.time()
     print(f"  Time: {t3 - t2:.2f}s, Output: {output.text[:50]}")
 
-    # The second request should have reused some cached blocks
-    r2 = engine.scheduler.requests.get("req-2")
-    if r2 is None:
-        print("  (request already cleaned up)")
-    print(f"  Prefix cache hit validated by faster execution")
+    cached_tokens = first_scheduled_computed_tokens.get("req-2", 0)
+    print(f"  Request 2 cached prompt tokens: {cached_tokens}")
+    if cached_tokens < page_size:
+        raise AssertionError("Second request did not start from a cached full block")
+    print("  Prefix cache hit validated")
     print()
 
     # --- Test 2: Chunk Prefill ---
@@ -117,7 +167,11 @@ async def main():
             break
     t5 = time.time()
     print(f"  Time: {t5 - t4:.2f}s, Output: {output.text[:50]}")
-    print(f"  Chunk prefill completed (prompt was split into multiple steps)")
+    chunk_steps = prefill_step_counts.get("req-3", 0)
+    print(f"  Prefill steps: {chunk_steps}")
+    if chunk_steps < 2:
+        raise AssertionError("Chunk prefill did not split the long prompt")
+    print("  Chunk prefill completed")
     print()
 
     await engine.stop()

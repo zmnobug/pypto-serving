@@ -162,7 +162,7 @@ class WorkerProcess:
         seq_lens = []
         allocations = []
         block_tables = []
-        slot_mappings = []
+        slot_positions = []
 
         for sr in scheduled:
             request = sr.request
@@ -172,25 +172,16 @@ class WorkerProcess:
             chunk_tokens = request.prompt_token_ids[num_computed:num_computed + num_new]
             chunk_tokens_list.append(chunk_tokens)
 
-            positions = list(range(num_computed, num_computed + num_new))
+            positions = range(num_computed, num_computed + num_new)
             positions_list.append(positions)
 
-            context_len = num_computed + num_new
             seq_lens.append(num_new)
 
             alloc = self._get_or_update_allocation(request, sr.block_ids, num_computed)
             allocations.append(alloc)
 
             block_tables.append(sr.block_ids)
-
-            page_size = self.kv_cache_manager._pool(self.config.model_id).page_size
-            chunk_slots = []
-            for token_idx in range(num_computed, num_computed + num_new):
-                page_idx = token_idx // page_size
-                offset = token_idx % page_size
-                slot = sr.block_ids[page_idx] * page_size + offset
-                chunk_slots.append(slot)
-            slot_mappings.append(chunk_slots)
+            slot_positions.append(positions)
 
         max_chunk = max(len(t) for t in chunk_tokens_list)
         token_tensor = torch.zeros((batch_size, max_chunk), dtype=torch.long, device=device)
@@ -208,22 +199,15 @@ class WorkerProcess:
                 runtime_model, row
             )
             positions_tensor[i, : len(tokens)] = torch.tensor(
-                positions_list[i], dtype=torch.long, device=device
+                list(positions_list[i]), dtype=torch.long, device=device
             )
 
-        max_blocks = max(len(bt) for bt in block_tables)
-        block_table_tensor = torch.full(
-            (batch_size, max_blocks), -1, dtype=torch.int32, device=device
-        )
-        for i, bt in enumerate(block_tables):
-            block_table_tensor[i, : len(bt)] = torch.tensor(bt, dtype=torch.int32)
-
-        max_slots = max(len(sm) for sm in slot_mappings)
-        slot_mapping_tensor = torch.full(
-            (batch_size, max_slots), -1, dtype=torch.int32, device=device
-        )
-        for i, sm in enumerate(slot_mappings):
-            slot_mapping_tensor[i, : len(sm)] = torch.tensor(sm, dtype=torch.int32)
+        block_table_tensor = self.kv_cache_manager.block_table_for_block_ids_batch(block_tables).to(device)
+        slot_mapping_tensor = self.kv_cache_manager.slot_mapping_for_block_ids_batch(
+            self.config.model_id,
+            block_tables,
+            slot_positions,
+        ).to(device)
 
         prefill_result = self.executor.run_prefill(
             runtime_model,
@@ -332,13 +316,12 @@ class WorkerProcess:
         req_id = request.request_id
         if req_id in self._allocations:
             alloc = self._allocations[req_id]
-            alloc.page_ids = list(block_ids)
-            alloc.tokens_capacity = len(block_ids) * self.kv_cache_manager._pool(
-                self.config.model_id
-            ).page_size
-            alloc.tokens_used = num_computed_tokens
-            return alloc
-        alloc = self.kv_cache_manager.allocate_with_page_ids(
+            return self.kv_cache_manager.update_allocation_from_block_ids(
+                alloc,
+                block_ids,
+                num_computed_tokens,
+            )
+        alloc = self.kv_cache_manager.allocation_from_block_ids(
             self.config.model_id, req_id, block_ids, tokens_used=num_computed_tokens
         )
         self._allocations[req_id] = alloc

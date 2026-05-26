@@ -1,3 +1,12 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
 """Serving benchmark: measures TTFT (prefill), per-token decode latency, and throughput."""
 
 import argparse
@@ -106,7 +115,7 @@ async def run_bench(args):
         prompt = prompts[i % len(prompts)]
         tasks.append(prompt)
 
-    print(f"=== PyPTO Serving Benchmark ===")
+    print("=== PyPTO Serving Benchmark ===")
     print(f"Target: {url}")
     print(f"Requests: {args.num_requests}, Concurrency: {args.concurrency}")
     print(f"Max tokens: {args.max_tokens}, Temperature: {args.temperature}")
@@ -142,7 +151,7 @@ async def run_bench(args):
     throughput_req = len(successes) / t_total
     throughput_tok = total_tokens / t_total if total_tokens > 0 else 0
 
-    print(f"--- End-to-End ---")
+    print("--- End-to-End ---")
     print(f"Total time:      {t_total:.2f}s")
     print(f"Successful:      {len(successes)}/{args.num_requests}")
     print(f"Errors:          {len(errors)}")
@@ -154,7 +163,7 @@ async def run_bench(args):
     if args.stream:
         ttfts = sorted(r["ttft"] for r in successes)
         print()
-        print(f"--- TTFT (~ prefill) ---")
+        print("--- TTFT (~ prefill) ---")
         print(f"TTFT avg:        {sum(ttfts)/len(ttfts)*1000:.1f}ms")
         print(f"TTFT p50:        {percentile(ttfts, 0.5)*1000:.1f}ms")
         print(f"TTFT p99:        {percentile(ttfts, 0.99)*1000:.1f}ms")
@@ -165,14 +174,14 @@ async def run_bench(args):
         if all_intervals:
             all_intervals.sort()
             print()
-            print(f"--- Decode (per-token interval) ---")
+            print("--- Decode (per-token interval) ---")
             print(f"Tokens total:    {total_tokens}")
             print(f"Interval avg:    {sum(all_intervals)/len(all_intervals)*1000:.1f}ms")
             print(f"Interval p50:    {percentile(all_intervals, 0.5)*1000:.1f}ms")
             print(f"Interval p99:    {percentile(all_intervals, 0.99)*1000:.1f}ms")
 
     print()
-    print(f"--- Sample outputs ---")
+    print("--- Sample outputs ---")
     for r in successes[:3]:
         print(f"  [total={r['total']:.2f}s tokens={r['num_tokens']}] {r['text'][:80]}")
 

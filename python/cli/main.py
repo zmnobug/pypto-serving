@@ -294,8 +294,6 @@ def run_serve(
     disable_prefix_cache: bool = False,
     disable_chunk_prefill: bool = False,
 ) -> None:
-    import asyncio
-
     try:
         import uvicorn
     except ImportError as e:
@@ -365,7 +363,7 @@ def run_serve(
     print(f"  Chunked prefill threshold: {long_prefill_token_threshold}")
     print(f"  Prefix cache: {'enabled' if not disable_prefix_cache else 'disabled'}")
     print(f"  Chunk prefill: {'enabled' if not disable_chunk_prefill else 'disabled'}")
-    print(f"  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health")
+    print("  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
 

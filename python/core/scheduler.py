@@ -14,7 +14,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from .block_pool import BlockPool
+from .kv_cache import KvCacheManager
 
 
 class RequestStatus(Enum):
@@ -119,9 +119,9 @@ class RequestOutput:
 class Scheduler:
     """Continuous batching scheduler with chunked prefill and preemption."""
 
-    def __init__(self, config: SchedulerConfig, block_pool: BlockPool) -> None:
+    def __init__(self, config: SchedulerConfig, kv_cache_manager: KvCacheManager) -> None:
         self.config = config
-        self.block_pool = block_pool
+        self.kv_cache_manager = kv_cache_manager
         self.waiting: deque[Request] = deque()
         self.running: list[Request] = []
         self.requests: dict[str, Request] = {}
@@ -130,7 +130,7 @@ class Scheduler:
         if len(request.prompt_token_ids) > self.config.max_seq_len:
             request.prompt_token_ids = request.prompt_token_ids[: self.config.max_seq_len]
         if self.config.enable_prefix_cache:
-            request.block_hashes = self.block_pool.compute_block_hashes(request.prompt_token_ids)
+            request.block_hashes = self.kv_cache_manager.compute_block_hashes(request.prompt_token_ids)
         request.status = RequestStatus.WAITING
         self.waiting.append(request)
         self.requests[request.request_id] = request
@@ -225,10 +225,10 @@ class Scheduler:
 
             # Prefix cache lookup
             if self.config.enable_prefix_cache:
-                cached_blocks = self.block_pool.get_computed_blocks(request.prompt_token_ids)
+                cached_blocks = self.kv_cache_manager.get_computed_blocks(request.prompt_token_ids)
                 if cached_blocks:
                     request.cached_block_ids = [b.block_id for b in cached_blocks]
-                    request.num_computed_tokens = len(cached_blocks) * self.block_pool.block_size
+                    request.num_computed_tokens = len(cached_blocks) * self.kv_cache_manager.block_size
             else:
                 cached_blocks = []
 
@@ -243,8 +243,7 @@ class Scheduler:
 
             num_blocks_needed = self._blocks_needed(request, num_new)
             if not self._try_allocate_blocks(request, num_blocks_needed):
-                for block in cached_blocks:
-                    self.block_pool.release(block)
+                self.kv_cache_manager.release_cached_blocks(cached_blocks)
                 request.cached_block_ids = []
                 request.num_computed_tokens = 0
                 remaining_waiting.append(request)
@@ -336,19 +335,19 @@ class Scheduler:
     def _blocks_needed(self, request: Request, num_new_tokens: int) -> int:
         current_total_tokens = request.num_computed_tokens + num_new_tokens
         current_blocks = len(request.cached_block_ids) + len(request.allocated_block_ids)
-        needed_blocks = (current_total_tokens + self.block_pool.block_size - 1) // self.block_pool.block_size
+        block_size = self.kv_cache_manager.block_size
+        needed_blocks = (current_total_tokens + block_size - 1) // block_size
         return max(0, needed_blocks - current_blocks)
 
     def _try_allocate_blocks(self, request: Request, num_blocks: int) -> bool:
         if num_blocks <= 0:
             return True
-        if self.block_pool.num_free_blocks < num_blocks:
+        if self.kv_cache_manager.num_free_blocks < num_blocks:
             return False
-        for _ in range(num_blocks):
-            block = self.block_pool.allocate()
-            if block is None:
-                return False
-            request.allocated_block_ids.append(block.block_id)
+        block_ids = self.kv_cache_manager.allocate_block_ids(num_blocks)
+        if block_ids is None:
+            return False
+        request.allocated_block_ids.extend(block_ids)
         return True
 
     def _preempt_lowest_priority(
@@ -392,12 +391,10 @@ class Scheduler:
         return {"request": victim, "returned_tokens": returned_tokens}
 
     def _free_request_blocks(self, request: Request) -> None:
-        for block_id in request.cached_block_ids:
-            block = self.block_pool.blocks[block_id]
-            self.block_pool.release(block)
-        for block_id in request.allocated_block_ids:
-            block = self.block_pool.blocks[block_id]
-            self.block_pool.release(block)
+        self.kv_cache_manager.release_block_id_groups(
+            request.cached_block_ids,
+            request.allocated_block_ids,
+        )
         request.cached_block_ids = []
         request.allocated_block_ids = []
 
@@ -405,13 +402,12 @@ class Scheduler:
         """Register completed blocks in the prefix cache."""
         if not self.config.enable_prefix_cache:
             return
-        total_blocks_computed = request.num_computed_tokens // self.block_pool.block_size
+        total_blocks_computed = request.num_computed_tokens // self.kv_cache_manager.block_size
         already_cached = len(request.cached_block_ids)
         all_block_ids = request.cached_block_ids + request.allocated_block_ids
-
-        for i in range(already_cached, total_blocks_computed):
-            if i >= len(request.block_hashes) or i >= len(all_block_ids):
-                break
-            block_id = all_block_ids[i]
-            block = self.block_pool.blocks[block_id]
-            self.block_pool.cache_block(block, request.block_hashes[i])
+        self.kv_cache_manager.cache_block_ids(
+            all_block_ids,
+            request.block_hashes,
+            already_cached,
+            total_blocks_computed,
+        )
