@@ -19,7 +19,6 @@ import torch
 
 try:
     from python.core._profiling import StageTimer
-    from python.core.kv_cache import KvCacheManager
     from python.core.model_runner import ModelRunner
     from python.core.pypto_executor import PyptoExecutor as CorePyptoExecutor
     from python.core.types import (
@@ -40,7 +39,6 @@ try:
     )
 except ImportError:
     from python.core._profiling import StageTimer
-    from python.core.kv_cache import KvCacheManager
     from python.core.model_runner import ModelRunner
     from python.core.pypto_executor import PyptoExecutor as CorePyptoExecutor
     from python.core.types import (
@@ -157,7 +155,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
     def __init__(
         self,
-        kv_cache_manager: KvCacheManager,
+        kv_cache_manager=None,
         *,
         platform: str = "a2a3sim",
         device_id: int = 0,
@@ -187,7 +185,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return Qwen314BModelRunner(
             model_id=model_id,
             compiled=compiled,
-            kv_cache_manager=self._kv_cache_manager,
             platform=self._platform,
             device_id=self._device_id,
             save_kernels_dir=self._save_kernels_dir,

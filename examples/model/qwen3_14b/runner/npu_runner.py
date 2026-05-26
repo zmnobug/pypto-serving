@@ -18,7 +18,6 @@ import torch
 
 try:
     from python.core._profiling import StageTimer
-    from python.core.kv_cache import KvCacheManager
     from python.core.model_runner import ModelRunner
     from python.core.types import (
         DecodeBatch,
@@ -32,7 +31,6 @@ try:
     from python.runtime.worker import WorkerTensor
 except ImportError:
     from python.core._profiling import StageTimer
-    from python.core.kv_cache import KvCacheManager
     from python.core.model_runner import ModelRunner
     from python.core.types import (
         DecodeBatch,
@@ -141,15 +139,14 @@ class Qwen314BModelRunner(ModelRunner):
         *,
         model_id: str,
         compiled: _CompiledKernels,
-        kv_cache_manager: KvCacheManager,
         platform: str,
         device_id: int,
         save_kernels_dir: str | None,
         l3_trace: bool,
     ) -> None:
+        super().__init__()
         self._model_id = model_id
         self._compiled = compiled
-        self._kv_cache_manager = kv_cache_manager
         self._platform = platform
         self._device_id = device_id
         self._save_kernels_dir = save_kernels_dir
@@ -167,7 +164,7 @@ class Qwen314BModelRunner(ModelRunner):
         t_prefill_start = time.perf_counter()
 
         for layer_idx, layer in enumerate(compiled.layers):
-            k_cache, v_cache = self._kv_cache_manager.materialize_single_layer_cache(
+            k_cache, v_cache = self.materialize_single_layer_cache(
                 model.config.model_id,
                 layer_idx,
             )
@@ -209,9 +206,13 @@ class Qwen314BModelRunner(ModelRunner):
             )
 
         last_hidden_rows: list[torch.Tensor] = []
-        for batch_idx, alloc in enumerate(batch.kv_allocations):
+        actual_batch = int(batch.seq_lens.shape[0])
+        for batch_idx in range(actual_batch):
             seq_len = int(batch.seq_lens[batch_idx].item())
-            alloc.tokens_used = max(alloc.tokens_used, seq_len)
+            if batch_idx < len(batch.kv_allocations):
+                batch.kv_allocations[batch_idx].tokens_used = max(
+                    batch.kv_allocations[batch_idx].tokens_used, seq_len
+                )
             last_hidden_rows.append(hidden[batch_idx, seq_len - 1].float())
         last_hidden = torch.stack(last_hidden_rows)
         logits = self._project_logits(model, last_hidden)
@@ -229,7 +230,7 @@ class Qwen314BModelRunner(ModelRunner):
         hidden = decode_inputs.hidden
         dw = compiled.decode_weights
 
-        k_cache, v_cache = self._kv_cache_manager.materialize_full_layer_cache(
+        k_cache, v_cache = self.materialize_full_layer_cache(
             model.config.model_id,
         )
         refresh_kv_cache = model.config.model_id in self._l2_dirty_kv_models
@@ -288,8 +289,12 @@ class Qwen314BModelRunner(ModelRunner):
         final_hidden = out.float()
 
         logits = self._project_logits(model, final_hidden)
-        for batch_idx, alloc in enumerate(batch.kv_allocations):
-            alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
+        for batch_idx in range(final_hidden.shape[0]):
+            if batch_idx < len(batch.kv_allocations):
+                batch.kv_allocations[batch_idx].tokens_used = max(
+                    batch.kv_allocations[batch_idx].tokens_used,
+                    int(batch.seq_lens[batch_idx].item()),
+                )
         return DecodeResult(hidden_states=final_hidden, logits=logits)
 
     def _project_logits(self, model: RuntimeModel, hidden: torch.Tensor) -> torch.Tensor:
@@ -549,7 +554,7 @@ class Qwen314BModelRunner(ModelRunner):
         vocab_size = model.config.vocab_size
         padded_vocab = compiled.padded_vocab
 
-        k_cache_all, v_cache_all = self._kv_cache_manager.materialize_full_layer_cache(
+        k_cache_all, v_cache_all = self.materialize_full_layer_cache(
             model.config.model_id,
         )
         _mark("kv_cache_materialize")
@@ -950,7 +955,8 @@ class Qwen314BModelRunner(ModelRunner):
         batch: PrefillBatch,
     ) -> _PrefillInputs:
         """Pack variable-length prefill requests into kernel input tensors."""
-        actual_batch = self._validate_batch_size(model, len(batch.kv_allocations))
+        batch_count = len(batch.kv_allocations) if batch.kv_allocations else int(batch.seq_lens.shape[0])
+        actual_batch = self._validate_batch_size(model, batch_count)
         max_seq = model.runtime.max_seq_len
         hidden_size = model.config.hidden_size
         max_blocks = self._max_blocks_per_seq(model)
@@ -962,7 +968,8 @@ class Qwen314BModelRunner(ModelRunner):
         block_table = torch.full((actual_batch * max_blocks,), -1, dtype=torch.int32)
         slot_mapping = torch.full((actual_batch * max_seq,), -1, dtype=torch.int32)
 
-        for batch_idx, alloc in enumerate(batch.kv_allocations):
+        for batch_idx in range(actual_batch):
+            alloc = batch.kv_allocations[batch_idx] if batch_idx < len(batch.kv_allocations) else None
             seq_len = int(batch.seq_lens[batch_idx].item())
             if seq_len <= 0:
                 raise ValueError("prefill seq_lens must be positive")
@@ -985,11 +992,13 @@ class Qwen314BModelRunner(ModelRunner):
                 slot_mapping[
                     batch_idx * max_seq : batch_idx * max_seq + valid_slots
                 ] = sm_row[:valid_slots].to(torch.int32).cpu()
-            else:
+            elif alloc is not None:
                 self._write_block_table_row(block_table, batch_idx, max_blocks, alloc)
-                slot_row = self._kv_cache_manager.slot_mapping_for_positions(
-                    alloc,
+                from python.core.kv_cache import slot_mapping_for_positions as _slot_mapping_for_positions
+                slot_row = _slot_mapping_for_positions(
+                    alloc.page_ids,
                     seq_len,
+                    self._kv_page_sizes[model.config.model_id],
                     max_tokens=max_seq,
                 )
                 slot_mapping[batch_idx * max_seq : (batch_idx + 1) * max_seq] = slot_row
@@ -1008,16 +1017,20 @@ class Qwen314BModelRunner(ModelRunner):
         batch: DecodeBatch,
     ) -> _DecodeInputs:
         """Pack active decode requests into fused decode-kernel inputs."""
-        actual_batch = self._validate_batch_size(model, len(batch.kv_allocations))
+        batch_count = len(batch.kv_allocations) if batch.kv_allocations else int(batch.seq_lens.shape[0])
+        actual_batch = self._validate_batch_size(model, batch_count)
         hidden_size = model.config.hidden_size
         max_blocks = self._max_blocks_per_seq(model)
+
+        has_precomputed = batch.slot_mapping is not None and batch.block_table is not None
 
         hidden = torch.zeros((actual_batch, hidden_size), dtype=torch.bfloat16)
         seq_lens = torch.empty((actual_batch,), dtype=torch.int32)
         block_table = torch.full((actual_batch * max_blocks,), -1, dtype=torch.int32)
         slot_mapping = torch.empty((actual_batch,), dtype=torch.int32)
 
-        for batch_idx, alloc in enumerate(batch.kv_allocations):
+        for batch_idx in range(actual_batch):
+            alloc = batch.kv_allocations[batch_idx] if batch_idx < len(batch.kv_allocations) else None
             seq_len = int(batch.seq_lens[batch_idx].item())
             if seq_len <= 0:
                 raise ValueError("decode seq_lens must be positive")
@@ -1027,8 +1040,20 @@ class Qwen314BModelRunner(ModelRunner):
                 )
             hidden[batch_idx, :] = batch.hidden_states[batch_idx].to(torch.bfloat16).cpu()
             seq_lens[batch_idx] = seq_len
-            self._write_block_table_row(block_table, batch_idx, max_blocks, alloc)
-            slot_mapping[batch_idx] = self._kv_cache_manager.slot_mapping_for_request(alloc)
+
+            if has_precomputed:
+                bt_row = batch.block_table[batch_idx]
+                valid_blocks = (bt_row >= 0).sum().item()
+                block_table[
+                    batch_idx * max_blocks : batch_idx * max_blocks + valid_blocks
+                ] = bt_row[:valid_blocks].to(torch.int32).cpu()
+                slot_mapping[batch_idx] = batch.slot_mapping[batch_idx].to(torch.int32).cpu()
+            elif alloc is not None:
+                self._write_block_table_row(block_table, batch_idx, max_blocks, alloc)
+                from python.core.kv_cache import slot_mapping_for_decode as _slot_mapping_for_decode
+                slot_mapping[batch_idx] = _slot_mapping_for_decode(
+                    alloc.page_ids, alloc.tokens_used, self._kv_page_sizes[model.config.model_id]
+                )
 
         return _DecodeInputs(
             actual_batch=actual_batch,

@@ -391,7 +391,7 @@ class Scheduler:
         return {"request": victim, "returned_tokens": returned_tokens}
 
     def _free_request_blocks(self, request: Request) -> None:
-        self.kv_cache_manager.release_block_id_groups(
+        self.kv_cache_manager.release_blocks_by_ids(
             request.cached_block_ids,
             request.allocated_block_ids,
         )

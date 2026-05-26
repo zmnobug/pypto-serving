@@ -31,8 +31,8 @@ from .types import (
 class ModelExecutor(ABC):
     """Backend-neutral interface used by ``LLMEngine`` to execute generation."""
 
-    def __init__(self, kv_cache_manager: KvCacheManager) -> None:
-        """Store the KV cache manager shared with the engine."""
+    def __init__(self, kv_cache_manager: KvCacheManager | None = None) -> None:
+        """Store the KV cache manager shared with the engine (optional for serving path)."""
         self._kv_cache_manager = kv_cache_manager
 
     @contextlib.contextmanager

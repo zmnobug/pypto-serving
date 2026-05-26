@@ -81,6 +81,8 @@ class FreeKVCacheBlockQueue:
         return block
 
     def remove(self, block: KVCacheBlock) -> None:
+        if block != self.head and block != self.tail and block.prev_free is None and block.next_free is None:
+            return
         prev_b = block.prev_free
         next_b = block.next_free
         if prev_b is not None:
@@ -200,42 +202,6 @@ class KvCacheManager:
             tokens_used=0,
         )
 
-    def allocate_with_page_ids(
-        self, model_id: str, request_id: str, page_ids: list[int], tokens_used: int = 0
-    ) -> KvAllocation:
-        """Create a KvAllocation using externally-assigned page IDs from the scheduler."""
-        return self.allocation_from_block_ids(model_id, request_id, page_ids, tokens_used)
-
-    def allocation_from_block_ids(
-        self,
-        model_id: str,
-        request_id: str,
-        block_ids: list[int],
-        tokens_used: int = 0,
-    ) -> KvAllocation:
-        """Create a ``KvAllocation`` view over scheduler-assigned physical blocks."""
-        pool = self._pool(model_id)
-        return KvAllocation(
-            request_id=request_id,
-            model_id=model_id,
-            page_ids=list(block_ids),
-            tokens_capacity=len(block_ids) * pool.page_size,
-            tokens_used=tokens_used,
-        )
-
-    def update_allocation_from_block_ids(
-        self,
-        alloc: KvAllocation,
-        block_ids: list[int],
-        tokens_used: int,
-    ) -> KvAllocation:
-        """Update an existing ``KvAllocation`` view from scheduler-assigned blocks."""
-        pool = self._pool(alloc.model_id)
-        alloc.page_ids = list(block_ids)
-        alloc.tokens_capacity = len(block_ids) * pool.page_size
-        alloc.tokens_used = tokens_used
-        return alloc
-
     def allocate_blocks(self, num_blocks: int) -> list[KVCacheBlock] | None:
         """Allocate physical KV blocks, evicting stale prefix hashes as needed."""
         if num_blocks <= 0:
@@ -263,15 +229,11 @@ class KvCacheManager:
             return None
         return [block.block_id for block in blocks]
 
-    def release_blocks_by_ids(self, block_ids: list[int]) -> None:
-        """Release request references for the given physical block IDs."""
-        for block_id in block_ids:
-            self.release(self.blocks[block_id])
-
-    def release_block_id_groups(self, *block_id_groups: list[int]) -> None:
-        """Release several block ID groups in order."""
+    def release_blocks_by_ids(self, *block_id_groups: list[int]) -> None:
+        """Release request references for one or more groups of physical block IDs."""
         for block_ids in block_id_groups:
-            self.release_blocks_by_ids(block_ids)
+            for block_id in block_ids:
+                self.release(self.blocks[block_id])
 
     def release_cached_blocks(self, blocks: list[KVCacheBlock]) -> None:
         """Release cached block objects returned by ``get_computed_blocks``."""
@@ -322,42 +284,31 @@ class KvCacheManager:
         if block.ref_cnt == 0:
             self.free_queue.append(block)
 
+    def _iter_block_hashes(self, token_ids: list[int]):
+        """Yield (block_index, block_hash) for each full block in the token sequence."""
+        parent_hash = NONE_HASH
+        num_full_blocks = len(token_ids) // self.block_size
+        for i in range(num_full_blocks):
+            start = i * self.block_size
+            block_tokens = tuple(token_ids[start : start + self.block_size])
+            parent_hash = hash_block_tokens(parent_hash, block_tokens)
+            yield i, parent_hash
+
     def get_computed_blocks(self, token_ids: list[int]) -> list[KVCacheBlock]:
         """Find the longest full-block cached prefix for the token sequence."""
         if not self.enable_prefix_cache:
             return []
         hit_blocks: list[KVCacheBlock] = []
-        parent_hash = NONE_HASH
-        num_full_blocks = len(token_ids) // self.block_size
-
-        for i in range(num_full_blocks):
-            start = i * self.block_size
-            end = start + self.block_size
-            block_tokens = tuple(token_ids[start:end])
-            block_hash = hash_block_tokens(parent_hash, block_tokens)
+        for _, block_hash in self._iter_block_hashes(token_ids):
             block = self.get_cached_block(block_hash)
             if block is None:
                 break
             hit_blocks.append(block)
-            parent_hash = block_hash
-
         return hit_blocks
 
     def compute_block_hashes(self, token_ids: list[int]) -> list[int]:
         """Compute chained hashes for all full blocks in the token sequence."""
-        hashes: list[int] = []
-        parent_hash = NONE_HASH
-        num_full_blocks = len(token_ids) // self.block_size
-
-        for i in range(num_full_blocks):
-            start = i * self.block_size
-            end = start + self.block_size
-            block_tokens = tuple(token_ids[start:end])
-            block_hash = hash_block_tokens(parent_hash, block_tokens)
-            hashes.append(block_hash)
-            parent_hash = block_hash
-
-        return hashes
+        return [block_hash for _, block_hash in self._iter_block_hashes(token_ids)]
 
     def ensure_one_more_slot(self, alloc: KvAllocation) -> int:
         """Ensure a request has capacity for one more token and return its slot."""
@@ -371,55 +322,15 @@ class KvCacheManager:
             alloc.tokens_capacity = len(alloc.page_ids) * pool.page_size
         return self.slot_mapping_for_request(alloc, alloc.tokens_used)
 
-    def block_table_for_request(self, alloc: KvAllocation) -> torch.Tensor:
-        """Return the page IDs for one request as an int32 tensor."""
-        return torch.tensor(alloc.page_ids, dtype=torch.int32)
-
     def block_table_for_batch(self, allocations: list[KvAllocation]) -> torch.Tensor:
         """Return a dense ``[batch, max_blocks]`` block table for requests."""
-        max_blocks = max((len(alloc.page_ids) for alloc in allocations), default=0)
-        table = torch.full((len(allocations), max_blocks), -1, dtype=torch.int32)
-        for row, alloc in enumerate(allocations):
-            if alloc.page_ids:
-                table[row, : len(alloc.page_ids)] = torch.tensor(alloc.page_ids, dtype=torch.int32)
-        return table
-
-    def block_table_for_block_ids_batch(self, block_ids_batch: list[list[int]]) -> torch.Tensor:
-        """Return a dense ``[batch, max_blocks]`` block table from physical block IDs."""
-        max_blocks = max((len(block_ids) for block_ids in block_ids_batch), default=0)
-        table = torch.full((len(block_ids_batch), max_blocks), -1, dtype=torch.int32)
-        for row, block_ids in enumerate(block_ids_batch):
-            if block_ids:
-                table[row, : len(block_ids)] = torch.tensor(block_ids, dtype=torch.int32)
-        return table
-
-    def block_table_for_batch_padded(self, allocations: list[KvAllocation]) -> torch.Tensor:
-        """Return a flat ``[B * max_blocks_per_seq]`` block table, -1 padded.
-
-        This matches the paged-attention layout the bundled fused decode kernel
-        expects: row ``b`` occupies ``[b * max_blocks_per_seq, (b+1) * max_blocks_per_seq)``,
-        with unused trailing slots set to -1.
-        """
-        if not allocations:
-            return torch.empty((0,), dtype=torch.int32)
-        pool = self._pool(allocations[0].model_id)
-        max_blocks = pool.max_blocks_per_seq
-        table = torch.full((len(allocations) * max_blocks,), -1, dtype=torch.int32)
-        for row, alloc in enumerate(allocations):
-            if alloc.page_ids:
-                row_start = row * max_blocks
-                table[row_start : row_start + len(alloc.page_ids)] = torch.tensor(
-                    alloc.page_ids, dtype=torch.int32,
-                )
-        return table
+        return block_table_from_block_ids([alloc.page_ids for alloc in allocations])
 
     def slot_mapping_for_request(self, alloc: KvAllocation, token_index: int | None = None) -> int:
         """Return the physical slot index for a request token."""
         pool = self._pool(alloc.model_id)
         logical_index = alloc.tokens_used if token_index is None else token_index
-        page_idx = logical_index // pool.page_size
-        offset = logical_index % pool.page_size
-        return alloc.page_ids[page_idx] * pool.page_size + offset
+        return slot_mapping_for_decode(alloc.page_ids, logical_index, pool.page_size)
 
     def slot_mapping_for_batch(self, allocations: list[KvAllocation]) -> torch.Tensor:
         """Return current decode slot mappings for a batch."""
@@ -427,39 +338,6 @@ class KvCacheManager:
             [self.slot_mapping_for_request(alloc) for alloc in allocations],
             dtype=torch.int32,
         )
-
-    def slot_mapping_for_block_ids(
-        self,
-        model_id: str,
-        block_ids: list[int],
-        token_indices: range | list[int],
-    ) -> torch.Tensor:
-        """Return physical slot IDs for absolute token indices in one request."""
-        pool = self._pool(model_id)
-        slots = []
-        for token_index in token_indices:
-            page_idx = token_index // pool.page_size
-            offset = token_index % pool.page_size
-            slots.append(block_ids[page_idx] * pool.page_size + offset)
-        return torch.tensor(slots, dtype=torch.int32)
-
-    def slot_mapping_for_block_ids_batch(
-        self,
-        model_id: str,
-        block_ids_batch: list[list[int]],
-        token_indices_batch: list[range | list[int]],
-    ) -> torch.Tensor:
-        """Return a padded ``[batch, max_tokens]`` slot mapping from block IDs."""
-        mappings = [
-            self.slot_mapping_for_block_ids(model_id, block_ids, token_indices)
-            for block_ids, token_indices in zip(block_ids_batch, token_indices_batch, strict=True)
-        ]
-        max_slots = max((mapping.numel() for mapping in mappings), default=0)
-        table = torch.full((len(mappings), max_slots), -1, dtype=torch.int32)
-        for row, mapping in enumerate(mappings):
-            if mapping.numel() > 0:
-                table[row, : mapping.numel()] = mapping
-        return table
 
     def slot_mapping_for_positions(
         self,
@@ -469,11 +347,8 @@ class KvCacheManager:
         max_tokens: int | None = None,
     ) -> torch.Tensor:
         """Return per-position slot mappings, optionally padded with -1."""
-        size = num_tokens if max_tokens is None else max_tokens
-        mapping = torch.full((size,), -1, dtype=torch.int32)
-        for token_index in range(num_tokens):
-            mapping[token_index] = self.slot_mapping_for_request(alloc, token_index)
-        return mapping
+        pool = self._pool(alloc.model_id)
+        return slot_mapping_for_positions(alloc.page_ids, num_tokens, pool.page_size, max_tokens=max_tokens)
 
     def write_tokens(
         self,
@@ -495,30 +370,6 @@ class KvCacheManager:
             pool.key_pages[layer_idx, physical_page, :, offset, :] = keys[row]
             pool.value_pages[layer_idx, physical_page, :, offset, :] = values[row]
         alloc.tokens_used = max(alloc.tokens_used, start_token_index + keys.shape[0])
-
-    def ingest_prefill_cache(
-        self,
-        layer_idx: int,
-        alloc: KvAllocation,
-        keys_flat: torch.Tensor,
-        values_flat: torch.Tensor,
-        *,
-        max_seq: int,
-        seq_len: int,
-    ) -> None:
-        """Import flattened prefill K/V tensors into the paged cache."""
-        pool = self._pool(alloc.model_id)
-        keys = (
-            keys_flat.view(pool.num_kv_heads, max_seq, pool.head_dim)[:, :seq_len, :]
-            .permute(1, 0, 2)
-            .contiguous()
-        )
-        values = (
-            values_flat.view(pool.num_kv_heads, max_seq, pool.head_dim)[:, :seq_len, :]
-            .permute(1, 0, 2)
-            .contiguous()
-        )
-        self.write_tokens(layer_idx, alloc, 0, keys, values)
 
     def read_context(
         self,
@@ -595,9 +446,73 @@ class KvCacheManager:
             raise KeyError(f"Model {model_id} is not registered with the KV cache manager.")
         return self._pools[model_id]
 
-    def _take_pages(self, pool: _CachePool, num_pages: int) -> list[int]:
-        """Compatibility wrapper returning block IDs from the unified pool."""
-        blocks = self.allocate_blocks(num_pages)
-        if blocks is None:
-            raise RuntimeError(f"Insufficient KV cache capacity: requested {num_pages} pages.")
-        return [block.block_id for block in blocks]
+
+# ---------------------------------------------------------------------------
+# Standalone utility functions for block-table / slot-mapping computation.
+# These are pure math (no allocation state) and can be used directly by
+# the serving worker without a KvCacheManager instance.
+# ---------------------------------------------------------------------------
+
+def block_table_from_block_ids(block_ids_batch: list[list[int]]) -> torch.Tensor:
+    """Return a dense ``[batch, max_blocks]`` int32 block table from physical block IDs."""
+    max_blocks = max((len(bids) for bids in block_ids_batch), default=0)
+    table = torch.full((len(block_ids_batch), max_blocks), -1, dtype=torch.int32)
+    for row, block_ids in enumerate(block_ids_batch):
+        if block_ids:
+            table[row, : len(block_ids)] = torch.tensor(block_ids, dtype=torch.int32)
+    return table
+
+
+def slot_mapping_from_block_ids(
+    block_ids: list[int],
+    token_indices: range | list[int],
+    page_size: int,
+) -> torch.Tensor:
+    """Return physical slot IDs for absolute token indices in one request."""
+    slots = []
+    for token_index in token_indices:
+        page_idx = token_index // page_size
+        offset = token_index % page_size
+        slots.append(block_ids[page_idx] * page_size + offset)
+    return torch.tensor(slots, dtype=torch.int32)
+
+
+def slot_mapping_from_block_ids_batch(
+    block_ids_batch: list[list[int]],
+    token_indices_batch: list[range | list[int]],
+    page_size: int,
+) -> torch.Tensor:
+    """Return a padded ``[batch, max_tokens]`` int32 slot mapping from block IDs."""
+    mappings = [
+        slot_mapping_from_block_ids(block_ids, token_indices, page_size)
+        for block_ids, token_indices in zip(block_ids_batch, token_indices_batch, strict=True)
+    ]
+    max_slots = max((mapping.numel() for mapping in mappings), default=0)
+    table = torch.full((len(mappings), max_slots), -1, dtype=torch.int32)
+    for row, mapping in enumerate(mappings):
+        if mapping.numel() > 0:
+            table[row, : mapping.numel()] = mapping
+    return table
+
+
+def slot_mapping_for_decode(page_ids: list[int], tokens_used: int, page_size: int) -> int:
+    """Return the single physical slot for a decode step."""
+    page_idx = tokens_used // page_size
+    offset = tokens_used % page_size
+    return page_ids[page_idx] * page_size + offset
+
+
+def slot_mapping_for_positions(
+    page_ids: list[int],
+    num_tokens: int,
+    page_size: int,
+    max_tokens: int | None = None,
+) -> torch.Tensor:
+    """Return per-position slot mappings, optionally padded with -1."""
+    size = num_tokens if max_tokens is None else max_tokens
+    mapping = torch.full((size,), -1, dtype=torch.int32)
+    for token_index in range(num_tokens):
+        page_idx = token_index // page_size
+        offset = token_index % page_size
+        mapping[token_index] = page_ids[page_idx] * page_size + offset
+    return mapping

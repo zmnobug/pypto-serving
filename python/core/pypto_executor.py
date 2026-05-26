@@ -31,7 +31,7 @@ class PyptoExecutor(ModelExecutor, ABC):
 
     def __init__(
         self,
-        kv_cache_manager: KvCacheManager,
+        kv_cache_manager: KvCacheManager | None = None,
         *,
         platform: str = "a2a3sim",
         device_id: int = 0,
@@ -49,7 +49,9 @@ class PyptoExecutor(ModelExecutor, ABC):
         """Compile kernels for ``record`` and attach a runner to ``model_id``."""
         compiled = self._compile_model(record.runtime_model)
         self._compiled[model_id] = compiled
-        self._runners[model_id] = self._create_runner(model_id, compiled)
+        runner = self._create_runner(model_id, compiled)
+        runner.init_kv_cache(model_id, record.config, record.runtime)
+        self._runners[model_id] = runner
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Delegate prefill execution to the registered model runner."""

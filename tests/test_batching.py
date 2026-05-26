@@ -91,12 +91,12 @@ def test_prefill_inputs_use_actual_user_batch_without_padding_lanes():
     runner = ModelRunner(
         model_id=model.config.model_id,
         compiled=None,  # type: ignore[arg-type]
-        kv_cache_manager=manager,
         platform="a2a3sim",
         device_id=0,
         save_kernels_dir=None,
         l3_trace=False,
     )
+    runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
     allocations = [
         manager.allocate_for_prompt(model.config.model_id, f"req-{idx}", idx + 1)
         for idx in range(2)
@@ -145,12 +145,12 @@ def test_decode_inputs_use_actual_user_batch_without_padding_lanes():
     runner = ModelRunner(
         model_id=model.config.model_id,
         compiled=None,  # type: ignore[arg-type]
-        kv_cache_manager=manager,
         platform="a2a3sim",
         device_id=0,
         save_kernels_dir=None,
         l3_trace=False,
     )
+    runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
     alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 1)
     hidden_states = torch.ones(1, model.config.hidden_size)
 
@@ -221,15 +221,16 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         decode_weights=executor._stack_decode_weights([cached_layer]),
     )
     executor._compiled[model.config.model_id] = compiled
-    executor._runners[model.config.model_id] = ModelRunner(
+    runner = ModelRunner(
         model_id=model.config.model_id,
         compiled=compiled,
-        kv_cache_manager=manager,
         platform=executor._platform,
         device_id=executor._device_id,
         save_kernels_dir=executor._save_kernels_dir,
         l3_trace=executor._l3_trace,
     )
+    runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
+    executor._runners[model.config.model_id] = runner
     monkeypatch.setattr(
         PyptoExecutor,
         "_kernel_weight",
