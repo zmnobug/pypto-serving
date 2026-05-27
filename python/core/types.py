@@ -191,7 +191,7 @@ class PrefillBatch:
 class PrefillResult:
     """Outputs from prompt prefill."""
 
-    last_hidden: torch.Tensor
+    last_hidden: torch.Tensor | None
     logits: torch.Tensor
 
 

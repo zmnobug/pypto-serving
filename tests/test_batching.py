@@ -25,6 +25,7 @@ from examples.model.qwen3_14b.runner.cpu_executor import CpuModelExecutor
 from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
 from examples.model.qwen3_14b.runner.npu_runner import Qwen314BModelRunner as ModelRunner
 from examples.model.qwen3_14b.runner.npu_runner import _CompiledKernels
+from examples.model.qwen3_14b.runner.npu_runner import _L2Callable
 
 
 class _Tokenizer:
@@ -127,15 +128,12 @@ def test_prefill_inputs_use_actual_user_batch_without_padding_lanes():
     )
 
     assert prepared.actual_batch == 2
-    assert prepared.hidden.shape == (2, model.runtime.max_seq_len, model.config.hidden_size)
+    assert prepared.hidden.shape == (3, model.config.hidden_size)
     assert prepared.seq_lens.tolist() == [1, 2]
     assert prepared.block_table.shape == (2 * 2,)
     assert prepared.block_table[0].item() == allocations[0].page_ids[0]
-    assert prepared.slot_mapping.shape == (2 * model.runtime.max_seq_len,)
-    assert prepared.slot_mapping[
-        model.runtime.max_seq_len + 1
-    ].item() == manager.slot_mapping_for_request(allocations[1], 1)
-    assert prepared.slot_mapping[-1].item() == -1
+    assert prepared.slot_mapping.shape == (3,)
+    assert prepared.slot_mapping[2].item() == manager.slot_mapping_for_request(allocations[1], 1)
 
 
 def test_decode_inputs_use_actual_user_batch_without_padding_lanes():
@@ -207,11 +205,18 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
     executor = PyptoExecutor(manager)
     cached_layer = executor._kernel_layer_weights(model.layers[0])
     fake_kernel = _CopyKernel()
+    fake_callable = _L2Callable(
+        chip_callable=fake_kernel,
+        runtime_name="fake-runtime",
+        block_dim=1,
+        aicpu_thread_num=1,
+        param_infos=(),
+    )
     compiled = _CompiledKernels(
-        prefill=fake_kernel,
-        decode=fake_kernel,
-        final_rms=_NoopKernel(),
-        lm_head=_NoopKernel(),
+        prefill=fake_callable,
+        decode=fake_callable,
+        final_rms=None,
+        lm_head=None,
         final_norm_weight=torch.ones(1, model.config.hidden_size),
         rope_cos=torch.zeros(model.runtime.max_seq_len, model.config.head_dim),
         rope_sin=torch.zeros(model.runtime.max_seq_len, model.config.head_dim),
@@ -219,6 +224,7 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         padded_lm_head_weight=torch.zeros(model.config.vocab_size, model.config.hidden_size),
         layers=[cached_layer],
         decode_weights=executor._stack_decode_weights([cached_layer]),
+        decode_logits_buffer=torch.zeros(1, model.config.vocab_size),
     )
     executor._compiled[model.config.model_id] = compiled
     runner = ModelRunner(
@@ -230,6 +236,8 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         l3_trace=executor._l3_trace,
     )
     runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
+    monkeypatch.setattr(runner, "_l2_child_tensor", lambda _runtime_name, tensor, **_kwargs: tensor)
+    monkeypatch.setattr(runner, "_run_l2_program", lambda callable_spec, *args: callable_spec.chip_callable(*args))
     executor._runners[model.config.model_id] = runner
     monkeypatch.setattr(
         PyptoExecutor,
@@ -286,7 +294,10 @@ def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeig
 class _CopyKernel:
     def __call__(self, hidden, *args, config=None):
         out = args[-1]
-        out.copy_(hidden)
+        if out.shape == hidden.shape:
+            out.copy_(hidden)
+        else:
+            out.zero_()
 
 
 class _NoopKernel:

@@ -6,6 +6,7 @@
   },
   "runtime": {
     "backend": "npu",
+    "page_size": 128,
     "max_seq_len": 512,
     "max_batch_size": 16,
     "kv_dtype": "bfloat16",

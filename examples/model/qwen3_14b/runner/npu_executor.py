@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,6 @@ try:
         _CompiledKernels,
         _KernelLayerWeights,
         _L2Callable,
-        _LOGITS_BATCH_TILE,
         Qwen314BModelRunner,
     )
 except ImportError:
@@ -54,13 +54,13 @@ except ImportError:
         _CompiledKernels,
         _KernelLayerWeights,
         _L2Callable,
-        _LOGITS_BATCH_TILE,
         Qwen314BModelRunner,
     )
 
 
 _VOCAB_PAD_MULTIPLE = 512  # must be a multiple of lm_head.VOCAB_CHUNK (64)
-_QWEN14B_PAGE_SIZE = 256
+_QWEN14B_PAGE_SIZE = 128
+_QWEN14B_BLOCK_DIM = 24
 
 
 def _find_pypto_lib_qwen14b_dir() -> Path:
@@ -83,6 +83,8 @@ def _load_pypto_lib_qwen14b_module(module_name: str) -> object:
     """Load a Qwen3-14B kernel module from the pypto-lib submodule."""
     module_path = _PYPTO_LIB_QWEN14B_DIR / f"qwen3_14b_{module_name}.py"
     if not module_path.is_file():
+        module_path = _PYPTO_LIB_QWEN14B_DIR / f"{module_name}.py"
+    if not module_path.is_file():
         raise FileNotFoundError(
             f"Missing pypto-lib Qwen3-14B kernel module: {module_path}. "
             "Run `git submodule update --init --recursive`."
@@ -94,7 +96,14 @@ def _load_pypto_lib_qwen14b_module(module_name: str) -> object:
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load pypto-lib kernel module from {module_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.path.insert(0, str(_PYPTO_LIB_QWEN14B_DIR))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        try:
+            sys.path.remove(str(_PYPTO_LIB_QWEN14B_DIR))
+        except ValueError:
+            pass
     return module
 
 
@@ -305,34 +314,22 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         def _mark(label: str) -> None:
             timer.mark(label)
 
-        qwen3_decode_full = _load_pypto_lib_qwen14b_module("decode_full")
-        qwen3_final_rms = _load_pypto_lib_qwen14b_module("final_rms")
         qwen3_l3_generate = _load_pypto_lib_qwen14b_module("l3_generate")
-        qwen3_lm_head = _load_pypto_lib_qwen14b_module("lm_head")
-        qwen3_prefill = _load_pypto_lib_qwen14b_module("prefill")
+        qwen3_prefill_fwd = _load_pypto_lib_qwen14b_module("prefill_fwd")
+        qwen3_decode_fwd = _load_pypto_lib_qwen14b_module("decode_fwd")
 
-        build_qwen3_decode_program = qwen3_decode_full.build_qwen3_decode_program
-        build_qwen3_final_rms_program = qwen3_final_rms.build_qwen3_final_rms_program
         build_qwen3_14b_l3_generate_program = qwen3_l3_generate.build_qwen3_14b_l3_generate_program
         stack_layer_weights_full = qwen3_l3_generate.stack_layer_weights_full
-        build_qwen3_lm_head_program = qwen3_lm_head.build_qwen3_lm_head_program
-        build_qwen3_14b_prefill_program = qwen3_prefill.build_qwen3_14b_prefill_program
         _mark("imports")
 
         self._validate_supported_shape(model)
         kernel_batch = model.runtime.max_batch_size
         self._validate_total_kv_pages(model, kernel_batch)
 
-        prefill_program = build_qwen3_14b_prefill_program(
-            batch=kernel_batch,
-            max_seq=model.runtime.max_seq_len,
-            hidden_size=model.config.hidden_size,
-            num_heads=model.config.num_attention_heads,
-            num_kv_heads=model.config.num_key_value_heads,
-            head_dim=model.config.head_dim,
-            intermediate_size=model.config.intermediate_size,
-        )
-        decode_program = build_qwen3_decode_program(
+        padded_vocab = round_up(model.config.vocab_size, _VOCAB_PAD_MULTIPLE)
+        prefill_block_table_stride = int(qwen3_prefill_fwd.MAX_CTX_BLOCKS)
+        prefill = self._compile_prefill_fwd_callable(
+            qwen3_prefill_fwd.prefill_fwd,
             batch=kernel_batch,
             max_seq=model.runtime.max_seq_len,
             hidden_size=model.config.hidden_size,
@@ -341,26 +338,27 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             num_kv_heads=model.config.num_key_value_heads,
             head_dim=model.config.head_dim,
             num_layers=model.config.num_hidden_layers,
+            vocab_size=padded_vocab,
+            block_table_stride=prefill_block_table_stride,
         )
-        padded_vocab = round_up(model.config.vocab_size, _VOCAB_PAD_MULTIPLE)
-        final_rms_program = build_qwen3_final_rms_program(
-            batch=_LOGITS_BATCH_TILE,
+        _mark("compile_prefill")
+        decode_block_table_stride = int(qwen3_decode_fwd.MAX_BLOCKS_PER_SEQ)
+        decode = self._compile_decode_fwd_callable(
+            qwen3_decode_fwd.decode_fwd,
+            batch=kernel_batch,
+            max_seq=model.runtime.max_seq_len,
+            block_table_stride=decode_block_table_stride,
             hidden_size=model.config.hidden_size,
-            eps=model.config.rms_norm_eps,
-        )
-        lm_head_program = build_qwen3_lm_head_program(
-            batch=_LOGITS_BATCH_TILE,
-            hidden_size=model.config.hidden_size,
+            intermediate_size=model.config.intermediate_size,
+            num_heads=model.config.num_attention_heads,
+            num_kv_heads=model.config.num_key_value_heads,
+            head_dim=model.config.head_dim,
+            num_layers=model.config.num_hidden_layers,
             vocab_size=padded_vocab,
         )
-        _mark("build_programs")
-        prefill = self._compile_l2_callable("prefill", prefill_program)
-        _mark("compile_prefill")
-        decode = self._compile_l2_callable("decode", decode_program)
         _mark("compile_decode")
-        final_rms = self._compile_l2_callable("final_rms", final_rms_program)
-        lm_head = self._compile_l2_callable("lm_head", lm_head_program)
-        _mark("compile_final_rms_lm_head")
+        final_rms = None
+        lm_head = None
 
         rope_cos_raw, rope_sin_raw = rope_tables(
             model.runtime.max_seq_len,
@@ -407,7 +405,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 profiling=_rc.compile_profiling,
                 distributed_config=DistributedConfig(
                     device_ids=[self._device_id],
-                    block_dim=3,
+                    block_dim=_QWEN14B_BLOCK_DIM,
                     num_sub_workers=0,
                     aicpu_thread_num=4,
                 ),
@@ -516,6 +514,11 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             for name, tensor in self._stack_decode_weights(layers).items()
         }
         _mark("stack_decode_weights")
+        decode_logits_buffer = torch.empty(
+            (kernel_batch, padded_vocab),
+            dtype=torch.float32,
+        ).share_memory_()
+        _mark("decode_logits_buffer")
 
         timer.report()
 
@@ -531,6 +534,9 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             padded_lm_head_weight=padded_lm_head_weight,
             layers=layers,
             decode_weights=decode_weights,
+            decode_logits_buffer=decode_logits_buffer,
+            prefill_block_table_stride=prefill_block_table_stride,
+            decode_block_table_stride=decode_block_table_stride,
             stacked_weights=stacked_weights,
             l3_generate_chip_callables=l3_generate_chip_callables,
             l3_generate_entry_fn=l3_generate_entry_fn,
@@ -575,7 +581,149 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return _L2Callable(
             chip_callable=chip_callable,
             runtime_name=runtime_name,
-            block_dim=int(runtime_config.get("block_dim", 24)),
+            block_dim=int(runtime_config.get("block_dim", _QWEN14B_BLOCK_DIM)),
+            aicpu_thread_num=int(runtime_config.get("aicpu_thread_num", 4)),
+            param_infos=tuple(param_infos),
+        )
+
+    def _compile_prefill_fwd_callable(
+        self,
+        jit_fn: object,
+        *,
+        batch: int,
+        max_seq: int,
+        block_table_stride: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        num_layers: int,
+        vocab_size: int,
+    ) -> _L2Callable:
+        """Compile the top-level ``@pl.jit`` prefill_fwd into an L2 callable."""
+        kv_hidden = num_kv_heads * head_dim
+        total_tokens = batch * max_seq
+        runtime_cache_blocks = (max_seq + _QWEN14B_PAGE_SIZE - 1) // _QWEN14B_PAGE_SIZE
+        cache_rows = batch * runtime_cache_blocks * num_layers * num_kv_heads * _QWEN14B_PAGE_SIZE
+        dummy_args = [
+            torch.empty((total_tokens, hidden_size), dtype=torch.bfloat16),
+            torch.empty((batch,), dtype=torch.int32),
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
+            torch.empty((num_layers, head_dim), dtype=torch.float32),
+            torch.empty((num_layers, head_dim), dtype=torch.float32),
+            torch.empty((max_seq, head_dim), dtype=torch.float32),
+            torch.empty((max_seq, head_dim), dtype=torch.float32),
+            torch.empty((batch * block_table_stride,), dtype=torch.int32),
+            torch.empty((total_tokens,), dtype=torch.int32),
+            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
+            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
+            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((1, hidden_size), dtype=torch.float32),
+            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((batch, vocab_size), dtype=torch.float32),
+        ]
+        return self._compile_jit_fwd_callable("prefill_fwd", jit_fn, dummy_args)
+
+    def _compile_decode_fwd_callable(
+        self,
+        jit_fn: object,
+        *,
+        batch: int,
+        max_seq: int,
+        block_table_stride: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        num_layers: int,
+        vocab_size: int,
+    ) -> _L2Callable:
+        """Compile the top-level ``@pl.jit`` decode_fwd into an L2 callable."""
+        kv_hidden = num_kv_heads * head_dim
+        runtime_cache_blocks = (max_seq + _QWEN14B_PAGE_SIZE - 1) // _QWEN14B_PAGE_SIZE
+        cache_rows = batch * runtime_cache_blocks * num_layers * num_kv_heads * _QWEN14B_PAGE_SIZE
+        dummy_args = [
+            torch.empty((batch, hidden_size), dtype=torch.bfloat16),
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
+            torch.empty((num_layers, head_dim), dtype=torch.float32),
+            torch.empty((num_layers, head_dim), dtype=torch.float32),
+            torch.empty((batch,), dtype=torch.int32),
+            torch.empty((batch * block_table_stride,), dtype=torch.int32),
+            torch.empty((batch,), dtype=torch.int32),
+            torch.empty((max_seq, head_dim), dtype=torch.float32),
+            torch.empty((max_seq, head_dim), dtype=torch.float32),
+            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
+            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
+            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((1, hidden_size), dtype=torch.float32),
+            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((batch, vocab_size), dtype=torch.float32),
+        ]
+        return self._compile_jit_fwd_callable("decode_fwd", jit_fn, dummy_args)
+
+    def _compile_jit_fwd_callable(
+        self,
+        name: str,
+        jit_fn: object,
+        dummy_args: list[torch.Tensor],
+    ) -> _L2Callable:
+        """Compile a top-level ``@pl.jit`` kernel into an L2 callable."""
+        import pypto.language as pl_mod  # noqa: PLC0415
+        from pypto.jit.cache import make_cache_key  # noqa: PLC0415
+        from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
+        from pypto.runtime.runner import _patch_orchestration_headers  # noqa: PLC0415
+
+        param_names, _arguments, tensor_meta, scalar_values, scalar_dtypes, dynamic_dims = jit_fn._bind_args(
+            tuple(dummy_args), {}
+        )
+        key = make_cache_key(
+            source_hash=jit_fn._get_source_hash(),
+            param_names=param_names,
+            tensor_shapes={name: meta.shape for name, meta in tensor_meta.items()},
+            tensor_dtypes={name: meta.dtype for name, meta in tensor_meta.items()},
+            dynamic_dims=dynamic_dims[id(jit_fn._func)],
+            scalar_values=scalar_values,
+            platform=self._platform,
+        )
+        if key not in jit_fn._cache:
+            jit_fn._cache[key] = jit_fn._compile(
+                tensor_meta,
+                scalar_values,
+                scalar_dtypes,
+                dynamic_dims,
+                pl_mod,
+                platform=self._platform,
+            )
+        compiled = jit_fn._cache[key]
+        work_dir = Path(compiled.output_dir)
+        _patch_orchestration_headers(work_dir)
+        chip_callable, runtime_name, runtime_config = compile_and_assemble(
+            work_dir,
+            self._platform,
+            pto_isa_commit=self._run_config(codegen_only=True).pto_isa_commit,
+        )
+        runtime_config = runtime_config or {}
+        param_infos, _, _ = compiled._get_metadata()
+        return _L2Callable(
+            chip_callable=chip_callable,
+            runtime_name=runtime_name,
+            block_dim=int(runtime_config.get("block_dim", _QWEN14B_BLOCK_DIM)),
             aicpu_thread_num=int(runtime_config.get("aicpu_thread_num", 4)),
             param_infos=tuple(param_infos),
         )

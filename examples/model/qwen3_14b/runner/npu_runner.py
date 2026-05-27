@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import ctypes
+import inspect
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -81,8 +82,8 @@ class _CompiledKernels:
 
     prefill: _L2Callable
     decode: _L2Callable
-    final_rms: _L2Callable
-    lm_head: _L2Callable
+    final_rms: _L2Callable | None
+    lm_head: _L2Callable | None
     final_norm_weight: torch.Tensor
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
@@ -90,6 +91,9 @@ class _CompiledKernels:
     padded_lm_head_weight: torch.Tensor
     layers: list[_KernelLayerWeights]
     decode_weights: dict[str, torch.Tensor]
+    decode_logits_buffer: torch.Tensor
+    prefill_block_table_stride: int | None = None
+    decode_block_table_stride: int | None = None
     # L3-wrapped generate artifacts. Populated only when l3_mode=True.
     stacked_weights: dict[str, torch.Tensor] | None = None
     l3_generate_chip_callables: dict[str, object] | None = None
@@ -103,7 +107,7 @@ class _CompiledKernels:
 
 @dataclass
 class _PrefillInputs:
-    """Padded host tensors passed to the prefill kernel."""
+    """Host tensors passed to the prefill kernel."""
 
     actual_batch: int
     hidden: torch.Tensor
@@ -157,74 +161,64 @@ class Qwen314BModelRunner(ModelRunner):
         self._l2_dirty_kv_models: set[str] = set()
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
-        """Run layer-by-layer prompt prefill and project next-token logits."""
+        """Run the JIT all-layer prefill kernel and return next-token logits."""
         compiled = self._compiled
         prefill_inputs = self._prepare_prefill_inputs(model, batch)
-        hidden = prefill_inputs.hidden
+        dw = compiled.decode_weights
         t_prefill_start = time.perf_counter()
 
-        for layer_idx, layer in enumerate(compiled.layers):
-            k_cache, v_cache = self.materialize_single_layer_cache(
-                model.config.model_id,
-                layer_idx,
-            )
-            out = torch.zeros_like(hidden).share_memory_()
-            prefill_args = (
-                hidden,
-                prefill_inputs.seq_lens,
-                layer.input_rms_weight,
-                layer.wq,
-                layer.wk,
-                layer.wv,
-                layer.q_norm_weight,
-                layer.k_norm_weight,
-                compiled.rope_cos,
-                compiled.rope_sin,
-                prefill_inputs.block_table,
-                prefill_inputs.slot_mapping,
-                k_cache,
-                v_cache,
-                layer.wo,
-                layer.post_rms_weight,
-                layer.w_gate,
-                layer.w_up,
-                layer.w_down,
-                out,
-            )
-            if isinstance(compiled.prefill, _L2Callable):
-                self._run_l2_program(compiled.prefill, *prefill_args)
-            else:
-                compiled.prefill(*prefill_args, config=None)
-            hidden = out
+        k_cache, v_cache = self.materialize_full_layer_cache(
+            model.config.model_id,
+        )
+        logits_padded = torch.zeros(
+            (prefill_inputs.actual_batch, compiled.padded_vocab),
+            dtype=torch.float32,
+        ).share_memory_()
+
+        self._run_l2_program(
+            compiled.prefill,
+            prefill_inputs.hidden,
+            prefill_inputs.seq_lens,
+            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_input_rms_weight"]),
+            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wq"]),
+            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wk"]),
+            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wv"]),
+            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_q_norm_weight"]),
+            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_k_norm_weight"]),
+            self._l2_child_tensor(compiled.prefill.runtime_name, compiled.rope_cos),
+            self._l2_child_tensor(compiled.prefill.runtime_name, compiled.rope_sin),
+            prefill_inputs.block_table,
+            prefill_inputs.slot_mapping,
+            k_cache,
+            v_cache,
+            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wo"]),
+            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_post_rms_weight"]),
+            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_w_gate"]),
+            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_w_up"]),
+            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_w_down"]),
+            self._l2_child_tensor(compiled.prefill.runtime_name, compiled.final_norm_weight),
+            self._l2_child_tensor(compiled.prefill.runtime_name, compiled.padded_lm_head_weight),
+            logits_padded,
+        )
         self._l2_dirty_kv_models.add(model.config.model_id)
 
         if _TIMING_ENABLED:
             print(
-                f"[timing] prefill: {len(model.layers)} layers, "
+                f"[timing] prefill: fused {len(model.layers)} layers, "
                 f"{(time.perf_counter() - t_prefill_start) * 1000:.2f} ms",
                 flush=True,
             )
 
-        last_hidden_rows: list[torch.Tensor] = []
-        actual_batch = int(batch.seq_lens.shape[0])
-        for batch_idx in range(actual_batch):
+        for batch_idx, alloc in enumerate(batch.kv_allocations):
             seq_len = int(batch.seq_lens[batch_idx].item())
-            if batch_idx < len(batch.kv_allocations):
-                batch.kv_allocations[batch_idx].tokens_used = max(
-                    batch.kv_allocations[batch_idx].tokens_used, seq_len
-                )
-            last_hidden_rows.append(hidden[batch_idx, seq_len - 1].float())
-        last_hidden = torch.stack(last_hidden_rows)
-        logits = self._project_logits(model, last_hidden)
-        return PrefillResult(last_hidden=last_hidden, logits=logits)
+            alloc.tokens_used = max(alloc.tokens_used, seq_len)
+        return PrefillResult(
+            last_hidden=None,
+            logits=logits_padded[:, : model.config.vocab_size],
+        )
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
-        """Run the fused all-layer decode kernel and project next-token logits."""
-        # The fused decode kernel (decode_full.py) processes all
-        # layers in one call: weights are pre-stacked into [num_layers * ...]
-        # tensors at compile time and the KV cache is the full multi-layer
-        # buffer. Argument order mirrors the kernel signature in
-        # build_qwen3_decode_program.qwen3_decode.
+        """Run the JIT all-layer decode kernel and return next-token logits."""
         compiled = self._compiled
         decode_inputs = self._prepare_decode_inputs(model, batch)
         hidden = decode_inputs.hidden
@@ -234,68 +228,45 @@ class Qwen314BModelRunner(ModelRunner):
             model.config.model_id,
         )
         refresh_kv_cache = model.config.model_id in self._l2_dirty_kv_models
-        out = torch.zeros_like(hidden)
 
-        if isinstance(compiled.decode, _L2Callable):
-            self._run_l2_program(
-                compiled.decode,
-                hidden,
-                self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_input_rms_weight"]),
-                self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_wq"]),
-                self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_wk"]),
-                self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_wv"]),
-                self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_q_norm_weight"]),
-                self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_k_norm_weight"]),
-                decode_inputs.seq_lens,
-                decode_inputs.block_table,
-                decode_inputs.slot_mapping,
-                self._l2_child_tensor(compiled.decode.runtime_name, compiled.rope_cos),
-                self._l2_child_tensor(compiled.decode.runtime_name, compiled.rope_sin),
-                self._l2_child_tensor(compiled.decode.runtime_name, k_cache, refresh=refresh_kv_cache),
-                self._l2_child_tensor(compiled.decode.runtime_name, v_cache, refresh=refresh_kv_cache),
-                self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_wo"]),
-                self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_post_rms_weight"]),
-                self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_w_gate"]),
-                self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_w_up"]),
-                self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_w_down"]),
-                out,
+        if decode_inputs.actual_batch > compiled.decode_logits_buffer.shape[0]:
+            raise ValueError(
+                f"decode batch {decode_inputs.actual_batch} exceeds logits buffer batch "
+                f"{compiled.decode_logits_buffer.shape[0]}"
             )
-        else:
-            compiled.decode(
-                hidden,
-                dw["decode_input_rms_weight"],
-                dw["decode_wq"],
-                dw["decode_wk"],
-                dw["decode_wv"],
-                dw["decode_q_norm_weight"],
-                dw["decode_k_norm_weight"],
-                decode_inputs.seq_lens,
-                decode_inputs.block_table,
-                decode_inputs.slot_mapping,
-                compiled.rope_cos,
-                compiled.rope_sin,
-                k_cache,
-                v_cache,
-                dw["decode_wo"],
-                dw["decode_post_rms_weight"],
-                dw["decode_w_gate"],
-                dw["decode_w_up"],
-                dw["decode_w_down"],
-                out,
-                config=None,
-            )
+        logits_padded = compiled.decode_logits_buffer[: decode_inputs.actual_batch]
+        self._run_l2_program(
+            compiled.decode,
+            hidden,
+            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_input_rms_weight"]),
+            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_wq"]),
+            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_wk"]),
+            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_wv"]),
+            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_q_norm_weight"]),
+            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_k_norm_weight"]),
+            decode_inputs.seq_lens,
+            decode_inputs.block_table,
+            decode_inputs.slot_mapping,
+            self._l2_child_tensor(compiled.decode.runtime_name, compiled.rope_cos),
+            self._l2_child_tensor(compiled.decode.runtime_name, compiled.rope_sin),
+            self._l2_child_tensor(compiled.decode.runtime_name, k_cache, refresh=refresh_kv_cache),
+            self._l2_child_tensor(compiled.decode.runtime_name, v_cache, refresh=refresh_kv_cache),
+            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_wo"]),
+            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_post_rms_weight"]),
+            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_w_gate"]),
+            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_w_up"]),
+            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_w_down"]),
+            self._l2_child_tensor(compiled.decode.runtime_name, compiled.final_norm_weight),
+            self._l2_child_tensor(compiled.decode.runtime_name, compiled.padded_lm_head_weight),
+            logits_padded,
+        )
         self._l2_dirty_kv_models.discard(model.config.model_id)
-
-        final_hidden = out.float()
-
-        logits = self._project_logits(model, final_hidden)
-        for batch_idx in range(final_hidden.shape[0]):
-            if batch_idx < len(batch.kv_allocations):
-                batch.kv_allocations[batch_idx].tokens_used = max(
-                    batch.kv_allocations[batch_idx].tokens_used,
-                    int(batch.seq_lens[batch_idx].item()),
-                )
-        return DecodeResult(hidden_states=final_hidden, logits=logits)
+        for batch_idx, alloc in enumerate(batch.kv_allocations):
+            alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
+        return DecodeResult(
+            hidden_states=hidden.float(),
+            logits=logits_padded[:, : model.config.vocab_size].to(hidden.device),
+        )
 
     def _project_logits(self, model: RuntimeModel, hidden: torch.Tensor) -> torch.Tensor:
         """Run final RMSNorm and LM head kernels for a hidden-state batch."""
@@ -303,6 +274,9 @@ class Qwen314BModelRunner(ModelRunner):
         hidden_size = model.config.hidden_size
         vocab_size = model.config.vocab_size
         padded_vocab = compiled.padded_vocab
+
+        if compiled.final_rms is None or compiled.lm_head is None:
+            raise RuntimeError("standalone final_rms/lm_head kernels are not compiled")
 
         actual_batch = hidden.shape[0]
         if actual_batch > _LOGITS_BATCH_TILE:
@@ -541,7 +515,7 @@ class Qwen314BModelRunner(ModelRunner):
             )
 
         _mark("entry_validate")
-        prefill_inputs = self._prepare_prefill_inputs(model, prefill_batch)
+        prefill_inputs = self._prepare_prefill_inputs(model, prefill_batch, padded=True)
         _mark("prepare_prefill_inputs")
         actual_batch = prefill_inputs.actual_batch
         if actual_batch != 1:
@@ -748,13 +722,20 @@ class Qwen314BModelRunner(ModelRunner):
 
         def _submit_l3_generate(orch, config, tensors_dict, _keep):
             """Submit one l3_generate entry_fn call (dispatches all-layers L2 tasks)."""
+            kwargs = {
+                "tensors": tensors_dict,
+                "callables": lg_callable_ids,
+                "sub_ids": sub_ids,
+                "_keep": _keep,
+            }
+            entry_params = inspect.signature(lg_entry_fn).parameters
+            if "contexts" in entry_params:
+                kwargs["contexts"] = getattr(worker, "chip_contexts", None)
+            if "world_size" in entry_params:
+                kwargs["world_size"] = 1
             lg_entry_fn(
                 orch, None, config,
-                tensors=tensors_dict,
-                callables=lg_callable_ids,
-                sub_ids=sub_ids,
-                _keep=_keep,
-                contexts=worker.chip_contexts,
+                **kwargs,
             )
 
         _has_prefill_tensor = torch.tensor(True, dtype=torch.bool).share_memory_()
@@ -953,32 +934,56 @@ class Qwen314BModelRunner(ModelRunner):
         self,
         model: RuntimeModel,
         batch: PrefillBatch,
+        *,
+        padded: bool = False,
     ) -> _PrefillInputs:
         """Pack variable-length prefill requests into kernel input tensors."""
         batch_count = len(batch.kv_allocations) if batch.kv_allocations else int(batch.seq_lens.shape[0])
         actual_batch = self._validate_batch_size(model, batch_count)
         max_seq = model.runtime.max_seq_len
         hidden_size = model.config.hidden_size
-        max_blocks = self._max_blocks_per_seq(model)
+        max_blocks = (
+            self._compiled.prefill_block_table_stride
+            if self._compiled is not None and self._compiled.prefill_block_table_stride is not None
+            else self._max_blocks_per_seq(model)
+        )
+        if padded:
+            # L3 generate reuses this block table for both prefill and decode.
+            # Size it for the full reserved allocation, not only the standalone
+            # prefill kernel's context-tile constant.
+            if self._compiled is not None and self._compiled.decode_block_table_stride is not None:
+                max_blocks = max(max_blocks, self._compiled.decode_block_table_stride)
+            max_blocks = max(max_blocks, self._max_blocks_per_seq(model))
+            if batch.kv_allocations:
+                max_blocks = max(max_blocks, max(len(alloc.page_ids) for alloc in batch.kv_allocations))
 
         has_precomputed = batch.slot_mapping is not None and batch.block_table is not None
 
-        hidden = torch.zeros((actual_batch, max_seq, hidden_size), dtype=torch.bfloat16)
         seq_lens = torch.empty((actual_batch,), dtype=torch.int32)
         block_table = torch.full((actual_batch * max_blocks,), -1, dtype=torch.int32)
-        slot_mapping = torch.full((actual_batch * max_seq,), -1, dtype=torch.int32)
+        seq_len_values = [int(batch.seq_lens[idx].item()) for idx in range(actual_batch)]
+        total_tokens = sum(seq_len_values)
+        if padded:
+            hidden = torch.zeros((actual_batch, max_seq, hidden_size), dtype=torch.bfloat16)
+            slot_mapping = torch.full((actual_batch * max_seq,), -1, dtype=torch.int32)
+        else:
+            hidden = torch.empty((total_tokens, hidden_size), dtype=torch.bfloat16)
+            slot_mapping = torch.empty((total_tokens,), dtype=torch.int32)
 
+        token_offset = 0
         for batch_idx in range(actual_batch):
             alloc = batch.kv_allocations[batch_idx] if batch_idx < len(batch.kv_allocations) else None
-            seq_len = int(batch.seq_lens[batch_idx].item())
+            seq_len = seq_len_values[batch_idx]
             if seq_len <= 0:
                 raise ValueError("prefill seq_lens must be positive")
             if seq_len > max_seq:
                 raise ValueError(f"prefill seq_len {seq_len} exceeds max_seq_len {max_seq}")
             seq_lens[batch_idx] = seq_len
-            hidden[batch_idx, :seq_len, :] = (
-                batch.input_embeddings[batch_idx, :seq_len, :].to(torch.bfloat16).cpu()
-            )
+            embeddings = batch.input_embeddings[batch_idx, :seq_len, :].to(torch.bfloat16).cpu()
+            if padded:
+                hidden[batch_idx, :seq_len, :] = embeddings
+            else:
+                hidden[token_offset : token_offset + seq_len, :] = embeddings
 
             if has_precomputed:
                 bt_row = batch.block_table[batch_idx]
@@ -989,9 +994,14 @@ class Qwen314BModelRunner(ModelRunner):
 
                 sm_row = batch.slot_mapping[batch_idx]
                 valid_slots = (sm_row >= 0).sum().item()
-                slot_mapping[
-                    batch_idx * max_seq : batch_idx * max_seq + valid_slots
-                ] = sm_row[:valid_slots].to(torch.int32).cpu()
+                if padded:
+                    slot_mapping[
+                        batch_idx * max_seq : batch_idx * max_seq + valid_slots
+                    ] = sm_row[:valid_slots].to(torch.int32).cpu()
+                else:
+                    slot_mapping[
+                        token_offset : token_offset + seq_len
+                    ] = sm_row[:seq_len].to(torch.int32).cpu()
             elif alloc is not None:
                 self._write_block_table_row(block_table, batch_idx, max_blocks, alloc)
                 from python.core.kv_cache import slot_mapping_for_positions as _slot_mapping_for_positions
@@ -1001,7 +1011,11 @@ class Qwen314BModelRunner(ModelRunner):
                     self._kv_page_sizes[model.config.model_id],
                     max_tokens=max_seq,
                 )
-                slot_mapping[batch_idx * max_seq : (batch_idx + 1) * max_seq] = slot_row
+                if padded:
+                    slot_mapping[batch_idx * max_seq : (batch_idx + 1) * max_seq] = slot_row
+                else:
+                    slot_mapping[token_offset : token_offset + seq_len] = slot_row[:seq_len]
+            token_offset += seq_len
 
         return _PrefillInputs(
             actual_batch=actual_batch,
@@ -1020,7 +1034,12 @@ class Qwen314BModelRunner(ModelRunner):
         batch_count = len(batch.kv_allocations) if batch.kv_allocations else int(batch.seq_lens.shape[0])
         actual_batch = self._validate_batch_size(model, batch_count)
         hidden_size = model.config.hidden_size
-        max_blocks = self._max_blocks_per_seq(model)
+        decode_block_table_stride = (
+            self._compiled.decode_block_table_stride
+            if self._compiled is not None
+            else None
+        )
+        max_blocks = decode_block_table_stride or self._max_blocks_per_seq(model)
 
         has_precomputed = batch.slot_mapping is not None and batch.block_table is not None
 

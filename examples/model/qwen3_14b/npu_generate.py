@@ -148,11 +148,13 @@ def InstallProfiling(engine: LLMEngine, model_id: str, collector: _TimingCollect
         runner = executor._runners[model_id]  # type: ignore[attr-defined]
         orig_run_l2 = runner._run_l2_program  # type: ignore[attr-defined]
         l2_names = {
-            id(compiled.prefill): ("kernel.prefill_layer", False),
+            id(compiled.prefill): ("kernel.prefill_fwd", False),
             id(compiled.decode): ("kernel.decode_layer", True),
-            id(compiled.final_rms): ("kernel.final_rms", False),
-            id(compiled.lm_head): ("kernel.lm_head", False),
         }
+        if compiled.final_rms is not None:
+            l2_names[id(compiled.final_rms)] = ("kernel.final_rms", False)
+        if compiled.lm_head is not None:
+            l2_names[id(compiled.lm_head)] = ("kernel.lm_head", False)
 
         def timed_run_l2(callable_spec, *args, **kwargs):
             kernel_info = l2_names.get(id(callable_spec))
@@ -176,12 +178,14 @@ def InstallProfiling(engine: LLMEngine, model_id: str, collector: _TimingCollect
         # Per-layer kernel wrappers. compiled.prefill / compiled.decode are invoked
         # once per transformer layer inside run_prefill / run_decode respectively
         # (baseline non-L3 path only).
-        compiled.prefill = collector.WrapKernel(compiled.prefill, "kernel.prefill_layer")
+        compiled.prefill = collector.WrapKernel(compiled.prefill, "kernel.prefill_fwd")
         compiled.decode = collector.WrapKernel(
             compiled.decode, "kernel.decode_layer", group_by_decode_step=True
         )
-        compiled.final_rms = collector.WrapKernel(compiled.final_rms, "kernel.final_rms")
-        compiled.lm_head = collector.WrapKernel(compiled.lm_head, "kernel.lm_head")
+        if compiled.final_rms is not None:
+            compiled.final_rms = collector.WrapKernel(compiled.final_rms, "kernel.final_rms")
+        if compiled.lm_head is not None:
+            compiled.lm_head = collector.WrapKernel(compiled.lm_head, "kernel.lm_head")
 
     # L3 generate wrapper. run_generate_l3 is invoked once per generate call
     # (replaces run_prefill + run_decode in L3 mode).
@@ -258,7 +262,7 @@ def PrintTimingReport(collector: _TimingCollector, num_tokens: int, verbose: boo
     print()
     print("[kernel] aggregate over all invocations:")
     for kname in (
-        "kernel.prefill_layer",
+        "kernel.prefill_fwd",
         "kernel.decode_layer",
         "kernel.l3_generate",
         "kernel.final_rms",
@@ -274,7 +278,7 @@ def PrintTimingReport(collector: _TimingCollector, num_tokens: int, verbose: boo
         return
 
     # Verbose: per-layer prefill times (single prefill call -> N layer kernels)
-    prefill_layers = collector.kernel_times.get("kernel.prefill_layer", [])
+    prefill_layers = collector.kernel_times.get("kernel.prefill_fwd", [])
     if prefill_layers:
         print("\n--- per-layer prefill kernel times (single run_prefill) ---")
         for layer_idx, t in enumerate(prefill_layers):
@@ -376,7 +380,7 @@ def main() -> None:
         model_dir=str(model_dir),
         model_format="huggingface",
         runtime_config=RuntimeConfig(
-            page_size=256,
+            page_size=128,
             max_batch_size=16,
             max_seq_len=args.max_seq_len,
             max_new_tokens=args.max_new_tokens,
