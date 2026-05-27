@@ -16,10 +16,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from python.core.async_engine import AsyncLLMEngine, ServingConfig
+from python.core.async_engine import AsyncLLMEngine, EngineConfig
 from python.core.tokenizer import TransformersTokenizerAdapter
 from python.core.types import GenerateConfig, RuntimeConfig
-from python.core.serving_worker import WorkerConfig
 
 
 def build_prompt_with_min_tokens(tokenizer, min_tokens: int, max_tokens: int) -> str:
@@ -60,26 +59,20 @@ async def main():
         max_new_tokens=5,
     )
 
-    worker_config = WorkerConfig(
+    engine_config = EngineConfig(
         model_id="qwen3-14b",
         model_dir=model_dir,
         platform=args.platform,
         device_id=args.device,
-        runtime_config=runtime_config,
         executor_cls="PyptoQwen14BExecutor",
-    )
-
-    serving_config = ServingConfig(
+        runtime_config=runtime_config,
         max_num_running_reqs=4,
         max_num_scheduled_tokens=4096,
         long_prefill_token_threshold=128,
-        max_seq_len=512,
-        block_size=page_size,
     )
 
     engine = AsyncLLMEngine(
-        worker_config=worker_config,
-        serving_config=serving_config,
+        config=engine_config,
         tokenizer=tokenizer,
         eos_token_id=tokenizer.eos_token_id,
         bos_token_id=tokenizer.bos_token_id,

@@ -11,98 +11,74 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import json
 import os
 import sys
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Any, TextIO
+from typing import TYPE_CHECKING
 
-GenerateConfig = None
-LLMEngine = None
+if TYPE_CHECKING:
+    from ..core.async_engine import EngineConfig
+
 RuntimeConfig = None
-KvCacheManager = None
-CpuModelExecutor = None
-PyptoExecutor = None
 
 
-_VALID_BACKENDS = {"cpu", "npu"}
-_L3_BATCH_TILE = 16
-_EXIT_COMMANDS = {"/exit", "/quit"}
-_HELP_COMMANDS = {"/help", "?"}
-_CONFIG_COMMANDS = {"/config"}
-_CLEAR_COMMANDS = {"/clear"}
-
-
-@dataclass(frozen=True)
-class ModelCliConfig:
-    model_id: str
-    model_dir: str
-    model_format: str
-    loader_options: dict[str, object]
-
-
-@dataclass(frozen=True)
-class NpuCliConfig:
-    platform: str = "a2a3"
-    device_id: int = 0
-    save_kernels_dir: str | None = None
-    pypto_root: str | None = None
-    l3_mode: bool = False
-
-
-@dataclass(frozen=True)
-class ServingConfig:
-    model: ModelCliConfig
-    runtime: RuntimeConfig
-    generation: GenerateConfig
-    backend: str
-    npu: NpuCliConfig
+_VALID_BACKENDS = {"npu"}
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pypto-serving",
-        description="Run local interactive generation with PyPTO Serving.",
+        description="Start PyPTO Serving with an OpenAI-compatible API.",
     )
-    parser.add_argument("--config", required=True, help="Path to the user-written JSON config file.")
-    parser.add_argument("--prompt", help="Prompt text for one-shot generation.")
-    parser.add_argument("--interactive", action="store_true", help="Read prompts interactively after loading the model.")
-    parser.add_argument("--serve", action="store_true", help="Start HTTP serving mode with OpenAI-compatible API.")
+
+    # Model
+    parser.add_argument("--model", required=True, help="Path to the model directory.")
+    parser.add_argument("--served-model-name", default=None, help="Model name used in the API. Defaults to the model directory name.")
+
+    # Backend and device
+    parser.add_argument("--backend", default="npu", choices=sorted(_VALID_BACKENDS), help="Inference backend (default: npu).")
+    parser.add_argument("--platform", default="a2a3", help="NPU platform (default: a2a3).")
+    parser.add_argument("--device", type=int, default=0, help="NPU device ID (default: 0).")
+    # Dtype
+    parser.add_argument("--dtype", default="float32", help="Weight data type (default: float32).")
+    parser.add_argument("--kv-cache-dtype", default="bfloat16", help="KV cache data type. 'auto' follows --dtype (default: bfloat16).")
+
+    # Runtime
+    parser.add_argument("--max-model-len", type=int, default=512, help="Maximum sequence length (default: 512).")
+    parser.add_argument("--block-size", type=int, default=128, help="KV cache block size (default: 128).")
+
+    # Generation
+    parser.add_argument("--max-new-tokens", type=int, default=32, help="Maximum new tokens to generate (default: 32).")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (default: 0.0).")
+    parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus sampling probability (default: 1.0).")
+    parser.add_argument("--top-k", type=int, default=None, help="Top-k sampling cutoff (default: disabled).")
+
+    # Serving
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind the serving server (default: 0.0.0.0).")
     parser.add_argument("--port", type=int, default=8000, help="Port for the serving server (default: 8000).")
-    parser.add_argument("--stream", action="store_true", help="Override generation.stream=true for this run.")
-    parser.add_argument("--l3", action="store_true", help="Override npu.l3=true for this run.")
-    parser.add_argument(
-        "--max-num-running-reqs",
-        type=int,
-        default=32,
-        help="Max concurrent requests in serving mode (default: 32).",
-    )
-    parser.add_argument(
-        "--max-num-scheduled-tokens",
-        type=int,
-        default=4096,
-        help="Max tokens scheduled per iteration in serving mode (default: 4096).",
-    )
+    parser.add_argument("--max-num-seqs", type=int, default=16, help="Max concurrent requests in serving mode (default: 32).")
+    parser.add_argument("--max-num-batched-tokens", type=int, default=4096, help="Max tokens scheduled per iteration (default: 4096).")
     parser.add_argument(
         "--long-prefill-token-threshold",
         type=int,
         default=2048,
-        help="Chunked prefill threshold in serving mode (default: 2048). Set to 0 to disable chunk prefill.",
+        help="Chunked prefill threshold in serving mode (default: 2048).",
     )
     parser.add_argument(
-        "--disable-prefix-cache",
-        action="store_true",
-        help="Disable prefix caching (hash-based KV cache reuse across requests).",
+        "--enable-prefix-caching",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable prefix caching (default: True). Use --no-enable-prefix-caching to disable.",
     )
     parser.add_argument(
-        "--disable-chunk-prefill",
-        action="store_true",
-        help="Disable chunk prefill (always process full prompt in one step).",
+        "--enable-chunked-prefill",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable chunked prefill (default: True). Use --no-enable-chunked-prefill to disable.",
     )
-    parser.add_argument("--device", type=int, help="Override npu.device_id from the JSON config.")
+
+    # Misc
     parser.add_argument(
         "--show-startup-logs",
         action="store_true",
@@ -111,235 +87,81 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def load_serving_config(
-    config_path: str | Path,
-    *,
-    stream_override: bool = False,
-    l3_override: bool = False,
-    device_override: int | None = None,
-) -> ServingConfig:
+def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     _ensure_core_imports()
-    path = Path(config_path)
+    _validate_backend(args.backend)
+
     try:
-        raw = json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid JSON config {path}: {exc}") from exc
-    except OSError as exc:
-        raise ValueError(f"Unable to read config {path}: {exc}") from exc
+        from ..core.async_engine import EngineConfig
+    except ImportError:
+        from python.core.async_engine import EngineConfig
 
-    root = _require_mapping(raw, "config")
-    model_section = _require_mapping(root.get("model"), "model")
-    runtime_section = _require_mapping(root.get("runtime"), "runtime")
-    generation_section = _require_mapping(root.get("generation"), "generation")
-    npu_section = _optional_mapping(root.get("npu"), "npu")
+    model_dir = str(Path(args.model).resolve())
+    executor_kwargs = _build_executor_kwargs()
 
-    backend = _get_str(runtime_section, "backend", "npu").lower()
-    if backend not in _VALID_BACKENDS:
-        raise ValueError(f"runtime.backend must be one of {sorted(_VALID_BACKENDS)}, got {backend!r}")
-
-    model_dir = _get_required_str(model_section, "model_dir", "model")
-    model = ModelCliConfig(
-        model_id=_get_str(model_section, "model_id", "qwen3-14b-local"),
+    return EngineConfig(
+        model_id=args.served_model_name or Path(args.model).name,
         model_dir=model_dir,
-        model_format=_get_str(model_section, "model_format", "huggingface"),
-        loader_options=dict(_optional_mapping(model_section.get("loader_options"), "model.loader_options")),
-    )
-
-    generation_defaults = GenerateConfig()
-    generation = GenerateConfig(
-        max_new_tokens=_get_int(generation_section, "max_new_tokens", generation_defaults.max_new_tokens),
-        temperature=_get_float(generation_section, "temperature", generation_defaults.temperature),
-        top_p=_get_float(generation_section, "top_p", generation_defaults.top_p),
-        top_k=_get_optional_int(generation_section, "top_k"),
-        stop=_get_stop(generation_section),
-        stream=stream_override or _get_bool(generation_section, "stream", generation_defaults.stream),
-    )
-
-    npu_l3_mode = l3_override or _get_bool_alias(npu_section, ("l3", "l3_mode"), False)
-
-    page_size = _get_optional_int(runtime_section, "page_size")
-    if page_size is None:
-        page_size = 256 if backend == "npu" else 64
-    max_batch_size_default = _L3_BATCH_TILE if backend == "npu" and npu_l3_mode else 1
-    max_batch_size = _get_int(runtime_section, "max_batch_size", max_batch_size_default)
-    if backend == "npu" and npu_l3_mode and max_batch_size != _L3_BATCH_TILE:
-        raise ValueError(
-            f"npu.l3 requires runtime.max_batch_size={_L3_BATCH_TILE}; "
-            f"got {max_batch_size}."
-        )
-    runtime = RuntimeConfig(
-        page_size=page_size,
-        max_batch_size=max_batch_size,
-        max_seq_len=_get_int(runtime_section, "max_seq_len", 4096),
-        device=_get_str(runtime_section, "device", "cpu"),
-        kv_dtype=_get_str(runtime_section, "kv_dtype", "bfloat16"),
-        weight_dtype=_get_str(runtime_section, "weight_dtype", "float32"),
-        total_kv_pages=_get_optional_int(runtime_section, "total_kv_pages"),
-        max_new_tokens=generation.max_new_tokens,
-    )
-
-    npu = NpuCliConfig(
-        platform=_get_str(npu_section, "platform", "a2a3"),
-        device_id=device_override if device_override is not None else _get_int(npu_section, "device_id", 0),
-        save_kernels_dir=_get_optional_str(npu_section, "save_kernels_dir"),
-        pypto_root=_get_optional_str(npu_section, "pypto_root"),
-        l3_mode=npu_l3_mode,
-    )
-
-    return ServingConfig(
-        model=model,
-        runtime=runtime,
-        generation=generation,
-        backend=backend,
-        npu=npu,
+        platform=args.platform,
+        device_id=args.device,
+        executor_cls="PyptoQwen14BExecutor",
+        executor_kwargs=executor_kwargs,
+        runtime_config=_build_runtime_config(args),
+        max_num_running_reqs=args.max_num_seqs,
+        max_num_scheduled_tokens=args.max_num_batched_tokens,
+        long_prefill_token_threshold=args.long_prefill_token_threshold,
+        enable_prefix_cache=args.enable_prefix_caching,
+        enable_chunk_prefill=args.enable_chunked_prefill,
     )
 
 
-def create_engine(config: ServingConfig) -> LLMEngine:
-    _ensure_core_imports(cpu_executor=config.backend == "cpu", executor=config.backend == "npu")
-    kv_cache_manager = KvCacheManager()
-    if config.backend == "cpu":
-        executor = CpuModelExecutor(kv_cache_manager)
-        return LLMEngine(kv_cache_manager=kv_cache_manager, executor=executor)
+def _build_runtime_config(args: argparse.Namespace):
+    kv_dtype = args.kv_cache_dtype
+    if kv_dtype == "auto":
+        kv_dtype = args.dtype
 
-    executor = PyptoExecutor(
-        kv_cache_manager,
-        platform=config.npu.platform,
-        device_id=config.npu.device_id,
-        save_kernels_dir=config.npu.save_kernels_dir,
-        l3_mode=config.npu.l3_mode,
-    )
-    return LLMEngine(kv_cache_manager=kv_cache_manager, executor=executor)
-
-
-def init_engine(engine: LLMEngine, config: ServingConfig) -> None:
-    model_dir = Path(config.model.model_dir).resolve()
-    if not model_dir.is_dir():
-        raise FileNotFoundError(f"Model directory does not exist: {model_dir}")
-
-    engine.init_model(
-        model_id=config.model.model_id,
-        model_dir=str(model_dir),
-        model_format=config.model.model_format,
-        runtime_config=config.runtime,
-        **config.model.loader_options,
+    return RuntimeConfig(
+        page_size=args.block_size,
+        max_batch_size=args.max_num_seqs,
+        max_seq_len=args.max_model_len,
+        device="cpu",
+        kv_dtype=kv_dtype,
+        weight_dtype=args.dtype,
+        max_new_tokens=args.max_new_tokens,
     )
 
 
-def generate_once(
-    engine: LLMEngine,
-    config: ServingConfig,
-    prompt: str,
-    *,
-    stdout: TextIO | None = None,
-    show_role: bool = False,
-) -> None:
-    stdout = stdout or sys.stdout
-    if show_role:
-        print("[assistant]", file=stdout)
-    if config.generation.stream:
-        result = engine.generate(config.model.model_id, prompt, config.generation)
-        for chunk in _as_iterator(result):
-            print(chunk, end="", flush=True, file=stdout)
-        print(file=stdout)
-        return
-
-    result = engine.generate_result(config.model.model_id, prompt, config.generation)
-    print(f"text: {result.text}", file=stdout)
-    print(f"token_ids: {result.token_ids}", file=stdout)
-    print(f"finish_reason: {result.finish_reason}", file=stdout)
-
-
-def run_interactive(
-    engine: LLMEngine,
-    config: ServingConfig,
-    *,
-    input_fn: Callable[[str], str] = input,
-    stdout: TextIO | None = None,
-) -> None:
-    stdout = stdout or sys.stdout
-    _print_interactive_banner(config, stdout)
-    while True:
-        try:
-            prompt = input_fn("[user] ")
-        except EOFError:
-            print(file=stdout)
-            return
-        stripped = prompt.strip()
-        if not stripped:
-            continue
-        if stripped in _EXIT_COMMANDS:
-            print("Bye.", file=stdout)
-            return
-        if stripped in _HELP_COMMANDS:
-            _print_interactive_help(stdout)
-            continue
-        if stripped in _CONFIG_COMMANDS:
-            _print_runtime_summary(config, stdout)
-            continue
-        if stripped in _CLEAR_COMMANDS:
-            print("--- new prompt session ---", file=stdout)
-            continue
-        generate_once(engine, config, prompt, stdout=stdout, show_role=True)
+def _build_executor_kwargs() -> dict[str, object]:
+    executor_kwargs: dict[str, object] = {}
+    pypto_root = os.environ.get("PYPTO_ROOT")
+    save_kernels_dir = os.environ.get("PYPTO_SAVE_KERNELS_DIR")
+    if pypto_root:
+        executor_kwargs["pypto_root"] = pypto_root
+    if save_kernels_dir:
+        executor_kwargs["save_kernels_dir"] = save_kernels_dir
+    return executor_kwargs
 
 
 def run_serve(
-    config: ServingConfig,
+    config: EngineConfig,
     *,
     host: str = "0.0.0.0",
     port: int = 8000,
-    max_num_running_reqs: int = 32,
-    max_num_scheduled_tokens: int = 4096,
-    long_prefill_token_threshold: int = 2048,
-    disable_prefix_cache: bool = False,
-    disable_chunk_prefill: bool = False,
 ) -> None:
     try:
         import uvicorn
     except ImportError as e:
         raise ImportError("Serving mode requires uvicorn. Install with: pip install uvicorn") from e
 
-    from ..core.async_engine import AsyncLLMEngine, ServingConfig as AsyncServingConfig
+    from ..core.async_engine import AsyncLLMEngine
     from ..core.server import create_serving_app
     from ..core.tokenizer import TransformersTokenizerAdapter
-    from ..core.serving_worker import WorkerConfig
 
-    model_id = config.model.model_id
-    model_dir = str(Path(config.model.model_dir).resolve())
-
-    tokenizer = TransformersTokenizerAdapter.from_pretrained(model_dir)
-
-    executor_kwargs = {}
-    if config.npu.pypto_root:
-        executor_kwargs["pypto_root"] = config.npu.pypto_root
-    if config.npu.save_kernels_dir:
-        executor_kwargs["save_kernels_dir"] = config.npu.save_kernels_dir
-    if config.npu.l3_mode:
-        executor_kwargs["l3_mode"] = config.npu.l3_mode
-
-    worker_config = WorkerConfig(
-        model_id=model_id,
-        model_dir=model_dir,
-        platform=config.npu.platform,
-        device_id=config.npu.device_id,
-        runtime_config=config.runtime,
-        executor_cls="PyptoQwen14BExecutor" if config.backend == "npu" else "ModelExecutor",
-        executor_kwargs=executor_kwargs,
-    )
-
-    serving_config = AsyncServingConfig(
-        max_num_running_reqs=max_num_running_reqs,
-        max_num_scheduled_tokens=max_num_scheduled_tokens,
-        long_prefill_token_threshold=long_prefill_token_threshold,
-        max_seq_len=config.runtime.max_seq_len,
-        block_size=config.runtime.page_size,
-        enable_prefix_cache=not disable_prefix_cache,
-        enable_chunk_prefill=not disable_chunk_prefill,
-    )
+    model_id = config.model_id
+    tokenizer = TransformersTokenizerAdapter.from_pretrained(config.model_dir)
 
     async_engine = AsyncLLMEngine(
-        worker_config=worker_config,
-        serving_config=serving_config,
+        config=config,
         tokenizer=tokenizer,
         eos_token_id=tokenizer.eos_token_id,
         bos_token_id=tokenizer.bos_token_id,
@@ -357,129 +179,46 @@ def run_serve(
 
     print(f"Starting PyPTO serving on {host}:{port}")
     print(f"  Model: {model_id} (loaded in worker process)")
-    print(f"  Platform: {config.npu.platform}, Device: {config.npu.device_id}")
-    print(f"  Max running requests: {max_num_running_reqs}")
-    print(f"  Max scheduled tokens/iter: {max_num_scheduled_tokens}")
-    print(f"  Chunked prefill threshold: {long_prefill_token_threshold}")
-    print(f"  Prefix cache: {'enabled' if not disable_prefix_cache else 'disabled'}")
-    print(f"  Chunk prefill: {'enabled' if not disable_chunk_prefill else 'disabled'}")
+    print(f"  Platform: {config.platform}, Device: {config.device_id}")
+    print(f"  Max running requests: {config.max_num_running_reqs}")
+    print(f"  Max scheduled tokens/iter: {config.max_num_scheduled_tokens}")
+    print(f"  Chunked prefill threshold: {config.long_prefill_token_threshold}")
+    print(f"  Prefix cache: {'enabled' if config.enable_prefix_cache else 'disabled'}")
+    print(f"  Chunk prefill: {'enabled' if config.enable_chunk_prefill else 'disabled'}")
     print("  Endpoints: /v1/completions, /v1/chat/completions, /v1/models, /health")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
+def _validate_backend(backend: str) -> None:
+    if backend != "npu":
+        raise ValueError(f"Only NPU backend is supported, got: {backend}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    modes = sum([bool(args.prompt), bool(args.interactive), bool(args.serve)])
-    if modes != 1:
-        raise SystemExit("Specify exactly one of --prompt, --interactive, or --serve.")
 
     with _startup_log_context(enabled=not args.show_startup_logs):
-        config = load_serving_config(
-            args.config,
-            stream_override=args.stream,
-            l3_override=args.l3,
-            device_override=args.device,
-        )
-        if not args.serve:
-            engine = create_engine(config)
-            init_engine(engine, config)
+        config = build_serving_engine_config(args)
 
-    if args.serve:
-        run_serve(
-            config,
-            host=args.host,
-            port=args.port,
-            max_num_running_reqs=args.max_num_running_reqs,
-            max_num_scheduled_tokens=args.max_num_scheduled_tokens,
-            long_prefill_token_threshold=args.long_prefill_token_threshold,
-            disable_prefix_cache=args.disable_prefix_cache,
-            disable_chunk_prefill=args.disable_chunk_prefill,
-        )
-    elif args.interactive:
-        run_interactive(engine, config)
-    else:
-        generate_once(engine, config, args.prompt)
+    run_serve(
+        config,
+        host=args.host,
+        port=args.port,
+    )
     return 0
 
 
-def _ensure_core_imports(*, cpu_executor: bool = False, executor: bool = False) -> None:
-    global GenerateConfig, LLMEngine, RuntimeConfig, KvCacheManager, CpuModelExecutor, PyptoExecutor
+def _ensure_core_imports() -> None:
+    global RuntimeConfig
 
-    if GenerateConfig is None or LLMEngine is None or RuntimeConfig is None:
+    if RuntimeConfig is None:
         try:
-            from ..core import GenerateConfig as imported_generate_config
-            from ..core import LLMEngine as imported_engine
             from ..core import RuntimeConfig as imported_runtime_config
         except ImportError:
-            from python.core import GenerateConfig as imported_generate_config
-            from python.core import LLMEngine as imported_engine
             from python.core import RuntimeConfig as imported_runtime_config
 
-        if GenerateConfig is None:
-            GenerateConfig = imported_generate_config
-        if LLMEngine is None:
-            LLMEngine = imported_engine
-        if RuntimeConfig is None:
-            RuntimeConfig = imported_runtime_config
-
-    if KvCacheManager is None:
-        try:
-            from ..core.kv_cache import KvCacheManager as imported_kv_cache_manager
-        except ImportError:
-            from python.core.kv_cache import KvCacheManager as imported_kv_cache_manager
-        KvCacheManager = imported_kv_cache_manager
-
-    if cpu_executor and CpuModelExecutor is None:
-        try:
-            from examples.model.qwen3_14b.runner.cpu_executor import CpuModelExecutor as imported_cpu_executor
-        except ImportError:
-            from examples.model.qwen3_14b.runner.cpu_executor import CpuModelExecutor as imported_cpu_executor
-        CpuModelExecutor = imported_cpu_executor
-
-    if executor and PyptoExecutor is None:
-        try:
-            from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as imported_executor
-        except ImportError:
-            from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as imported_executor
-        PyptoExecutor = imported_executor
-
-
-def _print_interactive_banner(config: ServingConfig, stdout: TextIO) -> None:
-    print("PyPTO Serving interactive generation", file=stdout)
-    _print_runtime_summary(config, stdout)
-    print("Commands: /help, /config, /clear, /exit, /quit", file=stdout)
-    print("Enter a prompt to generate text.", file=stdout)
-
-
-def _print_interactive_help(stdout: TextIO) -> None:
-    print("Commands:", file=stdout)
-    print("  /help    Show this help.", file=stdout)
-    print("  /config  Show active model, backend, runtime, and generation settings.", file=stdout)
-    print("  /clear   Print a separator for the next prompt.", file=stdout)
-    print("  /exit    Exit interactive mode.", file=stdout)
-    print("  /quit    Exit interactive mode.", file=stdout)
-
-
-def _print_runtime_summary(config: ServingConfig, stdout: TextIO) -> None:
-    print(
-        "Config: "
-        f"model_id={config.model.model_id}, "
-        f"backend={config.backend}, "
-        f"max_seq_len={config.runtime.max_seq_len}, "
-        f"max_new_tokens={config.generation.max_new_tokens}, "
-        f"temperature={config.generation.temperature}, "
-        f"top_p={config.generation.top_p}, "
-        f"top_k={config.generation.top_k}, "
-        f"stream={config.generation.stream}",
-        file=stdout,
-    )
-    if config.backend == "npu":
-        print(
-            f"NPU: platform={config.npu.platform}, device_id={config.npu.device_id}, "
-            f"l3={config.npu.l3_mode}",
-            file=stdout,
-        )
+        RuntimeConfig = imported_runtime_config
 
 
 @contextlib.contextmanager
@@ -510,98 +249,6 @@ def _startup_log_context(*, enabled: bool) -> Iterator[None]:
             os.environ.pop("PTO_LOG_LEVEL", None)
         else:
             os.environ["PTO_LOG_LEVEL"] = old_log_level
-
-
-def _as_iterator(result: str | Iterator[str]) -> Iterator[str]:
-    if isinstance(result, str):
-        yield result
-        return
-    yield from result
-
-
-def _require_mapping(value: object, name: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{name} must be a JSON object.")
-    return value
-
-
-def _optional_mapping(value: object, name: str) -> Mapping[str, Any]:
-    if value is None:
-        return {}
-    if not isinstance(value, Mapping):
-        raise ValueError(f"{name} must be a JSON object.")
-    return value
-
-
-def _get_required_str(section: Mapping[str, Any], key: str, section_name: str) -> str:
-    value = section.get(key)
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{section_name}.{key} must be a non-empty string.")
-    return value
-
-
-def _get_str(section: Mapping[str, Any], key: str, default: str) -> str:
-    value = section.get(key, default)
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{key} must be a non-empty string.")
-    return value
-
-
-def _get_optional_str(section: Mapping[str, Any], key: str) -> str | None:
-    value = section.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"{key} must be a non-empty string when provided.")
-    return value
-
-
-def _get_int(section: Mapping[str, Any], key: str, default: int) -> int:
-    value = section.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{key} must be an integer.")
-    return value
-
-
-def _get_optional_int(section: Mapping[str, Any], key: str) -> int | None:
-    value = section.get(key)
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{key} must be an integer when provided.")
-    return value
-
-
-def _get_float(section: Mapping[str, Any], key: str, default: float) -> float:
-    value = section.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ValueError(f"{key} must be a number.")
-    return float(value)
-
-
-def _get_bool(section: Mapping[str, Any], key: str, default: bool) -> bool:
-    value = section.get(key, default)
-    if not isinstance(value, bool):
-        raise ValueError(f"{key} must be a boolean.")
-    return value
-
-
-def _get_bool_alias(section: Mapping[str, Any], keys: tuple[str, ...], default: bool) -> bool:
-    for key in keys:
-        if key in section:
-            return _get_bool(section, key, default)
-    return default
-
-
-def _get_stop(section: Mapping[str, Any]) -> tuple[str, ...]:
-    value = section.get("stop", ())
-    if isinstance(value, str):
-        return (value,)
-    if not isinstance(value, list | tuple):
-        raise ValueError("stop must be a string or a list of strings.")
-    if not all(isinstance(item, str) for item in value):
-        raise ValueError("stop must contain only strings.")
-    return tuple(value)
 
 
 if __name__ == "__main__":

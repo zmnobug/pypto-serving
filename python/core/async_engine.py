@@ -18,22 +18,33 @@ from dataclasses import dataclass, field
 
 from .kv_cache import KvCacheManager
 from .scheduler import Request, RequestStatus, Scheduler, SchedulerConfig, SchedulerOutput
-from .types import StepOutput, WorkerCommand
-from .serving_worker import WorkerConfig, WorkerProcess, spawn_worker
+from .types import RuntimeConfig, StepOutput, WorkerCommand
+from .serving_worker import spawn_worker
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ServingConfig:
+class EngineConfig:
+    # Model
+    model_id: str = ""
+    model_dir: str = ""
+
+    # Device / executor
+    platform: str = "a2a3"
+    device_id: int = 0
+    executor_cls: str = "PyptoQwen14BExecutor"
+    executor_kwargs: dict = field(default_factory=dict)
+
+    # Runtime
+    runtime_config: RuntimeConfig | None = None
+
+    # Scheduler / serving
     max_num_running_reqs: int = 32
     max_num_scheduled_tokens: int = 4096
     long_prefill_token_threshold: int = 2048
-    max_seq_len: int = 4096
     engine_loop_interval: float = 0.001
-    # Must equal RuntimeConfig.page_size for unified block/page management
-    block_size: int = 64
-    num_blocks: int | None = None
+
     # Feature flags
     enable_prefix_cache: bool = True
     enable_chunk_prefill: bool = True
@@ -63,32 +74,20 @@ class AsyncLLMEngine:
 
     def __init__(
         self,
-        worker_config: WorkerConfig,
-        serving_config: ServingConfig | None = None,
+        config: EngineConfig,
         tokenizer=None,
         eos_token_id: int | None = None,
-        bos_token_id: int | None = None,
-        in_process: bool = False,
+        bos_token_id: int | None = None
     ) -> None:
-        self.worker_config = worker_config
-        self.config = serving_config or ServingConfig()
+        self.config = config
         self.tokenizer = tokenizer
         self.eos_token_id = eos_token_id
         self.bos_token_id = bos_token_id
-        self._in_process = in_process
 
-        block_size = self.config.block_size
-        num_blocks = self.config.num_blocks
-        if self.worker_config.runtime_config is not None:
-            runtime = self.worker_config.runtime_config
-            block_size = runtime.page_size
-            max_blocks_per_seq = (runtime.max_seq_len + runtime.page_size - 1) // runtime.page_size
-            num_blocks = runtime.total_kv_pages or runtime.max_batch_size * max_blocks_per_seq
-        if num_blocks is None:
-            num_blocks = self.config.max_num_running_reqs * (
-                (self.config.max_seq_len + block_size - 1) // block_size
-            )
-        self.config.block_size = block_size
+        runtime = self.config.runtime_config or RuntimeConfig()
+        block_size = runtime.page_size
+        max_blocks_per_seq = (runtime.max_seq_len + block_size - 1) // block_size
+        num_blocks = runtime.total_kv_pages or runtime.max_batch_size * max_blocks_per_seq
         self.kv_cache_manager = KvCacheManager(
             num_blocks=num_blocks,
             block_size=block_size,
@@ -99,7 +98,7 @@ class AsyncLLMEngine:
             max_num_running_reqs=self.config.max_num_running_reqs,
             max_num_scheduled_tokens=self.config.max_num_scheduled_tokens,
             long_prefill_token_threshold=self.config.long_prefill_token_threshold,
-            max_seq_len=self.config.max_seq_len,
+            max_seq_len=runtime.max_seq_len,
             enable_prefix_cache=self.config.enable_prefix_cache,
             enable_chunk_prefill=self.config.enable_chunk_prefill,
         )
@@ -117,32 +116,16 @@ class AsyncLLMEngine:
 
     async def start(self) -> None:
         """Start worker process and engine loop."""
-        import queue
-        import threading
+        process, input_q, output_q, ready_event = spawn_worker(self.config)
+        self._worker_process = process
+        self._input_queue = input_q
+        self._output_queue = output_q
 
-        if self._in_process:
-            self._input_queue = queue.Queue()
-            self._output_queue = queue.Queue()
-            worker = WorkerProcess(
-                self.worker_config, self._input_queue, self._output_queue
-            )
-            worker.init_device_and_model()
-            self._worker_thread = threading.Thread(
-                target=worker.busy_loop, daemon=True
-            )
-            self._worker_thread.start()
-            logger.info("Worker started in-process (thread mode)")
-        else:
-            process, input_q, output_q, ready_event = spawn_worker(self.worker_config)
-            self._worker_process = process
-            self._input_queue = input_q
-            self._output_queue = output_q
-
-            logger.info("Waiting for worker to initialize model...")
-            await asyncio.to_thread(ready_event.wait, timeout=600)
-            if not ready_event.is_set():
-                raise RuntimeError("Worker failed to initialize within timeout")
-            logger.info("Worker ready")
+        logger.info("Waiting for worker to initialize model...")
+        await asyncio.to_thread(ready_event.wait, timeout=600)
+        if not ready_event.is_set():
+            raise RuntimeError("Worker failed to initialize within timeout")
+        logger.info("Worker ready")
 
         self._running = True
         self._loop_task = asyncio.create_task(self._engine_loop())
@@ -158,16 +141,11 @@ class AsyncLLMEngine:
         if self._input_queue is not None:
             self._input_queue.put(WorkerCommand(type="shutdown"))
 
-        if self._in_process:
-            if hasattr(self, "_worker_thread") and self._worker_thread is not None:
-                self._worker_thread.join(timeout=10)
-                self._worker_thread = None
-        else:
-            if self._worker_process is not None:
-                self._worker_process.join(timeout=30)
-                if self._worker_process.is_alive():
-                    self._worker_process.terminate()
-                self._worker_process = None
+        if self._worker_process is not None:
+            self._worker_process.join(timeout=30)
+            if self._worker_process.is_alive():
+                self._worker_process.terminate()
+            self._worker_process = None
         logger.info("AsyncLLMEngine stopped")
 
     def generate_request_id(self) -> str:

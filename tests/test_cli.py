@@ -9,320 +9,134 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import python.cli.main as cli
-from python.core import GenerateConfig, RuntimeConfig
 
 
-class _FakeEngine:
-    instances: list["_FakeEngine"] = []
-
-    def __init__(self, kv_cache_manager=None, executor=None):
-        self.kv_cache_manager = kv_cache_manager
-        self.executor = executor
-        self.init_calls = []
-        self.result_prompts = []
-        self.stream_prompts = []
-        _FakeEngine.instances.append(self)
-
-    def init_model(self, **kwargs):
-        self.init_calls.append(kwargs)
-
-    def generate_result(self, model_id, prompt, config):
-        self.result_prompts.append((model_id, prompt, config))
-        return SimpleNamespace(
-            text=f"generated:{prompt}",
-            token_ids=[1, 2, 3],
-            finish_reason="length",
-        )
-
-    def generate(self, model_id, prompt, config):
-        self.stream_prompts.append((model_id, prompt, config))
-        return iter(["stream:", prompt])
+def _parse_args(argv: list[str]):
+    return cli.build_parser().parse_args(argv)
 
 
-class _FakeNpuExecutor:
-    instances: list["_FakeNpuExecutor"] = []
+def test_build_serving_engine_config_uses_cli_args(tmp_path, monkeypatch):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    monkeypatch.setenv("PYPTO_ROOT", "/tmp/pypto")
+    monkeypatch.setenv("PYPTO_SAVE_KERNELS_DIR", "/tmp/kernels")
+    args = _parse_args([
+        "--model", str(model_dir),
+        "--served-model-name", "api-model",
+        "--backend", "npu",
+        "--platform", "a5",
+        "--device", "2",
+        "--max-model-len", "1024",
+        "--block-size", "64",
+        "--dtype", "bfloat16",
+        "--kv-cache-dtype", "auto",
+        "--max-new-tokens", "8",
+        "--max-num-seqs", "4",
+        "--max-num-batched-tokens", "256",
+        "--long-prefill-token-threshold", "64",
+        "--no-enable-prefix-caching",
+        "--no-enable-chunked-prefill",
+    ])
 
-    def __init__(self, kv_cache_manager, **kwargs):
-        self.kv_cache_manager = kv_cache_manager
-        self.kwargs = kwargs
-        _FakeNpuExecutor.instances.append(self)
+    config = cli.build_serving_engine_config(args)
 
-
-def _write_config(tmp_path: Path, data: dict) -> Path:
-    path = tmp_path / "serving.json"
-    path.write_text(json.dumps(data))
-    return path
-
-
-def _base_config(model_dir: Path, *, backend: str = "cpu") -> dict:
-    return {
-        "model": {
-            "model_id": "test-model",
-            "model_dir": str(model_dir),
-            "model_format": "huggingface",
-        },
-        "runtime": {
-            "backend": backend,
-            "max_seq_len": 128,
-        },
-        "generation": {
-            "max_new_tokens": 4,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "stop": ["</s>"],
-        },
+    assert config.model_id == "api-model"
+    assert config.model_dir == str(model_dir.resolve())
+    assert config.platform == "a5"
+    assert config.device_id == 2
+    assert config.executor_cls == "PyptoQwen14BExecutor"
+    assert config.executor_kwargs == {
+        "pypto_root": "/tmp/pypto",
+        "save_kernels_dir": "/tmp/kernels",
     }
+    assert config.runtime_config.page_size == 64
+    assert config.runtime_config.max_batch_size == 4
+    assert config.runtime_config.max_seq_len == 1024
+    assert config.runtime_config.kv_dtype == "bfloat16"
+    assert config.runtime_config.weight_dtype == "bfloat16"
+    assert config.runtime_config.max_new_tokens == 8
+    assert config.max_num_running_reqs == 4
+    assert config.max_num_scheduled_tokens == 256
+    assert config.long_prefill_token_threshold == 64
+    assert config.enable_prefix_cache is False
+    assert config.enable_chunk_prefill is False
 
 
-def test_load_serving_config_defaults_npu_page_size(tmp_path):
+def test_parser_rejects_invalid_backend(tmp_path):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    config_path = _write_config(tmp_path, _base_config(model_dir, backend="npu"))
 
-    config = cli.load_serving_config(config_path)
-
-    assert config.backend == "npu"
-    assert config.runtime.page_size == 256
-    assert config.runtime.max_seq_len == 128
-    assert config.runtime.max_new_tokens == 4
-    assert config.generation.stop == ("</s>",)
-    assert config.npu.l3_mode is False
+    with pytest.raises(SystemExit):
+        _parse_args(["--model", str(model_dir), "--backend", "cpu"])
 
 
-def test_load_serving_config_accepts_l3_npu_options(tmp_path):
+def test_parser_rejects_removed_prompt_mode(tmp_path):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    config_data = _base_config(model_dir, backend="npu")
-    config_data["npu"] = {
-        "l3": True,
-    }
-    config_path = _write_config(tmp_path, config_data)
 
-    config = cli.load_serving_config(config_path)
-
-    assert config.runtime.max_batch_size == 16
-    assert config.runtime.max_new_tokens == 4
-    assert config.generation.max_new_tokens == 4
-    assert config.npu.l3_mode is True
+    with pytest.raises(SystemExit):
+        _parse_args(["--model", str(model_dir), "--backend", "npu", "--prompt", "hello"])
 
 
-def test_load_serving_config_rejects_l3_max_batch_size_mismatch(tmp_path):
+def test_main_starts_serving(tmp_path, monkeypatch):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    config_data = _base_config(model_dir, backend="npu")
-    config_data["runtime"]["max_batch_size"] = 1
-    config_data["npu"] = {
-        "l3": True,
-    }
-    config_path = _write_config(tmp_path, config_data)
-
-    with pytest.raises(ValueError, match="runtime.max_batch_size=16"):
-        cli.load_serving_config(config_path)
-
-
-def test_load_serving_config_applies_l3_cli_overrides(tmp_path):
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    config_path = _write_config(tmp_path, _base_config(model_dir, backend="npu"))
-
-    config = cli.load_serving_config(config_path, l3_override=True)
-
-    assert config.runtime.max_batch_size == 16
-    assert config.npu.l3_mode is True
-
-
-def test_load_serving_config_applies_device_cli_override(tmp_path):
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    config_data = _base_config(model_dir, backend="npu")
-    config_data["npu"] = {
-        "device_id": 3,
-    }
-    config_path = _write_config(tmp_path, config_data)
-
-    config = cli.load_serving_config(config_path, device_override=7)
-
-    assert config.npu.device_id == 7
-
-
-def test_load_serving_config_rejects_missing_model_dir(tmp_path):
-    config_path = _write_config(
-        tmp_path,
-        {
-            "model": {},
-            "runtime": {"backend": "cpu"},
-            "generation": {},
-        },
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_serve",
+        lambda config, *, host, port: calls.append((config, host, port)),
     )
 
-    with pytest.raises(ValueError, match="model.model_dir"):
-        cli.load_serving_config(config_path)
+    assert cli.main(["--model", str(model_dir), "--backend", "npu", "--host", "127.0.0.1", "--port", "8899"]) == 0
 
-
-def test_main_one_shot_cpu_uses_json_config(tmp_path, monkeypatch, capsys):
-    _FakeEngine.instances.clear()
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    config_path = _write_config(tmp_path, _base_config(model_dir, backend="cpu"))
-    monkeypatch.setattr(cli, "LLMEngine", _FakeEngine)
-
-    assert cli.main(["--config", str(config_path), "--prompt", "hello"]) == 0
-
-    engine = _FakeEngine.instances[-1]
-    assert engine.executor is not None
-    assert engine.init_calls[0]["model_id"] == "test-model"
-    assert engine.init_calls[0]["model_dir"] == str(model_dir.resolve())
-    assert engine.result_prompts[0][1] == "hello"
-    out = capsys.readouterr().out
-    assert "text: generated:hello" in out
-    assert "finish_reason: length" in out
-
-
-def test_main_passes_device_override_to_config_loader(tmp_path, monkeypatch):
-    _FakeEngine.instances.clear()
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    config_path = _write_config(tmp_path, _base_config(model_dir, backend="cpu"))
-    seen_kwargs = {}
-    real_load_serving_config = cli.load_serving_config
-
-    def fake_load_serving_config(path, **kwargs):
-        seen_kwargs.update(kwargs)
-        return real_load_serving_config(path, **kwargs)
-
-    monkeypatch.setattr(cli, "load_serving_config", fake_load_serving_config)
-    monkeypatch.setattr(cli, "LLMEngine", _FakeEngine)
-
-    assert cli.main(["--config", str(config_path), "--prompt", "hello", "--device", "9"]) == 0
-
-    assert seen_kwargs["device_override"] == 9
+    config, host, port = calls[-1]
+    assert config.model_id == model_dir.name
+    assert host == "127.0.0.1"
+    assert port == 8899
 
 
 def test_main_suppresses_startup_logs_by_default(tmp_path, monkeypatch):
-    _FakeEngine.instances.clear()
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    config_path = _write_config(tmp_path, _base_config(model_dir, backend="cpu"))
     startup_context_flags = []
-    monkeypatch.setattr(cli, "LLMEngine", _FakeEngine)
+    monkeypatch.setattr(cli, "run_serve", lambda config, *, host, port: None)
     monkeypatch.setattr(
         cli,
         "_startup_log_context",
         lambda *, enabled: _RecordingContext(startup_context_flags, enabled),
     )
 
-    cli.main(["--config", str(config_path), "--prompt", "hello"])
+    cli.main(["--model", str(model_dir), "--backend", "npu"])
 
     assert startup_context_flags == [True]
 
 
 def test_main_can_show_startup_logs(tmp_path, monkeypatch):
-    _FakeEngine.instances.clear()
     model_dir = tmp_path / "model"
     model_dir.mkdir()
-    config_path = _write_config(tmp_path, _base_config(model_dir, backend="cpu"))
     startup_context_flags = []
-    monkeypatch.setattr(cli, "LLMEngine", _FakeEngine)
+    monkeypatch.setattr(cli, "run_serve", lambda config, *, host, port: None)
     monkeypatch.setattr(
         cli,
         "_startup_log_context",
         lambda *, enabled: _RecordingContext(startup_context_flags, enabled),
     )
 
-    cli.main(["--config", str(config_path), "--prompt", "hello", "--show-startup-logs"])
+    cli.main(["--model", str(model_dir), "--backend", "npu", "--show-startup-logs"])
 
     assert startup_context_flags == [False]
-
-
-def test_create_engine_npu_wires_executor_options(tmp_path, monkeypatch):
-    _FakeEngine.instances.clear()
-    _FakeNpuExecutor.instances.clear()
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    config_data = _base_config(model_dir, backend="npu")
-    config_data["npu"] = {
-        "platform": "a5",
-        "device_id": 3,
-        "save_kernels_dir": "/tmp/kernels",
-    }
-    config_path = _write_config(tmp_path, config_data)
-    monkeypatch.setattr(cli, "LLMEngine", _FakeEngine)
-    monkeypatch.setattr(cli, "PyptoExecutor", _FakeNpuExecutor)
-
-    engine = cli.create_engine(cli.load_serving_config(config_path))
-
-    executor = _FakeNpuExecutor.instances[-1]
-    assert engine.executor is executor
-    assert executor.kwargs == {
-        "platform": "a5",
-        "device_id": 3,
-        "save_kernels_dir": "/tmp/kernels",
-        "l3_mode": False,
-    }
-
-
-def test_create_engine_npu_wires_l3_executor_options(tmp_path, monkeypatch):
-    _FakeEngine.instances.clear()
-    _FakeNpuExecutor.instances.clear()
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    config_data = _base_config(model_dir, backend="npu")
-    config_data["npu"] = {
-        "l3_mode": True,
-    }
-    config_path = _write_config(tmp_path, config_data)
-    monkeypatch.setattr(cli, "LLMEngine", _FakeEngine)
-    monkeypatch.setattr(cli, "PyptoExecutor", _FakeNpuExecutor)
-
-    engine = cli.create_engine(cli.load_serving_config(config_path))
-
-    executor = _FakeNpuExecutor.instances[-1]
-    assert engine.executor is executor
-    assert executor.kwargs["l3_mode"] is True
-
-
-def test_run_interactive_reuses_engine_until_exit(capsys):
-    _FakeEngine.instances.clear()
-    engine = _FakeEngine()
-    config = cli.ServingConfig(
-        model=cli.ModelCliConfig(
-            model_id="test-model",
-            model_dir="/tmp/model",
-            model_format="huggingface",
-            loader_options={},
-        ),
-        runtime=RuntimeConfig(),
-        generation=GenerateConfig(max_new_tokens=1),
-        backend="cpu",
-        npu=cli.NpuCliConfig(),
-    )
-    prompts = iter(["/help", "/config", "/clear", "first", "", "second", "/exit"])
-
-    cli.run_interactive(engine, config, input_fn=lambda _: next(prompts))
-
-    assert [prompt for _, prompt, _ in engine.result_prompts] == ["first", "second"]
-    out = capsys.readouterr().out
-    assert "PyPTO Serving interactive generation" in out
-    assert "Commands: /help, /config, /clear, /exit, /quit" in out
-    assert "Commands:" in out
-    assert "model_id=test-model" in out
-    assert "--- new prompt session ---" in out
-    assert "[assistant]" in out
-    assert "text: generated:first" in out
-    assert "text: generated:second" in out
-    assert "Bye." in out
 
 
 class _RecordingContext:

@@ -70,26 +70,17 @@ python examples/model/qwen3_14b/npu_generate.py \
   --l3
 ```
 
-Interactive generation:
-
-```bash
-./examples/pypto-serving \
-  --config examples/model/qwen3_14b/npu_serving.json \
-  --device 0 \
-  --interactive
-```
-
-At the `[user]` prompt, enter a prompt such as `Huawei is`; use `/exit` or
-`/quit` to leave the interactive session.
-
 ## HTTP Serving (OpenAI-compatible API)
 
 Start the serving server with multiprocess worker:
 
 ```bash
 python -m python.cli.main \
-  --config examples/model/qwen3_14b/npu_serving.json \
-  --serve --port 8899 --device {}
+  --model /path/to/Qwen3-14B \
+  --backend npu \
+  --platform a2a3 \
+  --device 0 \
+  --port 8899
 ```
 
 Test with curl:
@@ -122,11 +113,8 @@ python tests/bench_serving.py --port 8899 --stream -n 8 -c 4 --max-tokens 16
 
 ## Notes
 
-- The sample config points at `/data/linyifan/models/Qwen3-14B`; edit
-  `examples/model/qwen3_14b/npu_serving.json` or pass another config if your
-  model path differs.
-- `./examples/pypto-serving --device <id>` overrides `npu.device_id` from the
-  JSON config for both one-shot and interactive serving.
+- All model/device/runtime options are passed via CLI arguments. Run
+  `python -m python.cli.main --help` for the full list.
 - Generated kernel artifacts are written under `build_output/` and are ignored
   by git.
 - This repository expects PyPTO, CANN, torch, safetensors, transformers, and the

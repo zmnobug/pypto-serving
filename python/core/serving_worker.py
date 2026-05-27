@@ -11,31 +11,23 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
-from dataclasses import dataclass, field
 
 import torch
+
+from typing import TYPE_CHECKING
 
 from .types import (
     DecodeBatch,
     PrefillBatch,
-    RuntimeConfig,
     SamplingParams,
     StepOutput,
     WorkerCommand,
 )
 
+if TYPE_CHECKING:
+    from .async_engine import EngineConfig
+
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class WorkerConfig:
-    model_id: str = ""
-    model_dir: str = ""
-    platform: str = "a2a3"
-    device_id: int = 0
-    runtime_config: RuntimeConfig | None = None
-    executor_cls: str = "PyptoQwen14BExecutor"
-    executor_kwargs: dict = field(default_factory=dict)
 
 
 class WorkerProcess:
@@ -47,7 +39,7 @@ class WorkerProcess:
 
     def __init__(
         self,
-        config: WorkerConfig,
+        config: EngineConfig,
         input_queue: mp.Queue,
         output_queue: mp.Queue,
     ):
@@ -278,7 +270,7 @@ class WorkerProcess:
 
 
 def _worker_entry(
-    config: WorkerConfig,
+    config: EngineConfig,
     input_queue: mp.Queue,
     output_queue: mp.Queue,
     ready_event,
@@ -297,7 +289,7 @@ def _worker_entry(
         ready_event.set()
 
 
-def spawn_worker(config: WorkerConfig) -> tuple[mp.Process, mp.Queue, mp.Queue, mp.Event]:
+def spawn_worker(config: EngineConfig) -> tuple[mp.Process, mp.Queue, mp.Queue, mp.Event]:
     """Spawn a worker process and return (process, input_queue, output_queue, ready_event)."""
     ctx = mp.get_context("spawn")
     input_queue = ctx.Queue()
