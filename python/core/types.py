@@ -183,8 +183,7 @@ class PrefillBatch:
     seq_lens: torch.Tensor
     kv_allocations: list[KvAllocation] = field(default_factory=list)
     positions: torch.Tensor | None = None
-    block_table: torch.Tensor | None = None
-    slot_mapping: torch.Tensor | None = None
+    block_ids: list[list[int]] = field(default_factory=list)
 
 
 @dataclass
@@ -204,8 +203,7 @@ class DecodeBatch:
     hidden_states: torch.Tensor
     seq_lens: torch.Tensor
     kv_allocations: list[KvAllocation] = field(default_factory=list)
-    block_table: torch.Tensor | None = None
-    slot_mapping: torch.Tensor | None = None
+    block_ids: list[list[int]] = field(default_factory=list)
 
 
 @dataclass

@@ -322,15 +322,13 @@ class KvCacheManager:
             alloc.tokens_capacity = len(alloc.page_ids) * pool.page_size
         return self.slot_mapping_for_request(alloc, alloc.tokens_used)
 
-    def block_table_for_batch(self, allocations: list[KvAllocation]) -> torch.Tensor:
-        """Return a dense ``[batch, max_blocks]`` block table for requests."""
-        return block_table_from_block_ids([alloc.page_ids for alloc in allocations])
-
     def slot_mapping_for_request(self, alloc: KvAllocation, token_index: int | None = None) -> int:
         """Return the physical slot index for a request token."""
         pool = self._pool(alloc.model_id)
         logical_index = alloc.tokens_used if token_index is None else token_index
-        return slot_mapping_for_decode(alloc.page_ids, logical_index, pool.page_size)
+        page_idx = logical_index // pool.page_size
+        offset = logical_index % pool.page_size
+        return alloc.page_ids[page_idx] * pool.page_size + offset
 
     def slot_mapping_for_batch(self, allocations: list[KvAllocation]) -> torch.Tensor:
         """Return current decode slot mappings for a batch."""
@@ -338,17 +336,6 @@ class KvCacheManager:
             [self.slot_mapping_for_request(alloc) for alloc in allocations],
             dtype=torch.int32,
         )
-
-    def slot_mapping_for_positions(
-        self,
-        alloc: KvAllocation,
-        num_tokens: int,
-        *,
-        max_tokens: int | None = None,
-    ) -> torch.Tensor:
-        """Return per-position slot mappings, optionally padded with -1."""
-        pool = self._pool(alloc.model_id)
-        return slot_mapping_for_positions(alloc.page_ids, num_tokens, pool.page_size, max_tokens=max_tokens)
 
     def write_tokens(
         self,
@@ -445,74 +432,3 @@ class KvCacheManager:
         if model_id not in self._pools:
             raise KeyError(f"Model {model_id} is not registered with the KV cache manager.")
         return self._pools[model_id]
-
-
-# ---------------------------------------------------------------------------
-# Standalone utility functions for block-table / slot-mapping computation.
-# These are pure math (no allocation state) and can be used directly by
-# the serving worker without a KvCacheManager instance.
-# ---------------------------------------------------------------------------
-
-def block_table_from_block_ids(block_ids_batch: list[list[int]]) -> torch.Tensor:
-    """Return a dense ``[batch, max_blocks]`` int32 block table from physical block IDs."""
-    max_blocks = max((len(bids) for bids in block_ids_batch), default=0)
-    table = torch.full((len(block_ids_batch), max_blocks), -1, dtype=torch.int32)
-    for row, block_ids in enumerate(block_ids_batch):
-        if block_ids:
-            table[row, : len(block_ids)] = torch.tensor(block_ids, dtype=torch.int32)
-    return table
-
-
-def slot_mapping_from_block_ids(
-    block_ids: list[int],
-    token_indices: range | list[int],
-    page_size: int,
-) -> torch.Tensor:
-    """Return physical slot IDs for absolute token indices in one request."""
-    slots = []
-    for token_index in token_indices:
-        page_idx = token_index // page_size
-        offset = token_index % page_size
-        slots.append(block_ids[page_idx] * page_size + offset)
-    return torch.tensor(slots, dtype=torch.int32)
-
-
-def slot_mapping_from_block_ids_batch(
-    block_ids_batch: list[list[int]],
-    token_indices_batch: list[range | list[int]],
-    page_size: int,
-) -> torch.Tensor:
-    """Return a padded ``[batch, max_tokens]`` int32 slot mapping from block IDs."""
-    mappings = [
-        slot_mapping_from_block_ids(block_ids, token_indices, page_size)
-        for block_ids, token_indices in zip(block_ids_batch, token_indices_batch, strict=True)
-    ]
-    max_slots = max((mapping.numel() for mapping in mappings), default=0)
-    table = torch.full((len(mappings), max_slots), -1, dtype=torch.int32)
-    for row, mapping in enumerate(mappings):
-        if mapping.numel() > 0:
-            table[row, : mapping.numel()] = mapping
-    return table
-
-
-def slot_mapping_for_decode(page_ids: list[int], tokens_used: int, page_size: int) -> int:
-    """Return the single physical slot for a decode step."""
-    page_idx = tokens_used // page_size
-    offset = tokens_used % page_size
-    return page_ids[page_idx] * page_size + offset
-
-
-def slot_mapping_for_positions(
-    page_ids: list[int],
-    num_tokens: int,
-    page_size: int,
-    max_tokens: int | None = None,
-) -> torch.Tensor:
-    """Return per-position slot mappings, optionally padded with -1."""
-    size = num_tokens if max_tokens is None else max_tokens
-    mapping = torch.full((size,), -1, dtype=torch.int32)
-    for token_index in range(num_tokens):
-        page_idx = token_index // page_size
-        offset = token_index % page_size
-        mapping[token_index] = page_ids[page_idx] * page_size + offset
-    return mapping

@@ -23,7 +23,6 @@ try:
     from python.core.types import (
         DecodeBatch,
         DecodeResult,
-        KvAllocation,
         PrefillBatch,
         PrefillResult,
         RuntimeModel,
@@ -36,7 +35,6 @@ except ImportError:
     from python.core.types import (
         DecodeBatch,
         DecodeResult,
-        KvAllocation,
         PrefillBatch,
         PrefillResult,
         RuntimeModel,
@@ -92,8 +90,6 @@ class _CompiledKernels:
     layers: list[_KernelLayerWeights]
     decode_weights: dict[str, torch.Tensor]
     decode_logits_buffer: torch.Tensor
-    prefill_block_table_stride: int | None = None
-    decode_block_table_stride: int | None = None
     # L3-wrapped generate artifacts. Populated only when l3_mode=True.
     stacked_weights: dict[str, torch.Tensor] | None = None
     l3_generate_chip_callables: dict[str, object] | None = None
@@ -942,22 +938,11 @@ class Qwen314BModelRunner(ModelRunner):
         actual_batch = self._validate_batch_size(model, batch_count)
         max_seq = model.runtime.max_seq_len
         hidden_size = model.config.hidden_size
-        max_blocks = (
-            self._compiled.prefill_block_table_stride
-            if self._compiled is not None and self._compiled.prefill_block_table_stride is not None
-            else self._max_blocks_per_seq(model)
-        )
+        page_size = self._kv_page_sizes.get(model.config.model_id, model.runtime.page_size)
+        max_blocks = self._max_blocks_per_seq(model)
         if padded:
-            # L3 generate reuses this block table for both prefill and decode.
-            # Size it for the full reserved allocation, not only the standalone
-            # prefill kernel's context-tile constant.
-            if self._compiled is not None and self._compiled.decode_block_table_stride is not None:
-                max_blocks = max(max_blocks, self._compiled.decode_block_table_stride)
-            max_blocks = max(max_blocks, self._max_blocks_per_seq(model))
             if batch.kv_allocations:
                 max_blocks = max(max_blocks, max(len(alloc.page_ids) for alloc in batch.kv_allocations))
-
-        has_precomputed = batch.slot_mapping is not None and batch.block_table is not None
 
         seq_lens = torch.empty((actual_batch,), dtype=torch.int32)
         block_table = torch.full((actual_batch * max_blocks,), -1, dtype=torch.int32)
@@ -985,36 +970,19 @@ class Qwen314BModelRunner(ModelRunner):
             else:
                 hidden[token_offset : token_offset + seq_len, :] = embeddings
 
-            if has_precomputed:
-                bt_row = batch.block_table[batch_idx]
-                valid_blocks = (bt_row >= 0).sum().item()
-                block_table[
-                    batch_idx * max_blocks : batch_idx * max_blocks + valid_blocks
-                ] = bt_row[:valid_blocks].to(torch.int32).cpu()
+            if alloc is not None:
+                page_ids = alloc.page_ids
+            elif batch_idx < len(batch.block_ids):
+                page_ids = batch.block_ids[batch_idx]
+            else:
+                page_ids = []
+            self._write_block_table_row(block_table, batch_idx, max_blocks, page_ids)
 
-                sm_row = batch.slot_mapping[batch_idx]
-                valid_slots = (sm_row >= 0).sum().item()
-                if padded:
-                    slot_mapping[
-                        batch_idx * max_seq : batch_idx * max_seq + valid_slots
-                    ] = sm_row[:valid_slots].to(torch.int32).cpu()
-                else:
-                    slot_mapping[
-                        token_offset : token_offset + seq_len
-                    ] = sm_row[:seq_len].to(torch.int32).cpu()
-            elif alloc is not None:
-                self._write_block_table_row(block_table, batch_idx, max_blocks, alloc)
-                from python.core.kv_cache import slot_mapping_for_positions as _slot_mapping_for_positions
-                slot_row = _slot_mapping_for_positions(
-                    alloc.page_ids,
-                    seq_len,
-                    self._kv_page_sizes[model.config.model_id],
-                    max_tokens=max_seq,
-                )
-                if padded:
-                    slot_mapping[batch_idx * max_seq : (batch_idx + 1) * max_seq] = slot_row
-                else:
-                    slot_mapping[token_offset : token_offset + seq_len] = slot_row[:seq_len]
+            slot_row = self._compute_slot_mapping(page_ids, seq_len, page_size)
+            if padded:
+                slot_mapping[batch_idx * max_seq : batch_idx * max_seq + seq_len] = slot_row
+            else:
+                slot_mapping[token_offset : token_offset + seq_len] = slot_row
             token_offset += seq_len
 
         return _PrefillInputs(
@@ -1034,14 +1002,8 @@ class Qwen314BModelRunner(ModelRunner):
         batch_count = len(batch.kv_allocations) if batch.kv_allocations else int(batch.seq_lens.shape[0])
         actual_batch = self._validate_batch_size(model, batch_count)
         hidden_size = model.config.hidden_size
-        decode_block_table_stride = (
-            self._compiled.decode_block_table_stride
-            if self._compiled is not None
-            else None
-        )
-        max_blocks = decode_block_table_stride or self._max_blocks_per_seq(model)
-
-        has_precomputed = batch.slot_mapping is not None and batch.block_table is not None
+        page_size = self._kv_page_sizes.get(model.config.model_id, model.runtime.page_size)
+        max_blocks = self._max_blocks_per_seq(model)
 
         hidden = torch.zeros((actual_batch, hidden_size), dtype=torch.bfloat16)
         seq_lens = torch.empty((actual_batch,), dtype=torch.int32)
@@ -1060,19 +1022,18 @@ class Qwen314BModelRunner(ModelRunner):
             hidden[batch_idx, :] = batch.hidden_states[batch_idx].to(torch.bfloat16).cpu()
             seq_lens[batch_idx] = seq_len
 
-            if has_precomputed:
-                bt_row = batch.block_table[batch_idx]
-                valid_blocks = (bt_row >= 0).sum().item()
-                block_table[
-                    batch_idx * max_blocks : batch_idx * max_blocks + valid_blocks
-                ] = bt_row[:valid_blocks].to(torch.int32).cpu()
-                slot_mapping[batch_idx] = batch.slot_mapping[batch_idx].to(torch.int32).cpu()
-            elif alloc is not None:
-                self._write_block_table_row(block_table, batch_idx, max_blocks, alloc)
-                from python.core.kv_cache import slot_mapping_for_decode as _slot_mapping_for_decode
-                slot_mapping[batch_idx] = _slot_mapping_for_decode(
-                    alloc.page_ids, alloc.tokens_used, self._kv_page_sizes[model.config.model_id]
-                )
+            if alloc is not None:
+                page_ids = alloc.page_ids
+            elif batch_idx < len(batch.block_ids):
+                page_ids = batch.block_ids[batch_idx]
+            else:
+                page_ids = []
+            self._write_block_table_row(block_table, batch_idx, max_blocks, page_ids)
+
+            tokens_used = seq_len - 1
+            page_idx = tokens_used // page_size
+            offset = tokens_used % page_size
+            slot_mapping[batch_idx] = page_ids[page_idx] * page_size + offset
 
         return _DecodeInputs(
             actual_batch=actual_batch,
@@ -1083,17 +1044,31 @@ class Qwen314BModelRunner(ModelRunner):
         )
 
     @staticmethod
+    def _compute_slot_mapping(
+        page_ids: list[int],
+        num_tokens: int,
+        page_size: int,
+    ) -> torch.Tensor:
+        """Return per-position physical slot indices for token positions 0..num_tokens-1."""
+        mapping = torch.empty((num_tokens,), dtype=torch.int32)
+        for pos in range(num_tokens):
+            page_idx = pos // page_size
+            offset = pos % page_size
+            mapping[pos] = page_ids[page_idx] * page_size + offset
+        return mapping
+
+    @staticmethod
     def _write_block_table_row(
         block_table: torch.Tensor,
         batch_idx: int,
         max_blocks: int,
-        alloc: KvAllocation,
+        page_ids: list[int],
     ) -> None:
         """Write one request's KV page IDs into a flat block table."""
         row_start = batch_idx * max_blocks
-        if alloc.page_ids:
-            block_table[row_start : row_start + len(alloc.page_ids)] = torch.tensor(
-                alloc.page_ids,
+        if page_ids:
+            block_table[row_start : row_start + len(page_ids)] = torch.tensor(
+                page_ids,
                 dtype=torch.int32,
             )
 
