@@ -327,7 +327,8 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         self._validate_total_kv_pages(model, kernel_batch)
 
         padded_vocab = round_up(model.config.vocab_size, _VOCAB_PAD_MULTIPLE)
-        prefill_block_table_stride = int(qwen3_prefill_fwd.MAX_CTX_BLOCKS)
+        page_size = model.runtime.page_size
+        max_blocks_per_seq = (model.runtime.max_seq_len + page_size - 1) // page_size
         prefill = self._compile_prefill_fwd_callable(
             qwen3_prefill_fwd.prefill_fwd,
             batch=kernel_batch,
@@ -339,15 +340,15 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             head_dim=model.config.head_dim,
             num_layers=model.config.num_hidden_layers,
             vocab_size=padded_vocab,
-            block_table_stride=prefill_block_table_stride,
+            block_table_stride=max_blocks_per_seq,
+            page_size=page_size,
         )
         _mark("compile_prefill")
-        decode_block_table_stride = int(qwen3_decode_fwd.MAX_BLOCKS_PER_SEQ)
         decode = self._compile_decode_fwd_callable(
             qwen3_decode_fwd.decode_fwd,
             batch=kernel_batch,
             max_seq=model.runtime.max_seq_len,
-            block_table_stride=decode_block_table_stride,
+            block_table_stride=max_blocks_per_seq,
             hidden_size=model.config.hidden_size,
             intermediate_size=model.config.intermediate_size,
             num_heads=model.config.num_attention_heads,
@@ -355,6 +356,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             head_dim=model.config.head_dim,
             num_layers=model.config.num_hidden_layers,
             vocab_size=padded_vocab,
+            page_size=page_size,
         )
         _mark("compile_decode")
         final_rms = None
@@ -535,8 +537,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             layers=layers,
             decode_weights=decode_weights,
             decode_logits_buffer=decode_logits_buffer,
-            prefill_block_table_stride=prefill_block_table_stride,
-            decode_block_table_stride=decode_block_table_stride,
             stacked_weights=stacked_weights,
             l3_generate_chip_callables=l3_generate_chip_callables,
             l3_generate_entry_fn=l3_generate_entry_fn,
@@ -600,12 +600,13 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         head_dim: int,
         num_layers: int,
         vocab_size: int,
+        page_size: int,
     ) -> _L2Callable:
         """Compile the top-level ``@pl.jit`` prefill_fwd into an L2 callable."""
         kv_hidden = num_kv_heads * head_dim
         total_tokens = batch * max_seq
-        runtime_cache_blocks = (max_seq + _QWEN14B_PAGE_SIZE - 1) // _QWEN14B_PAGE_SIZE
-        cache_rows = batch * runtime_cache_blocks * num_layers * num_kv_heads * _QWEN14B_PAGE_SIZE
+        runtime_cache_blocks = (max_seq + page_size - 1) // page_size
+        cache_rows = batch * runtime_cache_blocks * num_layers * num_kv_heads * page_size
         dummy_args = [
             torch.empty((total_tokens, hidden_size), dtype=torch.bfloat16),
             torch.empty((batch,), dtype=torch.int32),
@@ -646,11 +647,12 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         head_dim: int,
         num_layers: int,
         vocab_size: int,
+        page_size: int,
     ) -> _L2Callable:
         """Compile the top-level ``@pl.jit`` decode_fwd into an L2 callable."""
         kv_hidden = num_kv_heads * head_dim
-        runtime_cache_blocks = (max_seq + _QWEN14B_PAGE_SIZE - 1) // _QWEN14B_PAGE_SIZE
-        cache_rows = batch * runtime_cache_blocks * num_layers * num_kv_heads * _QWEN14B_PAGE_SIZE
+        runtime_cache_blocks = (max_seq + page_size - 1) // page_size
+        cache_rows = batch * runtime_cache_blocks * num_layers * num_kv_heads * page_size
         dummy_args = [
             torch.empty((batch, hidden_size), dtype=torch.bfloat16),
             torch.empty((num_layers, hidden_size), dtype=torch.float32),

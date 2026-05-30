@@ -15,11 +15,6 @@ from dataclasses import dataclass, field
 
 import torch
 
-from .kv_cache import (
-    block_table_from_block_ids,
-    slot_mapping_for_decode,
-    slot_mapping_from_block_ids_batch,
-)
 from .types import (
     DecodeBatch,
     PrefillBatch,
@@ -168,8 +163,7 @@ class WorkerProcess:
         chunk_tokens_list = []
         positions_list = []
         seq_lens = []
-        block_tables = []
-        slot_positions = []
+        block_ids_list = []
 
         for sr in scheduled:
             request = sr.request
@@ -183,9 +177,7 @@ class WorkerProcess:
             positions_list.append(positions)
 
             seq_lens.append(num_new)
-
-            block_tables.append(sr.block_ids)
-            slot_positions.append(positions)
+            block_ids_list.append(sr.block_ids)
 
         max_chunk = max(len(t) for t in chunk_tokens_list)
         token_tensor = torch.zeros((batch_size, max_chunk), dtype=torch.long, device=device)
@@ -206,13 +198,6 @@ class WorkerProcess:
                 list(positions_list[i]), dtype=torch.long, device=device
             )
 
-        block_table_tensor = block_table_from_block_ids(block_tables).to(device)
-        slot_mapping_tensor = slot_mapping_from_block_ids_batch(
-            block_tables,
-            slot_positions,
-            self._page_size,
-        ).to(device)
-
         prefill_result = self.executor.run_prefill(
             runtime_model,
             PrefillBatch(
@@ -220,10 +205,8 @@ class WorkerProcess:
                 token_ids=token_tensor,
                 input_embeddings=embeddings,
                 seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
-                kv_allocations=[],
                 positions=positions_tensor,
-                block_table=block_table_tensor,
-                slot_mapping=slot_mapping_tensor,
+                block_ids=block_ids_list,
             ),
         )
 
@@ -252,7 +235,6 @@ class WorkerProcess:
         decode_tokens = []
         block_ids_list = []
         seq_lens = []
-        slot_mappings = []
 
         for sr in scheduled:
             request = sr.request
@@ -264,15 +246,9 @@ class WorkerProcess:
             decode_tokens.append(last_token)
             block_ids_list.append(sr.block_ids)
             seq_lens.append(request.num_tokens)
-            slot_mappings.append(
-                slot_mapping_for_decode(sr.block_ids, request.num_tokens - 1, self._page_size)
-            )
 
         decode_token_tensor = torch.tensor(decode_tokens, dtype=torch.long, device=device)
         decode_embeddings = self.executor.lookup_embeddings(runtime_model, decode_token_tensor)
-
-        block_table = block_table_from_block_ids(block_ids_list).to(device)
-        slot_mapping = torch.tensor(slot_mappings, dtype=torch.int32, device=device)
 
         decode_result = self.executor.run_decode(
             runtime_model,
@@ -281,9 +257,7 @@ class WorkerProcess:
                 token_ids=decode_token_tensor.unsqueeze(1),
                 hidden_states=decode_embeddings,
                 seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
-                kv_allocations=[],
-                block_table=block_table,
-                slot_mapping=slot_mapping,
+                block_ids=block_ids_list,
             ),
         )
 
@@ -310,6 +284,9 @@ def _worker_entry(
     ready_event,
 ):
     """Entry point for the worker subprocess."""
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     worker = WorkerProcess(config, input_queue, output_queue)
     try:
         worker.init_device_and_model()

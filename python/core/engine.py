@@ -278,12 +278,6 @@ class LLMEngine:
                                 device=runtime_model.runtime.device,
                             ),
                             kv_allocations=active_allocations,
-                            block_table=self._kv_cache_manager.block_table_for_batch(active_allocations).to(
-                                runtime_model.runtime.device
-                            ),
-                            slot_mapping=self._kv_cache_manager.slot_mapping_for_batch(active_allocations).to(
-                                runtime_model.runtime.device
-                            ),
                         ),
                     )
                     for row_idx, request_idx in enumerate(next_active):
@@ -385,12 +379,6 @@ class LLMEngine:
                                 device=runtime_model.runtime.device,
                             ),
                             kv_allocations=[alloc],
-                            block_table=self._kv_cache_manager.block_table_for_batch([alloc]).to(
-                                runtime_model.runtime.device
-                            ),
-                            slot_mapping=self._kv_cache_manager.slot_mapping_for_batch([alloc]).to(
-                                runtime_model.runtime.device
-                            ),
                         ),
                     )
                     logits = self._select_batch_row(decode_result.logits, 0)

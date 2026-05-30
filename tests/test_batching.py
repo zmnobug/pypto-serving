@@ -160,8 +160,6 @@ def test_decode_inputs_use_actual_user_batch_without_padding_lanes():
             hidden_states=hidden_states,
             seq_lens=torch.tensor([1], dtype=torch.int32),
             kv_allocations=[alloc],
-            block_table=manager.block_table_for_batch([alloc]),
-            slot_mapping=manager.slot_mapping_for_batch([alloc]),
         ),
     )
 
@@ -267,8 +265,6 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
             hidden_states=torch.ones(1, model.config.hidden_size),
             seq_lens=torch.tensor([1], dtype=torch.int32),
             kv_allocations=[decode_alloc],
-            block_table=manager.block_table_for_batch([decode_alloc]),
-            slot_mapping=manager.slot_mapping_for_batch([decode_alloc]),
         ),
     )
     manager.free(decode_alloc)
