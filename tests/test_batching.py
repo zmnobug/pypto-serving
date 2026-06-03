@@ -7,6 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import pytest
 import torch
 
 from python.core.engine import LLMEngine
@@ -130,10 +131,83 @@ def test_prefill_inputs_use_actual_user_batch_without_padding_lanes():
     assert prepared.actual_batch == 2
     assert prepared.hidden.shape == (3, model.config.hidden_size)
     assert prepared.seq_lens.tolist() == [1, 2]
+    assert prepared.chunk_lens.tolist() == [1, 2]
+    assert prepared.chunk_offsets.tolist() == [0, 1]
     assert prepared.block_table.shape == (2 * 2,)
     assert prepared.block_table[0].item() == allocations[0].page_ids[0]
     assert prepared.slot_mapping.shape == (3,)
     assert prepared.slot_mapping[2].item() == manager.slot_mapping_for_request(allocations[1], 1)
+
+
+def test_prefill_inputs_pack_resumed_chunk_positions():
+    model = _model(max_batch_size=1, max_seq_len=8, page_size=2)
+    manager = KvCacheManager()
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    runner = ModelRunner(
+        model_id=model.config.model_id,
+        compiled=None,  # type: ignore[arg-type]
+        platform="a2a3sim",
+        device_id=0,
+        save_kernels_dir=None,
+        l3_trace=False,
+    )
+    runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
+    alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 4)
+
+    prepared = runner._prepare_prefill_inputs(
+        model,
+        PrefillBatch(
+            request_ids=[alloc.request_id],
+            token_ids=torch.zeros(1, 2, dtype=torch.long),
+            input_embeddings=torch.ones(1, 2, model.config.hidden_size),
+            seq_lens=torch.tensor([4], dtype=torch.int32),
+            kv_allocations=[alloc],
+            positions=torch.tensor([[2, 3]], dtype=torch.long),
+        ),
+    )
+
+    assert prepared.hidden.shape == (2, model.config.hidden_size)
+    assert prepared.seq_lens.tolist() == [4]
+    assert prepared.chunk_lens.tolist() == [2]
+    assert prepared.chunk_offsets.tolist() == [0]
+    assert prepared.slot_mapping.tolist() == [
+        manager.slot_mapping_for_request(alloc, 2),
+        manager.slot_mapping_for_request(alloc, 3),
+    ]
+
+
+def test_prefill_inputs_reject_non_contiguous_chunk_positions():
+    model = _model(max_batch_size=1, max_seq_len=8, page_size=2)
+    manager = KvCacheManager()
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    runner = ModelRunner(
+        model_id=model.config.model_id,
+        compiled=None,  # type: ignore[arg-type]
+        platform="a2a3sim",
+        device_id=0,
+        save_kernels_dir=None,
+        l3_trace=False,
+    )
+    runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
+    alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 4)
+
+    with pytest.raises(ValueError, match="contiguous chunk"):
+        runner._prepare_prefill_inputs(
+            model,
+            PrefillBatch(
+                request_ids=[alloc.request_id],
+                token_ids=torch.zeros(1, 3, dtype=torch.long),
+                input_embeddings=torch.ones(1, 3, model.config.hidden_size),
+                seq_lens=torch.tensor([4], dtype=torch.int32),
+                kv_allocations=[alloc],
+                positions=torch.tensor([[1, 3, 4]], dtype=torch.long),
+            ),
+        )
+
+
+def test_compute_slot_mapping_rejects_insufficient_pages():
+    with pytest.raises(ValueError, match="too small"):
+        ModelRunner._compute_slot_mapping([0], 2, 2, start_pos=1)
 
 
 def test_decode_inputs_use_actual_user_batch_without_padding_lanes():

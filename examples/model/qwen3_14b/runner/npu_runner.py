@@ -108,6 +108,8 @@ class _PrefillInputs:
     actual_batch: int
     hidden: torch.Tensor
     seq_lens: torch.Tensor
+    chunk_lens: torch.Tensor
+    chunk_offsets: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
 
@@ -175,6 +177,8 @@ class Qwen314BModelRunner(ModelRunner):
             compiled.prefill,
             prefill_inputs.hidden,
             prefill_inputs.seq_lens,
+            prefill_inputs.chunk_lens,
+            prefill_inputs.chunk_offsets,
             self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_input_rms_weight"]),
             self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wq"]),
             self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wk"]),
@@ -945,9 +949,43 @@ class Qwen314BModelRunner(ModelRunner):
                 max_blocks = max(max_blocks, max(len(alloc.page_ids) for alloc in batch.kv_allocations))
 
         seq_lens = torch.empty((actual_batch,), dtype=torch.int32)
+        chunk_lens = torch.empty((actual_batch,), dtype=torch.int32)
+        chunk_offsets = torch.empty((actual_batch,), dtype=torch.int32)
         block_table = torch.full((actual_batch * max_blocks,), -1, dtype=torch.int32)
         seq_len_values = [int(batch.seq_lens[idx].item()) for idx in range(actual_batch)]
-        total_tokens = sum(seq_len_values)
+        chunk_len_values: list[int] = []
+        chunk_start_values: list[int] = []
+        for batch_idx, seq_len in enumerate(seq_len_values):
+            if batch.positions is not None:
+                row_positions = batch.positions[batch_idx].detach().cpu()
+                valid_positions = row_positions[row_positions >= 0]
+                if valid_positions.numel() == 0:
+                    raise ValueError("prefill positions must include at least one chunk token")
+                chunk_start = int(valid_positions[0].item())
+                chunk_len = int(valid_positions.numel())
+                expected_positions = torch.arange(
+                    chunk_start,
+                    chunk_start + chunk_len,
+                    dtype=valid_positions.dtype,
+                )
+                if not torch.equal(valid_positions, expected_positions):
+                    raise ValueError(
+                        "prefill batch.positions must form one contiguous chunk: "
+                        f"chunk_start={chunk_start}, chunk_len={chunk_len}, seq_len={seq_len}"
+                    )
+            else:
+                chunk_len = seq_len
+                chunk_start = 0
+            if chunk_len <= 0:
+                raise ValueError("prefill chunk_lens must be positive")
+            if chunk_start + chunk_len != seq_len:
+                raise ValueError(
+                    "prefill chunk must end at seq_len: "
+                    f"chunk_start={chunk_start}, chunk_len={chunk_len}, seq_len={seq_len}"
+                )
+            chunk_len_values.append(chunk_len)
+            chunk_start_values.append(chunk_start)
+        total_tokens = sum(chunk_len_values)
         if padded:
             hidden = torch.zeros((actual_batch, max_seq, hidden_size), dtype=torch.bfloat16)
             slot_mapping = torch.full((actual_batch * max_seq,), -1, dtype=torch.int32)
@@ -964,11 +1002,15 @@ class Qwen314BModelRunner(ModelRunner):
             if seq_len > max_seq:
                 raise ValueError(f"prefill seq_len {seq_len} exceeds max_seq_len {max_seq}")
             seq_lens[batch_idx] = seq_len
-            embeddings = batch.input_embeddings[batch_idx, :seq_len, :].to(torch.bfloat16).cpu()
+            chunk_len = chunk_len_values[batch_idx]
+            chunk_start = chunk_start_values[batch_idx]
+            chunk_lens[batch_idx] = chunk_len
+            chunk_offsets[batch_idx] = token_offset
+            embeddings = batch.input_embeddings[batch_idx, :chunk_len, :].to(torch.bfloat16).cpu()
             if padded:
-                hidden[batch_idx, :seq_len, :] = embeddings
+                hidden[batch_idx, chunk_start:seq_len, :] = embeddings
             else:
-                hidden[token_offset : token_offset + seq_len, :] = embeddings
+                hidden[token_offset : token_offset + chunk_len, :] = embeddings
 
             if alloc is not None:
                 page_ids = alloc.page_ids
@@ -978,17 +1020,19 @@ class Qwen314BModelRunner(ModelRunner):
                 page_ids = []
             self._write_block_table_row(block_table, batch_idx, max_blocks, page_ids)
 
-            slot_row = self._compute_slot_mapping(page_ids, seq_len, page_size)
+            slot_row = self._compute_slot_mapping(page_ids, chunk_len, page_size, start_pos=chunk_start)
             if padded:
-                slot_mapping[batch_idx * max_seq : batch_idx * max_seq + seq_len] = slot_row
+                slot_mapping[batch_idx * max_seq + chunk_start : batch_idx * max_seq + seq_len] = slot_row
             else:
-                slot_mapping[token_offset : token_offset + seq_len] = slot_row
-            token_offset += seq_len
+                slot_mapping[token_offset : token_offset + chunk_len] = slot_row
+            token_offset += chunk_len
 
         return _PrefillInputs(
             actual_batch=actual_batch,
             hidden=hidden.share_memory_(),
             seq_lens=seq_lens.share_memory_(),
+            chunk_lens=chunk_lens.share_memory_(),
+            chunk_offsets=chunk_offsets.share_memory_(),
             block_table=block_table.share_memory_(),
             slot_mapping=slot_mapping.share_memory_(),
         )
@@ -1048,13 +1092,24 @@ class Qwen314BModelRunner(ModelRunner):
         page_ids: list[int],
         num_tokens: int,
         page_size: int,
+        *,
+        start_pos: int = 0,
     ) -> torch.Tensor:
-        """Return per-position physical slot indices for token positions 0..num_tokens-1."""
+        """Return physical slot indices for token positions start_pos..start_pos+num_tokens-1."""
         mapping = torch.empty((num_tokens,), dtype=torch.int32)
-        for pos in range(num_tokens):
+        if num_tokens > 0:
+            max_pos = start_pos + num_tokens - 1
+            max_page_idx = max_pos // page_size
+            if max_page_idx >= len(page_ids):
+                raise ValueError(
+                    f"page_ids list length {len(page_ids)} is too small for position {max_pos}; "
+                    f"need at least {max_page_idx + 1} pages"
+                )
+        for offset_idx in range(num_tokens):
+            pos = start_pos + offset_idx
             page_idx = pos // page_size
             offset = pos % page_size
-            mapping[pos] = page_ids[page_idx] * page_size + offset
+            mapping[offset_idx] = page_ids[page_idx] * page_size + offset
         return mapping
 
     @staticmethod

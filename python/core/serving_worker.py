@@ -176,7 +176,7 @@ class WorkerProcess:
             positions = range(num_computed, num_computed + num_new)
             positions_list.append(positions)
 
-            seq_lens.append(num_new)
+            seq_lens.append(num_computed + num_new)
             block_ids_list.append(sr.block_ids)
 
         max_chunk = max(len(t) for t in chunk_tokens_list)
@@ -186,7 +186,7 @@ class WorkerProcess:
             dtype=runtime_model.embed_tokens.dtype,
             device=device,
         )
-        positions_tensor = torch.zeros((batch_size, max_chunk), dtype=torch.long, device=device)
+        positions_tensor = torch.full((batch_size, max_chunk), -1, dtype=torch.long, device=device)
 
         for i, tokens in enumerate(chunk_tokens_list):
             row = torch.tensor(tokens, dtype=torch.long, device=device)

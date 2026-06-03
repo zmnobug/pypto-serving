@@ -610,6 +610,8 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         dummy_args = [
             torch.empty((total_tokens, hidden_size), dtype=torch.bfloat16),
             torch.empty((batch,), dtype=torch.int32),
+            torch.empty((batch,), dtype=torch.int32),
+            torch.empty((batch,), dtype=torch.int32),
             torch.empty((num_layers, hidden_size), dtype=torch.float32),
             torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
             torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
