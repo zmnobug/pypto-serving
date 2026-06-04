@@ -179,7 +179,50 @@ class Qwen314BModelRunner(ModelRunner):
         self._l2_workers: dict[str, LlmWorker] = {}
         self._l2_programs: dict[int, _L2ProgramHandle] = {}
         self._l2_child_allocs: dict[tuple[str, int], tuple[int, int]] = {}
-        self._l2_dirty_kv_models: set[str] = set()
+
+    def _kv_cache_runtime_name(self) -> str:
+        if self._compiled.prefill.runtime_name != self._compiled.decode.runtime_name:
+            raise ValueError(
+                "device-side KV cache requires prefill and decode to use the same L2 runtime: "
+                f"{self._compiled.prefill.runtime_name!r} != {self._compiled.decode.runtime_name!r}"
+            )
+        return self._compiled.prefill.runtime_name
+
+    def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> WorkerTensor:
+        """Allocate one KV cache tensor on the L2 NPU worker."""
+        worker = self._worker_for_runtime(self._kv_cache_runtime_name())
+        return worker.alloc_tensor(shape, dtype)
+
+    def _free_kv_cache_tensor(self, tensor: WorkerTensor) -> None:
+        """Free one KV cache tensor from the L2 NPU worker."""
+        worker = self._l2_workers.get(self._kv_cache_runtime_name())
+        if worker is not None and worker.initialized:
+            worker.free_tensor(tensor)
+
+    @staticmethod
+    def _validate_kv_cache_bounds(
+        model: RuntimeModel,
+        block_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        cache: WorkerTensor,
+    ) -> None:
+        """Fail on host before an invalid KV page id reaches the NPU kernel."""
+        valid_blocks = block_table[block_table >= 0]
+        valid_slots = slot_mapping[slot_mapping >= 0]
+        if valid_blocks.numel() == 0 and valid_slots.numel() == 0:
+            return
+        max_block_id = int(valid_blocks.max().item()) if valid_blocks.numel() else -1
+        max_slot_block = int(valid_slots.max().item()) // model.runtime.page_size if valid_slots.numel() else -1
+        max_page_id = max(max_block_id, max_slot_block)
+        rows_per_layer = cache.shape[0] // model.config.num_hidden_layers
+        max_pages = rows_per_layer // (model.config.num_key_value_heads * model.runtime.page_size)
+        if max_page_id >= max_pages:
+            raise RuntimeError(
+                "KV cache page id exceeds runner device cache capacity: "
+                f"max_page_id={max_page_id}, max_pages={max_pages}, "
+                f"cache_shape={cache.shape}, block_table_shape={tuple(block_table.shape)}, "
+                f"slot_mapping_shape={tuple(slot_mapping.shape)}"
+            )
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Run the JIT all-layer prefill kernel and return next-token logits."""
@@ -188,9 +231,12 @@ class Qwen314BModelRunner(ModelRunner):
         dw = compiled.decode_weights
         t_prefill_start = time.perf_counter()
 
-        k_cache, v_cache = self.materialize_full_layer_cache(
-            model.config.model_id,
-        )
+        kv_cache = self._kv_caches.get(model.config.model_id)
+        if kv_cache is None:
+            raise RuntimeError(f"KV cache for model {model.config.model_id!r} is not initialized")
+        k_cache = kv_cache.key_pages
+        v_cache = kv_cache.value_pages
+        self._validate_kv_cache_bounds(model, prefill_inputs.block_table, prefill_inputs.slot_mapping, k_cache)
         logits_padded = torch.zeros(
             (prefill_inputs.actual_batch, compiled.padded_vocab),
             dtype=torch.float32,
@@ -223,8 +269,6 @@ class Qwen314BModelRunner(ModelRunner):
             self._l2_child_tensor(compiled.prefill.runtime_name, compiled.padded_lm_head_weight),
             logits_padded,
         )
-        self._l2_dirty_kv_models.add(model.config.model_id)
-
         if _TIMING_ENABLED:
             print(
                 f"[timing] prefill: fused {len(model.layers)} layers, "
@@ -247,10 +291,12 @@ class Qwen314BModelRunner(ModelRunner):
         hidden = decode_inputs.hidden
         dw = compiled.decode_weights
 
-        k_cache, v_cache = self.materialize_full_layer_cache(
-            model.config.model_id,
-        )
-        refresh_kv_cache = model.config.model_id in self._l2_dirty_kv_models
+        kv_cache = self._kv_caches.get(model.config.model_id)
+        if kv_cache is None:
+            raise RuntimeError(f"KV cache for model {model.config.model_id!r} is not initialized")
+        k_cache = kv_cache.key_pages
+        v_cache = kv_cache.value_pages
+        self._validate_kv_cache_bounds(model, decode_inputs.block_table, decode_inputs.slot_mapping, k_cache)
 
         if decode_inputs.actual_batch > compiled.decode_logits_buffer.shape[0]:
             raise ValueError(
@@ -272,8 +318,8 @@ class Qwen314BModelRunner(ModelRunner):
             decode_inputs.slot_mapping,
             self._l2_child_tensor(compiled.decode.runtime_name, compiled.rope_cos),
             self._l2_child_tensor(compiled.decode.runtime_name, compiled.rope_sin),
-            self._l2_child_tensor(compiled.decode.runtime_name, k_cache, refresh=refresh_kv_cache),
-            self._l2_child_tensor(compiled.decode.runtime_name, v_cache, refresh=refresh_kv_cache),
+            k_cache,
+            v_cache,
             self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_wo"]),
             self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_post_rms_weight"]),
             self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_w_gate"]),
@@ -283,7 +329,6 @@ class Qwen314BModelRunner(ModelRunner):
             self._l2_child_tensor(compiled.decode.runtime_name, compiled.padded_lm_head_weight),
             logits_padded,
         )
-        self._l2_dirty_kv_models.discard(model.config.model_id)
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
         return DecodeResult(
@@ -464,13 +509,13 @@ class Qwen314BModelRunner(ModelRunner):
 
     def close(self) -> None:
         """Release non-L3 child-memory allocations and L2 workers."""
+        self.close_kv_cache()
         for (runtime_name, _), (dev_ptr, _nbytes) in list(self._l2_child_allocs.items()):
             worker = self._l2_workers.get(runtime_name)
             if worker is not None and worker.initialized:
                 worker.free(dev_ptr)
         self._l2_child_allocs.clear()
         self._l2_programs.clear()
-        self._l2_dirty_kv_models.clear()
         for worker in self._l2_workers.values():
             worker.close()
         self._l2_workers.clear()
@@ -565,9 +610,11 @@ class Qwen314BModelRunner(ModelRunner):
         vocab_size = model.config.vocab_size
         padded_vocab = compiled.padded_vocab
 
-        k_cache_all, v_cache_all = self.materialize_full_layer_cache(
-            model.config.model_id,
-        )
+        kv_cache = self._kv_caches.get(model.config.model_id)
+        if kv_cache is None:
+            raise RuntimeError(f"KV cache for model {model.config.model_id!r} is not initialized")
+        k_cache_all = kv_cache.key_pages
+        v_cache_all = kv_cache.value_pages
         _mark("kv_cache_materialize")
 
         # Build initial decode hidden: last prompt token embedding per batch.
@@ -999,7 +1046,7 @@ class Qwen314BModelRunner(ModelRunner):
         actual_batch = self._validate_batch_size(model, batch_count)
         max_seq = model.runtime.max_seq_len
         hidden_size = model.config.hidden_size
-        page_size = self._kv_page_sizes.get(model.config.model_id, model.runtime.page_size)
+        page_size = model.runtime.page_size
         max_blocks = self._max_blocks_per_seq(model)
         if padded:
             if batch.kv_allocations:
@@ -1103,7 +1150,7 @@ class Qwen314BModelRunner(ModelRunner):
         batch_count = len(batch.kv_allocations) if batch.kv_allocations else int(batch.seq_lens.shape[0])
         actual_batch = self._validate_batch_size(model, batch_count)
         hidden_size = model.config.hidden_size
-        page_size = self._kv_page_sizes.get(model.config.model_id, model.runtime.page_size)
+        page_size = model.runtime.page_size
         max_blocks = self._max_blocks_per_seq(model)
 
         hidden = torch.zeros((actual_batch, hidden_size), dtype=torch.bfloat16)

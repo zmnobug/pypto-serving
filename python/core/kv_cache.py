@@ -401,25 +401,6 @@ class KvCacheManager:
             pool.value_pages[layer_idx].reshape(-1, pool.head_dim),
         )
 
-    def materialize_full_layer_cache(self, model_id: str) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return flattened K/V cache views stacked across every model layer.
-
-        Use this API for fused or L3 decode kernels that select layer i via
-        an arithmetic offset (layer_idx * cache_rows_per_layer) on a single
-        cache tensor. The pool is already laid out as
-        ``[num_layers, num_pages, num_kv_heads, page_size, head_dim]`` so the
-        flat view is zero-copy.
-
-        Returns:
-            (key_cache_all, value_cache_all) each shaped
-            [num_layers * num_pages * num_kv_heads * page_size, head_dim].
-        """
-        pool = self._pool(model_id)
-        return (
-            pool.key_pages.reshape(-1, pool.head_dim),
-            pool.value_pages.reshape(-1, pool.head_dim),
-        )
-
     def free(self, alloc: KvAllocation) -> None:
         """Return an allocation's pages to the model pool."""
         self.release_request(alloc.request_id)
