@@ -15,6 +15,7 @@ import time
 import uuid
 
 from .async_engine import AsyncLLMEngine
+from python.profile import profile_instant, profile_span
 from .types import GenerateConfig
 
 logger = logging.getLogger(__name__)
@@ -122,27 +123,32 @@ class ServingServer:
             stream=request.stream,
         )
 
-        if request.stream:
-            return StreamingResponse(
-                self._stream_completion(request_id, request.prompt, config, request.model or self.model_id),
-                media_type="text/event-stream",
+        with profile_span(
+            "http.completions",
+            cat="request",
+            args={"request_id": request_id, "max_tokens": request.max_tokens, "stream": request.stream},
+        ):
+            if request.stream:
+                return StreamingResponse(
+                    self._stream_completion(request_id, request.prompt, config, request.model or self.model_id),
+                    media_type="text/event-stream",
+                )
+
+            full_text = ""
+            finish_reason = ""
+            async for output in self.engine.add_request(request_id, request.prompt, config):
+                if output.text:
+                    full_text = output.text
+                if output.finished:
+                    finish_reason = self._map_finish_reason(output.finish_reason)
+
+            response = CompletionResponse(
+                id=request_id,
+                created=int(time.time()),
+                model=request.model or self.model_id,
+                choices=[CompletionChoice(text=full_text, finish_reason=finish_reason)],
             )
-
-        full_text = ""
-        finish_reason = ""
-        async for output in self.engine.add_request(request_id, request.prompt, config):
-            if output.text:
-                full_text = output.text
-            if output.finished:
-                finish_reason = self._map_finish_reason(output.finish_reason)
-
-        response = CompletionResponse(
-            id=request_id,
-            created=int(time.time()),
-            model=request.model or self.model_id,
-            choices=[CompletionChoice(text=full_text, finish_reason=finish_reason)],
-        )
-        return JSONResponse(response.model_dump())
+            return JSONResponse(response.model_dump())
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
@@ -156,77 +162,94 @@ class ServingServer:
             stream=request.stream,
         )
 
-        if request.stream:
-            return StreamingResponse(
-                self._stream_chat_completion(request_id, prompt, config, request.model or self.model_id),
-                media_type="text/event-stream",
+        with profile_span(
+            "http.chat_completions",
+            cat="request",
+            args={"request_id": request_id, "max_tokens": request.max_tokens, "stream": request.stream},
+        ):
+            if request.stream:
+                return StreamingResponse(
+                    self._stream_chat_completion(request_id, prompt, config, request.model or self.model_id),
+                    media_type="text/event-stream",
+                )
+
+            full_text = ""
+            finish_reason = ""
+            async for output in self.engine.add_request(request_id, prompt, config):
+                if output.text:
+                    full_text = output.text
+                if output.finished:
+                    finish_reason = self._map_finish_reason(output.finish_reason)
+
+            response = ChatCompletionResponse(
+                id=request_id,
+                object="chat.completion",
+                created=int(time.time()),
+                model=request.model or self.model_id,
+                choices=[ChatCompletionChoice(
+                    message=ChatMessage(role="assistant", content=full_text),
+                    finish_reason=finish_reason,
+                )],
             )
-
-        full_text = ""
-        finish_reason = ""
-        async for output in self.engine.add_request(request_id, prompt, config):
-            if output.text:
-                full_text = output.text
-            if output.finished:
-                finish_reason = self._map_finish_reason(output.finish_reason)
-
-        response = ChatCompletionResponse(
-            id=request_id,
-            object="chat.completion",
-            created=int(time.time()),
-            model=request.model or self.model_id,
-            choices=[ChatCompletionChoice(
-                message=ChatMessage(role="assistant", content=full_text),
-                finish_reason=finish_reason,
-            )],
-        )
-        return JSONResponse(response.model_dump())
+            return JSONResponse(response.model_dump())
 
     async def _stream_completion(
         self, request_id: str, prompt: str, config: GenerateConfig, model: str
     ):
-        prev_text = ""
-        async for output in self.engine.add_request(request_id, prompt, config):
-            delta = output.text[len(prev_text):] if output.text else ""
-            prev_text = output.text or prev_text
-            finish_reason = self._map_finish_reason(output.finish_reason) if output.finished else None
+        with profile_span("http.stream_completion", cat="request", args={"request_id": request_id}):
+            prev_text = ""
+            async for output in self.engine.add_request(request_id, prompt, config):
+                delta = output.text[len(prev_text):] if output.text else ""
+                prev_text = output.text or prev_text
+                finish_reason = self._map_finish_reason(output.finish_reason) if output.finished else None
 
-            chunk = CompletionResponse(
-                id=request_id,
-                created=int(time.time()),
-                model=model,
-                choices=[CompletionChoice(text=delta, finish_reason=finish_reason)],
-            )
-            yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+                chunk = CompletionResponse(
+                    id=request_id,
+                    created=int(time.time()),
+                    model=model,
+                    choices=[CompletionChoice(text=delta, finish_reason=finish_reason)],
+                )
+                yield f"data: {json.dumps(chunk.model_dump())}\n\n"
 
-            if output.finished:
-                yield "data: [DONE]\n\n"
-                break
+                if output.finished:
+                    profile_instant(
+                        "http.stream_completion.finished",
+                        cat="request",
+                        args={"request_id": request_id, "finish_reason": finish_reason},
+                    )
+                    yield "data: [DONE]\n\n"
+                    break
 
     async def _stream_chat_completion(
         self, request_id: str, prompt: str, config: GenerateConfig, model: str
     ):
-        prev_text = ""
-        async for output in self.engine.add_request(request_id, prompt, config):
-            delta = output.text[len(prev_text):] if output.text else ""
-            prev_text = output.text or prev_text
-            finish_reason = self._map_finish_reason(output.finish_reason) if output.finished else None
+        with profile_span("http.stream_chat_completion", cat="request", args={"request_id": request_id}):
+            prev_text = ""
+            async for output in self.engine.add_request(request_id, prompt, config):
+                delta = output.text[len(prev_text):] if output.text else ""
+                prev_text = output.text or prev_text
+                finish_reason = self._map_finish_reason(output.finish_reason) if output.finished else None
 
-            chunk = ChatCompletionResponse(
-                id=request_id,
-                object="chat.completion.chunk",
-                created=int(time.time()),
-                model=model,
-                choices=[ChatCompletionChoice(
-                    delta=ChatMessage(role="assistant", content=delta),
-                    finish_reason=finish_reason,
-                )],
-            )
-            yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+                chunk = ChatCompletionResponse(
+                    id=request_id,
+                    object="chat.completion.chunk",
+                    created=int(time.time()),
+                    model=model,
+                    choices=[ChatCompletionChoice(
+                        delta=ChatMessage(role="assistant", content=delta),
+                        finish_reason=finish_reason,
+                    )],
+                )
+                yield f"data: {json.dumps(chunk.model_dump())}\n\n"
 
-            if output.finished:
-                yield "data: [DONE]\n\n"
-                break
+                if output.finished:
+                    profile_instant(
+                        "http.stream_chat.finished",
+                        cat="request",
+                        args={"request_id": request_id, "finish_reason": finish_reason},
+                    )
+                    yield "data: [DONE]\n\n"
+                    break
 
     def _apply_chat_template(self, messages: list[ChatMessage]) -> str:
         """Simple chat template — can be replaced with tokenizer's chat_template."""

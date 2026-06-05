@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..core.async_engine import EngineConfig
 
+from python.profile import get_profiler, merge_profile
+
 RuntimeConfig = None
 
 
@@ -158,6 +160,7 @@ def run_serve(
     from ..core.tokenizer import TransformersTokenizerAdapter
 
     model_id = config.model_id
+    get_profiler(process_name="pypto-serving-api")
     tokenizer = TransformersTokenizerAdapter.from_pretrained(config.model_dir)
 
     async_engine = AsyncLLMEngine(
@@ -176,6 +179,7 @@ def run_serve(
     @app.on_event("shutdown")
     async def shutdown():
         await async_engine.stop()
+        merge_profile()
 
     print(f"Starting PyPTO serving on {host}:{port}")
     print(f"  Model: {model_id} (loaded in worker process)")
@@ -197,6 +201,7 @@ def _validate_backend(backend: str) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    get_profiler(process_name="pypto-serving")
 
     with _startup_log_context(enabled=not args.show_startup_logs):
         config = build_serving_engine_config(args)

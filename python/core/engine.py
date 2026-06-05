@@ -18,6 +18,7 @@ from ._profiling import StageTimer
 from .executor import ModelExecutor
 from .kv_cache import KvCacheManager
 from .model_loader import ModelLoader
+from python.profile import profile_span
 from .sampler import Sampler
 from .types import (
     DecodeBatch,
@@ -59,43 +60,44 @@ class LLMEngine:
         **loader_options: object,
     ) -> None:
         """Load a model, register its KV cache, and notify the executor."""
-        _verbose = self._executor.profile_verbose
-        timer = StageTimer(
-            enabled=_verbose,
-            prefix="init-breakdown",
-            title="init_model stage timings",
-        )
+        with profile_span("LLMEngine.init_model", cat="engine", args={"model_id": model_id}):
+            _verbose = self._executor.profile_verbose
+            timer = StageTimer(
+                enabled=_verbose,
+                prefix="init-breakdown",
+                title="init_model stage timings",
+            )
 
-        # Caller-supplied loader_options["profile_verbose"] takes precedence
-        # over the executor-derived default; avoid passing the same kwarg twice.
-        effective_loader_options = dict(loader_options)
-        effective_loader_options.setdefault("profile_verbose", _verbose)
-        loaded = self._model_loader.load(
-            model_id=model_id,
-            model_dir=model_dir,
-            runtime_config=runtime_config,
-            model_format=model_format,
-            **effective_loader_options,
-        )
-        timer.mark("model_loader.load")
-        config = loaded.config
-        runtime = loaded.runtime_model.runtime
-        self._kv_cache_manager.register_model(model_id, config, runtime)
-        timer.mark("kv_cache_manager.register")
-        self._models[model_id] = ModelRecord(
-            config=config,
-            runtime=runtime,
-            tokenizer=loaded.tokenizer,
-            layer_specs=loaded.layer_specs,
-            runtime_model=loaded.runtime_model,
-        )
-        timer.mark("create_model_record")
-        register_model = getattr(self._executor, "register_model", None)
-        if callable(register_model):
-            register_model(model_id, self._models[model_id])
-        timer.mark("executor.register_model")
+            # Caller-supplied loader_options["profile_verbose"] takes precedence
+            # over the executor-derived default; avoid passing the same kwarg twice.
+            effective_loader_options = dict(loader_options)
+            effective_loader_options.setdefault("profile_verbose", _verbose)
+            loaded = self._model_loader.load(
+                model_id=model_id,
+                model_dir=model_dir,
+                runtime_config=runtime_config,
+                model_format=model_format,
+                **effective_loader_options,
+            )
+            timer.mark("model_loader.load")
+            config = loaded.config
+            runtime = loaded.runtime_model.runtime
+            self._kv_cache_manager.register_model(model_id, config, runtime)
+            timer.mark("kv_cache_manager.register")
+            self._models[model_id] = ModelRecord(
+                config=config,
+                runtime=runtime,
+                tokenizer=loaded.tokenizer,
+                layer_specs=loaded.layer_specs,
+                runtime_model=loaded.runtime_model,
+            )
+            timer.mark("create_model_record")
+            register_model = getattr(self._executor, "register_model", None)
+            if callable(register_model):
+                register_model(model_id, self._models[model_id])
+            timer.mark("executor.register_model")
 
-        timer.report()
+            timer.report()
 
     def generate(self, model_id: str, prompt: str, config: GenerateConfig | None = None) -> str | Iterator[str]:
         """Generate text for one prompt, optionally returning a text stream."""
@@ -118,6 +120,23 @@ class LLMEngine:
         generate_config = config or GenerateConfig()
         if generate_config.stream:
             raise ValueError("generate_batch requires stream=False")
+        with profile_span(
+            "LLMEngine.generate_batch",
+            cat="engine",
+            args={
+                "model_id": model_id,
+                "batch_size": len(prompts),
+                "max_new_tokens": generate_config.max_new_tokens,
+            },
+        ):
+            return self._generate_batch_impl(model_id, prompts, generate_config)
+
+    def _generate_batch_impl(
+        self,
+        model_id: str,
+        prompts: list[str] | tuple[str, ...],
+        generate_config: GenerateConfig,
+    ) -> list[GenerateResult]:
         if not prompts:
             return []
         if model_id not in self._models:

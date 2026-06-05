@@ -41,6 +41,7 @@ _bootstrap_package_root()
 
 from python.core import GenerateConfig, LLMEngine, RuntimeConfig
 from python.core.kv_cache import KvCacheManager
+from python.profile import get_profiler, merge_profile, profile_span
 from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
 from python.core.types import LoadedModel
 import dataclasses
@@ -61,6 +62,8 @@ class _TimingCollector:
         self.phases: dict[str, float] = {}
         # kernel_name -> flat list of seconds (one entry per kernel invocation)
         self.kernel_times: dict[str, list[float]] = defaultdict(list)
+        self.kernel_host_wall_times: dict[str, list[float]] = defaultdict(list)
+        self.kernel_device_wall_times: dict[str, list[float]] = defaultdict(list)
         # kernel_name -> list[list[float]]: outer = decode step, inner = layer
         self.kernel_per_decode_step: dict[str, list[list[float]]] = defaultdict(list)
         # Bumped by BeginDecodeStep before each run_decode invocation.
@@ -94,6 +97,14 @@ class _TimingCollector:
 
     def BeginDecodeStep(self) -> None:
         self._decode_step_idx += 1
+
+    def RecordRunTiming(self, name: str, timing: object) -> None:
+        host_wall_us = getattr(timing, "host_wall_us", None)
+        device_wall_us = getattr(timing, "device_wall_us", None)
+        if host_wall_us is not None:
+            self.kernel_host_wall_times[name].append(float(host_wall_us) / 1_000_000.0)
+        if device_wall_us is not None:
+            self.kernel_device_wall_times[name].append(float(device_wall_us) / 1_000_000.0)
 
     @property
     def num_decode_steps(self) -> int:
@@ -163,7 +174,7 @@ def InstallProfiling(engine: LLMEngine, model_id: str, collector: _TimingCollect
             name, group_by_decode_step = kernel_info
             t0 = time.perf_counter()
             try:
-                return orig_run_l2(callable_spec, *args, **kwargs)
+                timing = orig_run_l2(callable_spec, *args, **kwargs)
             finally:
                 dt = time.perf_counter() - t0
                 collector.kernel_times[name].append(dt)
@@ -172,6 +183,8 @@ def InstallProfiling(engine: LLMEngine, model_id: str, collector: _TimingCollect
                     while len(bucket) <= collector._decode_step_idx:
                         bucket.append([])
                     bucket[collector._decode_step_idx].append(dt)
+            collector.RecordRunTiming(name, timing)
+            return timing
 
         runner._run_l2_program = timed_run_l2  # type: ignore[attr-defined]
     else:
@@ -269,6 +282,11 @@ def PrintTimingReport(collector: _TimingCollector, num_tokens: int, verbose: boo
         "kernel.lm_head",
     ):
         print(f"  {kname:24s}: {SummarizeTimes(collector.kernel_times.get(kname, []))}")
+        host_times = collector.kernel_host_wall_times.get(kname, [])
+        device_times = collector.kernel_device_wall_times.get(kname, [])
+        if host_times or device_times:
+            print(f"  {'  host_wall':24s}: {SummarizeTimes(host_times)}")
+            print(f"  {'  device_wall':24s}: {SummarizeTimes(device_times)}")
 
     if not verbose:
         print(
@@ -350,6 +368,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    get_profiler(process_name="npu_generate")
     model_dir = Path(args.model_dir).resolve()
     if not model_dir.is_dir():
         raise FileNotFoundError(f"Model directory does not exist: {model_dir}")
@@ -374,55 +393,68 @@ def main() -> None:
     if args.num_layers_override is not None:
         _install_num_layers_override(engine, args.num_layers_override)
 
-    init_t0 = time.perf_counter()
-    engine.init_model(
-        model_id=args.model_id,
-        model_dir=str(model_dir),
-        model_format="huggingface",
-        runtime_config=RuntimeConfig(
-            page_size=128,
-            max_batch_size=16,
-            max_seq_len=args.max_seq_len,
+    try:
+        init_t0 = time.perf_counter()
+        engine.init_model(
+            model_id=args.model_id,
+            model_dir=str(model_dir),
+            model_format="huggingface",
+            runtime_config=RuntimeConfig(
+                page_size=128,
+                max_batch_size=16,
+                max_seq_len=args.max_seq_len,
+                max_new_tokens=args.max_new_tokens,
+                device="cpu",
+                kv_dtype="bfloat16",
+                weight_dtype="float32",
+            ),
+        )
+        if collector is not None:
+            collector.phases["init_model"] = time.perf_counter() - init_t0
+            # Profiling must be installed AFTER init_model: register_model populates
+            # executor._compiled[model_id] with the four kernel callables we wrap.
+            InstallProfiling(engine, args.model_id, collector)
+
+        config = GenerateConfig(
             max_new_tokens=args.max_new_tokens,
-            device="cpu",
-            kv_dtype="bfloat16",
-            weight_dtype="float32",
-        ),
-    )
-    if collector is not None:
-        collector.phases["init_model"] = time.perf_counter() - init_t0
-        # Profiling must be installed AFTER init_model: register_model populates
-        # executor._compiled[model_id] with the four kernel callables we wrap.
-        InstallProfiling(engine, args.model_id, collector)
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            stream=args.stream,
+        )
 
-    config = GenerateConfig(
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        stream=args.stream,
-    )
+        num_tokens = 0
+        gen_t0 = time.perf_counter()
+        with profile_span(
+            "npu_generate.generate",
+            cat="request",
+            args={
+                "model_id": args.model_id,
+                "max_new_tokens": args.max_new_tokens,
+                "stream": args.stream,
+                "l3": args.l3_mode,
+            },
+        ):
+            if args.stream:
+                text_parts: list[str] = []
+                result = engine.generate(args.model_id, args.prompt, config)
+                for chunk in result:
+                    text_parts.append(chunk)
+                    print(chunk, end="", flush=True)
+                print()
+                num_tokens = len(text_parts)
+            else:
+                result = engine.generate_result(args.model_id, args.prompt, config)
+                num_tokens = len(result.token_ids)
+                print(f"text: {result.text}")
+                print(f"token_ids: {result.token_ids}")
+                print(f"finish_reason: {result.finish_reason}")
 
-    num_tokens = 0
-    gen_t0 = time.perf_counter()
-    if args.stream:
-        text_parts: list[str] = []
-        result = engine.generate(args.model_id, args.prompt, config)
-        for chunk in result:
-            text_parts.append(chunk)
-            print(chunk, end="", flush=True)
-        print()
-        num_tokens = len(text_parts)
-    else:
-        result = engine.generate_result(args.model_id, args.prompt, config)
-        num_tokens = len(result.token_ids)
-        print(f"text: {result.text}")
-        print(f"token_ids: {result.token_ids}")
-        print(f"finish_reason: {result.finish_reason}")
-
-    if collector is not None:
-        collector.phases["generate_total"] = time.perf_counter() - gen_t0
-        PrintTimingReport(collector, num_tokens=num_tokens, verbose=args.profile_verbose)
+        if collector is not None:
+            collector.phases["generate_total"] = time.perf_counter() - gen_t0
+            PrintTimingReport(collector, num_tokens=num_tokens, verbose=args.profile_verbose)
+    finally:
+        merge_profile()
 
 
 if __name__ == "__main__":

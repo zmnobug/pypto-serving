@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 from .executor import ModelExecutor
 from .kv_cache import KvCacheManager
 from .model_runner import ModelRunner
+from python.profile import profile_span
 from .types import (
     DecodeBatch,
     DecodeResult,
@@ -47,19 +48,30 @@ class PyptoExecutor(ModelExecutor, ABC):
 
     def register_model(self, model_id: str, record: ModelRecord) -> None:
         """Compile kernels for ``record`` and attach a runner to ``model_id``."""
-        compiled = self._compile_model(record.runtime_model)
-        self._compiled[model_id] = compiled
-        runner = self._create_runner(model_id, compiled)
-        runner.init_kv_cache(model_id, record.config, record.runtime)
-        self._runners[model_id] = runner
+        with profile_span("PyptoExecutor.register_model", cat="executor", args={"model_id": model_id}):
+            compiled = self._compile_model(record.runtime_model)
+            self._compiled[model_id] = compiled
+            runner = self._create_runner(model_id, compiled)
+            runner.init_kv_cache(model_id, record.config, record.runtime)
+            self._runners[model_id] = runner
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Delegate prefill execution to the registered model runner."""
-        return self._runners[model.config.model_id].run_prefill(model, batch)
+        with profile_span(
+            "PyptoExecutor.run_prefill",
+            cat="executor",
+            args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
+        ):
+            return self._runners[model.config.model_id].run_prefill(model, batch)
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         """Delegate decode execution to the registered model runner."""
-        return self._runners[model.config.model_id].run_decode(model, batch)
+        with profile_span(
+            "PyptoExecutor.run_decode",
+            cat="executor",
+            args={"model_id": model.config.model_id, "batch_size": len(batch.request_ids)},
+        ):
+            return self._runners[model.config.model_id].run_decode(model, batch)
 
     @contextlib.contextmanager
     def session(self):

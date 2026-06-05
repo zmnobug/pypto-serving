@@ -50,57 +50,67 @@ python -m python.cli --help
 One-shot generation, non-L3 path:
 
 ```bash
-python examples/model/qwen3_14b/npu_generate.py \
-  --model-dir /data/linyifan/models/Qwen3-14B \
-  --prompt 'Huawei is' \
-  --platform a2a3 \
-  --max-seq-len 512 \
-  --max-new-tokens 5
+task-submit --device auto --max-time 0 --run \
+  "PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=1048576 PTO2_RING_DEP_POOL=1048576 \
+  python examples/model/qwen3_14b/npu_generate.py \
+    --model-dir /path/to/Qwen3-14B \
+    --prompt 'Huawei is' \
+    --platform a2a3 \
+    --max-seq-len 512 \
+    --max-new-tokens 5"
 ```
 
-One-shot generation, L3 path:
+Add `--profile` to print timing and write a Chrome trace when `SA_PROFILE_OUTPUT`
+or `SA_PROFILE_LEVEL` is set:
 
 ```bash
-python examples/model/qwen3_14b/npu_generate.py \
-  --model-dir /data/linyifan/models/Qwen3-14B \
-  --prompt 'Huawei is' \
-  --platform a2a3 \
-  --max-seq-len 512 \
-  --max-new-tokens 5 \
-  --l3
+task-submit --device auto --max-time 0 --run \
+  "PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=1048576 PTO2_RING_DEP_POOL=1048576 \
+  SA_PROFILE_OUTPUT=/tmp/pypto-serving-profile-offline SA_PROFILE_LEVEL=verbose \
+  python examples/model/qwen3_14b/npu_generate.py \
+    --model-dir /path/to/Qwen3-14B \
+    --prompt 'Huawei is' \
+    --platform a2a3 \
+    --max-seq-len 512 \
+    --max-new-tokens 5 \
+    --profile"
 ```
 
 ## HTTP Serving (OpenAI-compatible API)
 
-Start the serving server with multiprocess worker:
+Start the serving server with a multiprocess worker. When launching through
+`task-submit`, keep `--device {}` so the selected NPU ID is substituted into the
+server command:
 
 ```bash
-python -m python.cli.main \
-  --model /path/to/Qwen3-14B \
-  --backend npu \
-  --platform a2a3 \
-  --device 0 \
-  --port 8899
+task-submit --device auto --run \
+  "PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=262144 PTO2_RING_DEP_POOL=262144 \
+  python -m python.cli.main \
+    --model /path/to/Qwen3-14B \
+    --backend npu \
+    --platform a2a3 \
+    --device {} \
+    --port 8899"
 ```
 
-Test with curl:
+Send a generation request after the server logs `Application startup complete`:
 
 ```bash
 # Health check
-curl http://localhost:8899/health
+curl --noproxy "*" http://127.0.0.1:8899/health
 
 # Completion
-curl http://localhost:8899/v1/completions \
+curl --noproxy "*" http://127.0.0.1:8899/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Huawei is", "max_tokens": 32, "temperature": 0.0}'
 
 # Streaming
-curl http://localhost:8899/v1/completions \
+curl --noproxy "*" http://127.0.0.1:8899/v1/completions \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Huawei is", "max_tokens": 32, "stream": true}'
 
 # Chat completion
-curl http://localhost:8899/v1/chat/completions \
+curl --noproxy "*" http://127.0.0.1:8899/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "What is 1+1?"}], "max_tokens": 32}'
 ```

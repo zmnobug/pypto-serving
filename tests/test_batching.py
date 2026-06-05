@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import pytest
+from types import SimpleNamespace
+
 import torch
 
 from python.core.engine import LLMEngine
@@ -27,6 +29,9 @@ from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor a
 from examples.model.qwen3_14b.runner.npu_runner import Qwen314BModelRunner as ModelRunner
 from examples.model.qwen3_14b.runner.npu_runner import _CompiledKernels
 from examples.model.qwen3_14b.runner.npu_runner import _L2Callable
+from examples.model.qwen3_14b.runner.npu_runner import _add_run_timing_args
+from examples.model.qwen3_14b.runner.npu_runner import _l2_trace_name
+from examples.model.qwen3_14b.runner.npu_runner import _run_timing_us
 
 
 class _Tokenizer:
@@ -279,6 +284,7 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
     fake_kernel = _CopyKernel()
     fake_callable = _L2Callable(
         chip_callable=fake_kernel,
+        name="fake",
         runtime_name="fake-runtime",
         block_dim=1,
         aicpu_thread_num=1,
@@ -342,6 +348,23 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         ),
     )
     manager.free(decode_alloc)
+
+
+def test_l2_profile_helpers_emit_kernel_name_and_runtime_timing():
+    args = {"runtime": "tensormap_and_ringbuffer"}
+    host_wall_us, device_wall_us = _run_timing_us(
+        SimpleNamespace(host_wall_us=1234.5, device_wall_us=678.0)
+    )
+    _add_run_timing_args(args, SimpleNamespace(host_wall_us=1234.5, device_wall_us=678.0))
+
+    assert _l2_trace_name("prefill_fwd") == "kernel.prefill_fwd"
+    assert _l2_trace_name("decode_fwd") == "kernel.decode_fwd"
+    assert host_wall_us == 1234.5
+    assert device_wall_us == 678.0
+    assert args["host_wall_us"] == 1234.5
+    assert args["host_wall_ms"] == 1.2345
+    assert args["device_wall_us"] == 678.0
+    assert args["device_wall_ms"] == 0.678
 
 
 def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeights:

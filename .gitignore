@@ -15,6 +15,7 @@ env/
 # PyPTO/CANN generated artifacts
 build_output/
 outputs/
+profile_out/
 *.log
 
 # Local editor and agent metadata

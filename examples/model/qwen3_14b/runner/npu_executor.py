@@ -16,46 +16,27 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from simpler.task_interface import ContinuousTensor
 
-
-try:
-    from python.core._profiling import StageTimer
-    from python.core.model_runner import ModelRunner
-    from python.core.pypto_executor import PyptoExecutor as CorePyptoExecutor
-    from python.core.types import (
-        GenerateConfig,
-        GenerateResult,
-        ModelRecord,
-        PrefillBatch,
-        RequestState,
-        RuntimeModel,
-    )
-    from python.core.utils import rope_tables, round_up
-    from .npu_runner import (
-        _CompiledKernels,
-        _KernelLayerWeights,
-        _L2Callable,
-        Qwen314BModelRunner,
-    )
-except ImportError:
-    from python.core._profiling import StageTimer
-    from python.core.model_runner import ModelRunner
-    from python.core.pypto_executor import PyptoExecutor as CorePyptoExecutor
-    from python.core.types import (
-        GenerateConfig,
-        GenerateResult,
-        ModelRecord,
-        PrefillBatch,
-        RequestState,
-        RuntimeModel,
-    )
-    from python.core.utils import rope_tables, round_up
-    from examples.model.qwen3_14b.runner.npu_runner import (
-        _CompiledKernels,
-        _KernelLayerWeights,
-        _L2Callable,
-        Qwen314BModelRunner,
-    )
+from examples.model.qwen3_14b.runner.npu_runner import (
+    _CompiledKernels,
+    _KernelLayerWeights,
+    _L2Callable,
+    Qwen314BModelRunner,
+)
+from python.core._profiling import StageTimer
+from python.core.model_runner import ModelRunner
+from python.core.pypto_executor import PyptoExecutor as CorePyptoExecutor
+from python.core.types import (
+    GenerateConfig,
+    GenerateResult,
+    ModelRecord,
+    PrefillBatch,
+    RequestState,
+    RuntimeModel,
+)
+from python.core.utils import rope_tables, round_up
+from python.profile import profile_span
 
 
 _VOCAB_PAD_MULTIPLE = 512  # must be a multiple of lm_head.VOCAB_CHUNK (64)
@@ -118,10 +99,6 @@ def _patch_orch_make_tensor_arg(module: object) -> None:
     crash.  Patching it here lets child_memory tensors pass through as-is
     so the runtime skips H2D/D2H for those buffers.
     """
-    try:
-        from simpler.task_interface import ContinuousTensor  # noqa: PLC0415
-    except ImportError:
-        return
     _orig = getattr(module, "make_tensor_arg", None)
     if _orig is None or getattr(_orig, "_child_memory_patched", False):
         return
@@ -296,12 +273,21 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         runner = self._runners[model.config.model_id]
         if not isinstance(runner, Qwen314BModelRunner):
             raise TypeError("Qwen314BPyptoExecutor requires a Qwen314BModelRunner.")
-        return runner.run_generate_l3(
-            model,
-            prefill_batch,
-            max_new_tokens,
-            eos_token_id,
-        )
+        with profile_span(
+            "executor.run_generate_l3",
+            cat="executor",
+            args={
+                "model_id": model.config.model_id,
+                "batch_size": len(prefill_batch.request_ids),
+                "max_new_tokens": max_new_tokens,
+            },
+        ):
+            return runner.run_generate_l3(
+                model,
+                prefill_batch,
+                max_new_tokens,
+                eos_token_id,
+            )
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
         """Compile Qwen3-14B PyPTO kernels and pack runtime artifacts."""
@@ -580,6 +566,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         param_infos, _, _ = compiled_view._get_metadata()
         return _L2Callable(
             chip_callable=chip_callable,
+            name=name,
             runtime_name=runtime_name,
             block_dim=int(runtime_config.get("block_dim", _QWEN14B_BLOCK_DIM)),
             aicpu_thread_num=int(runtime_config.get("aicpu_thread_num", 4)),
@@ -726,6 +713,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         param_infos, _, _ = compiled._get_metadata()
         return _L2Callable(
             chip_callable=chip_callable,
+            name=name,
             runtime_name=runtime_name,
             block_dim=int(runtime_config.get("block_dim", _QWEN14B_BLOCK_DIM)),
             aicpu_thread_num=int(runtime_config.get("aicpu_thread_num", 4)),

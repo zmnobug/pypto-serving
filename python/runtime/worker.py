@@ -230,15 +230,15 @@ class Worker:
         self._require_initialized("prepare_callable")
         self._worker.prepare_callable(int(callable_id), callable_obj)
 
-    def run(self, callable_obj: Any, args: Any = None, config: Any = None) -> None:
+    def run(self, callable_obj: Any, args: Any = None, config: Any = None) -> Any:
         """Run one L2 callable id or one L3 orchestration function."""
         self._require_initialized("run")
-        self._worker.run(callable_obj, args=args, config=config)
+        return self._worker.run(callable_obj, args=args, config=config)
 
-    def run_prepared(self, callable_id: int, args: Any = None, config: Any = None) -> None:
+    def run_prepared(self, callable_id: int, args: Any = None, config: Any = None) -> Any:
         """Run a callable previously staged with :meth:`prepare_callable`."""
         self._require_initialized("run_prepared")
-        self._worker.run_prepared(int(callable_id), args=args, config=config)
+        return self._worker.run_prepared(int(callable_id), args=args, config=config)
 
     def malloc(self, nbytes: int, *, worker_id: int = 0) -> int:
         """Allocate bytes on a worker child and return the device pointer."""

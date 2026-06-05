@@ -17,33 +17,55 @@ from typing import Any
 
 import torch
 
-try:
-    from python.core._profiling import StageTimer
-    from python.core.model_runner import ModelRunner
-    from python.core.types import (
-        DecodeBatch,
-        DecodeResult,
-        PrefillBatch,
-        PrefillResult,
-        RuntimeModel,
-    )
-    from python.runtime.worker import Worker as LlmWorker
-    from python.runtime.worker import WorkerTensor
-except ImportError:
-    from python.core._profiling import StageTimer
-    from python.core.model_runner import ModelRunner
-    from python.core.types import (
-        DecodeBatch,
-        DecodeResult,
-        PrefillBatch,
-        PrefillResult,
-        RuntimeModel,
-    )
-    from python.runtime.worker import Worker as LlmWorker
-    from python.runtime.worker import WorkerTensor
+from python.core._profiling import StageTimer
+from python.core.model_runner import ModelRunner
+from python.core.types import (
+    DecodeBatch,
+    DecodeResult,
+    PrefillBatch,
+    PrefillResult,
+    RuntimeModel,
+)
+from python.profile import profile_span
+from python.runtime.worker import Worker as LlmWorker
+from python.runtime.worker import WorkerTensor
 
 _TIMING_ENABLED = True
 _LOGITS_BATCH_TILE = 16
+
+
+def _l2_trace_name(kernel_name: str) -> str:
+    if "prefill" in kernel_name:
+        return "kernel.prefill_fwd"
+    if "decode" in kernel_name:
+        return "kernel.decode_fwd"
+    if "final_rms" in kernel_name:
+        return "kernel.final_rms"
+    if "lm_head" in kernel_name:
+        return "kernel.lm_head"
+    return f"kernel.{kernel_name}"
+
+
+def _run_timing_us(timing: Any) -> tuple[float | None, float | None]:
+    if timing is None:
+        return None, None
+    host_wall_us = getattr(timing, "host_wall_us", None)
+    device_wall_us = getattr(timing, "device_wall_us", None)
+    if host_wall_us is not None:
+        host_wall_us = float(host_wall_us)
+    if device_wall_us is not None:
+        device_wall_us = float(device_wall_us)
+    return host_wall_us, device_wall_us
+
+
+def _add_run_timing_args(args: dict[str, Any], timing: Any) -> None:
+    host_wall_us, device_wall_us = _run_timing_us(timing)
+    if host_wall_us is not None:
+        args["host_wall_us"] = host_wall_us
+        args["host_wall_ms"] = host_wall_us / 1000.0
+    if device_wall_us is not None:
+        args["device_wall_us"] = device_wall_us
+        args["device_wall_ms"] = device_wall_us / 1000.0
 
 
 @dataclass
@@ -68,6 +90,7 @@ class _L2Callable:
     """Assembled non-L3 callable and launch metadata."""
 
     chip_callable: object
+    name: str
     runtime_name: str
     block_dim: int
     aicpu_thread_num: int
@@ -329,19 +352,33 @@ class Qwen314BModelRunner(ModelRunner):
                 worker.free_tensor(normed)
         return logits_padded[:actual_batch, :vocab_size].to(hidden.device)
 
-    def _run_l2_program(self, callable_spec: _L2Callable, *args: Any) -> None:
+    def _run_l2_program(self, callable_spec: _L2Callable, *args: Any) -> Any:
         """Run a compiled non-L3 program through the LLM Simpler worker."""
         from simpler.task_interface import CallConfig  # noqa: PLC0415
 
-        handle = self._ensure_l2_program(callable_spec)
-        orch_args = self._build_l2_orch_args(callable_spec, args)
+        span_args = {
+            "kernel": callable_spec.name,
+            "runtime": callable_spec.runtime_name,
+            "block_dim": callable_spec.block_dim,
+            "aicpu_thread_num": callable_spec.aicpu_thread_num,
+        }
+        with profile_span(
+            _l2_trace_name(callable_spec.name),
+            cat="kernel",
+            level="kernel",
+            args=span_args,
+        ):
+            handle = self._ensure_l2_program(callable_spec)
+            orch_args = self._build_l2_orch_args(callable_spec, args)
 
-        cfg = CallConfig()
-        cfg.block_dim = callable_spec.block_dim
-        cfg.aicpu_thread_num = callable_spec.aicpu_thread_num
+            cfg = CallConfig()
+            cfg.block_dim = callable_spec.block_dim
+            cfg.aicpu_thread_num = callable_spec.aicpu_thread_num
 
-        worker = self._l2_workers[handle.runtime_name]
-        worker.run(handle.callable_id, orch_args, cfg)
+            worker = self._l2_workers[handle.runtime_name]
+            timing = worker.run(handle.callable_id, orch_args, cfg)
+            _add_run_timing_args(span_args, timing)
+            return timing
 
     def _worker_for_runtime(self, runtime_name: str) -> LlmWorker:
         """Return an initialized worker for ``runtime_name``."""
@@ -890,7 +927,19 @@ class Qwen314BModelRunner(ModelRunner):
         _mark("worker_init")
         try:
             _t_run_start = time.perf_counter()
-            worker.run(generate_orch_fn)
+            l3_span_args = {
+                "model_id": model.config.model_id,
+                "max_new_tokens": max_new_tokens,
+                "batch_size": actual_batch,
+            }
+            with profile_span(
+                "kernel.l3_generate",
+                cat="kernel",
+                level="kernel",
+                args=l3_span_args,
+            ):
+                timing = worker.run(generate_orch_fn)
+                _add_run_timing_args(l3_span_args, timing)
             _mark("worker_run_generate")
 
             # Sync KV cache back to host.  worker.run() above calls _drain()
@@ -904,7 +953,15 @@ class Qwen314BModelRunner(ModelRunner):
                         orch.copy_from(
                             worker_id=0, dst=_host_ptr, src=_dev_ptr, size=_nbytes,
                         )
-                worker.run(_kv_sync_orch_fn)
+                kv_sync_span_args: dict[str, Any] = {}
+                with profile_span(
+                    "kernel.l3_kv_sync",
+                    cat="kernel",
+                    level="kernel",
+                    args=kv_sync_span_args,
+                ):
+                    timing = worker.run(_kv_sync_orch_fn)
+                    _add_run_timing_args(kv_sync_span_args, timing)
             _mark("worker_run_kv_sync")
 
             _t_run_end = time.perf_counter()

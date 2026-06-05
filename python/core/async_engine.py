@@ -17,6 +17,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 
 from .kv_cache import KvCacheManager
+from python.profile import profile_instant, profile_span
 from .scheduler import Request, RequestStatus, Scheduler, SchedulerConfig, SchedulerOutput
 from .types import RuntimeConfig, StepOutput, WorkerCommand
 from .serving_worker import spawn_worker
@@ -116,16 +117,17 @@ class AsyncLLMEngine:
 
     async def start(self) -> None:
         """Start worker process and engine loop."""
-        process, input_q, output_q, ready_event = spawn_worker(self.config)
-        self._worker_process = process
-        self._input_queue = input_q
-        self._output_queue = output_q
+        with profile_span("AsyncLLMEngine.start", cat="serving"):
+            process, input_q, output_q, ready_event = spawn_worker(self.config)
+            self._worker_process = process
+            self._input_queue = input_q
+            self._output_queue = output_q
 
-        logger.info("Waiting for worker to initialize model...")
-        await asyncio.to_thread(ready_event.wait, timeout=600)
-        if not ready_event.is_set():
-            raise RuntimeError("Worker failed to initialize within timeout")
-        logger.info("Worker ready")
+            logger.info("Waiting for worker to initialize model...")
+            await asyncio.to_thread(ready_event.wait, timeout=600)
+            if not ready_event.is_set():
+                raise RuntimeError("Worker failed to initialize within timeout")
+            logger.info("Worker ready")
 
         self._running = True
         self._loop_task = asyncio.create_task(self._engine_loop())
@@ -161,27 +163,37 @@ class AsyncLLMEngine:
         """Add a request and yield token outputs as they are generated."""
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer is required for request processing")
-        prompt_token_ids = self.tokenizer.encode(prompt)
-        if not prompt_token_ids and self.bos_token_id is not None:
-            prompt_token_ids = [self.bos_token_id]
-        if not prompt_token_ids:
-            raise ValueError("Prompt tokenization produced no tokens.")
+        with profile_span(
+            "AsyncLLMEngine.add_request",
+            cat="serving",
+            args={"request_id": request_id, "max_new_tokens": config.max_new_tokens},
+        ):
+            prompt_token_ids = self.tokenizer.encode(prompt)
+            if not prompt_token_ids and self.bos_token_id is not None:
+                prompt_token_ids = [self.bos_token_id]
+            if not prompt_token_ids:
+                raise ValueError("Prompt tokenization produced no tokens.")
 
-        request = Request(
-            request_id=request_id,
-            prompt_token_ids=prompt_token_ids,
-            max_new_tokens=config.max_new_tokens,
-            arrival_time=time.time(),
-            stop_strings=tuple(config.stop) if config.stop else (),
-            eos_token_id=self.eos_token_id,
-            temperature=config.temperature,
-            top_p=config.top_p,
-            top_k=config.top_k,
-        )
+            request = Request(
+                request_id=request_id,
+                prompt_token_ids=prompt_token_ids,
+                max_new_tokens=config.max_new_tokens,
+                arrival_time=time.time(),
+                stop_strings=tuple(config.stop) if config.stop else (),
+                eos_token_id=self.eos_token_id,
+                temperature=config.temperature,
+                top_p=config.top_p,
+                top_k=config.top_k,
+            )
 
-        ctx = _RequestContext(request=request)
-        self._request_contexts[request_id] = ctx
-        self.scheduler.add_request(request)
+            ctx = _RequestContext(request=request)
+            self._request_contexts[request_id] = ctx
+            self.scheduler.add_request(request)
+            profile_instant(
+                "request.queued",
+                cat="serving",
+                args={"request_id": request_id, "prompt_tokens": len(prompt_token_ids)},
+            )
 
         try:
             while True:
@@ -210,25 +222,32 @@ class AsyncLLMEngine:
                 await asyncio.sleep(self.config.engine_loop_interval)
                 continue
 
-            scheduler_output = self.scheduler.schedule()
+            with profile_span("scheduler.schedule", cat="scheduler"):
+                scheduler_output = self.scheduler.schedule()
             if scheduler_output.is_empty:
                 await asyncio.sleep(self.config.engine_loop_interval)
                 continue
 
             finished_ids = self._pending_free_ids.copy()
             self._pending_free_ids.clear()
-            self._input_queue.put(
-                WorkerCommand(
-                    type="step",
-                    scheduler_output=scheduler_output,
-                    finished_request_ids=finished_ids or None,
+            with profile_span(
+                "scheduler.queue_worker_step",
+                cat="scheduler",
+                args={"scheduled": len(scheduler_output.scheduled_requests)},
+            ):
+                self._input_queue.put(
+                    WorkerCommand(
+                        type="step",
+                        scheduler_output=scheduler_output,
+                        finished_request_ids=finished_ids or None,
+                    )
                 )
-            )
 
             try:
-                step_output: StepOutput = await asyncio.to_thread(
-                    self._output_queue.get, timeout=300
-                )
+                with profile_span("scheduler.wait_worker_output", cat="scheduler"):
+                    step_output: StepOutput = await asyncio.to_thread(
+                        self._output_queue.get, timeout=300
+                    )
             except queue.Empty:
                 logger.error("Worker response timed out (300s)")
                 self._handle_step_error(scheduler_output)
@@ -239,7 +258,12 @@ class AsyncLLMEngine:
                 self._handle_step_error(scheduler_output)
                 continue
 
-            self._process_step_output(scheduler_output, step_output)
+            with profile_span(
+                "scheduler.process_step_output",
+                cat="scheduler",
+                args={"new_tokens": len(step_output.new_tokens)},
+            ):
+                self._process_step_output(scheduler_output, step_output)
 
         logger.info("Engine loop stopped")
 
