@@ -11,6 +11,7 @@ import pytest
 from types import SimpleNamespace
 
 import torch
+from simpler.task_interface import DataType
 
 from python.core.engine import LLMEngine
 from python.core.kv_cache import KvCacheManager
@@ -32,6 +33,7 @@ from examples.model.qwen3_14b.runner.npu_runner import _L2Callable
 from examples.model.qwen3_14b.runner.npu_runner import _add_run_timing_args
 from examples.model.qwen3_14b.runner.npu_runner import _l2_trace_name
 from examples.model.qwen3_14b.runner.npu_runner import _run_timing_us
+from python.runtime.worker import WorkerTensor
 
 
 class _Tokenizer:
@@ -103,7 +105,6 @@ def test_prefill_inputs_use_actual_user_batch_without_padding_lanes():
         save_kernels_dir=None,
         l3_trace=False,
     )
-    runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
     allocations = [
         manager.allocate_for_prompt(model.config.model_id, f"req-{idx}", idx + 1)
         for idx in range(2)
@@ -156,7 +157,6 @@ def test_prefill_inputs_pack_resumed_chunk_positions():
         save_kernels_dir=None,
         l3_trace=False,
     )
-    runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
     alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 4)
 
     prepared = runner._prepare_prefill_inputs(
@@ -193,7 +193,6 @@ def test_prefill_inputs_reject_non_contiguous_chunk_positions():
         save_kernels_dir=None,
         l3_trace=False,
     )
-    runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
     alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 4)
 
     with pytest.raises(ValueError, match="contiguous chunk"):
@@ -227,7 +226,6 @@ def test_decode_inputs_use_actual_user_batch_without_padding_lanes():
         save_kernels_dir=None,
         l3_trace=False,
     )
-    runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
     alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 1)
     hidden_states = torch.ones(1, model.config.hidden_size)
 
@@ -313,6 +311,7 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         save_kernels_dir=executor._save_kernels_dir,
         l3_trace=executor._l3_trace,
     )
+    monkeypatch.setattr(runner, "_worker_for_runtime", lambda _runtime_name: _FakeWorker())
     runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
     monkeypatch.setattr(runner, "_l2_child_tensor", lambda _runtime_name, tensor, **_kwargs: tensor)
     monkeypatch.setattr(runner, "_run_l2_program", lambda callable_spec, *args: callable_spec.chip_callable(*args))
@@ -395,4 +394,24 @@ class _CopyKernel:
 
 class _NoopKernel:
     def __call__(self, *args, config=None):
+        return None
+
+
+class _FakeWorker:
+    _DTYPES = {
+        torch.float32: DataType.FLOAT32,
+        torch.bfloat16: DataType.BFLOAT16,
+    }
+
+    def __init__(self) -> None:
+        self._next_ptr = 1
+        self.initialized = True
+
+    def alloc_tensor(self, shape, dtype):
+        nbytes = torch.empty(tuple(shape), dtype=dtype).nbytes
+        tensor = WorkerTensor(self._next_ptr, tuple(shape), self._DTYPES[dtype])
+        self._next_ptr += nbytes
+        return tensor
+
+    def free_tensor(self, tensor):
         return None

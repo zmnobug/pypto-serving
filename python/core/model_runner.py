@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import torch
+
+from python.runtime.worker import WorkerTensor
 
 from .types import (
     DecodeBatch,
@@ -25,62 +28,63 @@ from .types import (
 )
 
 
+@dataclass
+class _KvCachePool:
+    """Worker-resident flat all-layer KV cache for one model."""
+
+    key_pages: WorkerTensor
+    value_pages: WorkerTensor
+
+
 class ModelRunner(ABC):
     """Runtime interface for compiled kernels registered to one model."""
 
     def __init__(self) -> None:
-        self._kv_key_pages: dict[str, torch.Tensor] = {}
-        self._kv_value_pages: dict[str, torch.Tensor] = {}
-        self._kv_page_sizes: dict[str, int] = {}
+        self._kv_caches: dict[str, _KvCachePool] = {}
 
     def init_kv_cache(
         self, model_id: str, config: ModelConfig, runtime: RuntimeConfig
     ) -> None:
-        """Create the paged KV cache tensor pool for a model."""
-        if model_id in self._kv_key_pages:
+        """Create the paged KV cache directly in runner-owned device memory."""
+        if model_id in self._kv_caches:
             return
         max_blocks_per_seq = math.ceil(runtime.max_seq_len / runtime.page_size)
         num_pages = runtime.total_kv_pages
         if num_pages is None:
             num_pages = runtime.max_batch_size * max_blocks_per_seq
         kv_dtype = getattr(torch, runtime.kv_dtype)
-        key_pages = torch.zeros(
-            config.num_hidden_layers,
-            num_pages,
-            config.num_key_value_heads,
-            runtime.page_size,
+        cache_rows = config.num_hidden_layers * num_pages * config.num_key_value_heads * runtime.page_size
+        cache_shape = (
+            cache_rows,
             config.head_dim,
-            dtype=kv_dtype,
-            device=runtime.device,
         )
-        value_pages = torch.zeros_like(key_pages)
-        self._kv_key_pages[model_id] = key_pages
-        self._kv_value_pages[model_id] = value_pages
-        self._kv_page_sizes[model_id] = runtime.page_size
-
-    def materialize_single_layer_cache(
-        self, model_id: str, layer_idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return zero-copy views for one layer's KV cache."""
-        key_pages = self._kv_key_pages[model_id]
-        value_pages = self._kv_value_pages[model_id]
-        head_dim = key_pages.shape[-1]
-        return (
-            key_pages[layer_idx].reshape(-1, head_dim),
-            value_pages[layer_idx].reshape(-1, head_dim),
+        key_pages = self._alloc_kv_cache_tensor(cache_shape, kv_dtype)
+        try:
+            value_pages = self._alloc_kv_cache_tensor(cache_shape, kv_dtype)
+        except Exception:
+            self._free_kv_cache_tensor(key_pages)
+            raise
+        self._kv_caches[model_id] = _KvCachePool(
+            key_pages=key_pages,
+            value_pages=value_pages,
         )
 
-    def materialize_full_layer_cache(
-        self, model_id: str
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return zero-copy views spanning all layers' KV cache."""
-        key_pages = self._kv_key_pages[model_id]
-        value_pages = self._kv_value_pages[model_id]
-        head_dim = key_pages.shape[-1]
-        return (
-            key_pages.reshape(-1, head_dim),
-            value_pages.reshape(-1, head_dim),
-        )
+    def close_kv_cache(self) -> None:
+        """Release all runner-owned KV cache tensors."""
+        for pool in list(self._kv_caches.values()):
+            self._free_kv_cache_tensor(pool.key_pages)
+            self._free_kv_cache_tensor(pool.value_pages)
+        self._kv_caches.clear()
+
+    @abstractmethod
+    def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> WorkerTensor:
+        """Allocate one worker-resident KV cache tensor."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def _free_kv_cache_tensor(self, tensor: WorkerTensor) -> None:
+        """Free one worker-resident KV cache tensor."""
+        raise NotImplementedError
 
     @abstractmethod
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
