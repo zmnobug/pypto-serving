@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 from abc import ABC, abstractmethod
 
 from .executor import ModelExecutor
@@ -25,6 +26,9 @@ from .types import (
     RuntimeModel,
 )
 from .utils import backend_type_for_platform
+
+
+logger = logging.getLogger(__name__)
 
 
 class PyptoExecutor(ModelExecutor, ABC):
@@ -77,6 +81,16 @@ class PyptoExecutor(ModelExecutor, ABC):
     def session(self):
         """Provide a generation lifecycle hook for PyPTO runtimes."""
         yield
+
+    def close(self) -> None:
+        """Release runtime resources held by registered model runners."""
+        for model_id, runner in self._runners.items():
+            close = getattr(runner, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.exception("Failed to close PyPTO runner for model %s", model_id)
 
     def _run_config(self, *, codegen_only: bool):
         """Build a PyPTO ``RunConfig`` for compile or execution calls."""

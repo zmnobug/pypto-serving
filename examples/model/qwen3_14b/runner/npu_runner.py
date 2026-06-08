@@ -9,40 +9,30 @@
 
 from __future__ import annotations
 
-import ctypes
-import inspect
-import time
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+from pypto.runtime import DeviceTensor
 
-from python.core._profiling import StageTimer
 from python.core.model_runner import ModelRunner
 from python.core.types import (
     DecodeBatch,
     DecodeResult,
+    ModelConfig,
     PrefillBatch,
     PrefillResult,
+    RuntimeConfig,
     RuntimeModel,
 )
 from python.profile import profile_span
-from python.runtime.worker import Worker as LlmWorker
-from python.runtime.worker import WorkerTensor
-
-_TIMING_ENABLED = True
-_LOGITS_BATCH_TILE = 16
 
 
-def _l2_trace_name(kernel_name: str) -> str:
+def _kernel_trace_name(kernel_name: str) -> str:
     if "prefill" in kernel_name:
         return "kernel.prefill_fwd"
     if "decode" in kernel_name:
         return "kernel.decode_fwd"
-    if "final_rms" in kernel_name:
-        return "kernel.final_rms"
-    if "lm_head" in kernel_name:
-        return "kernel.lm_head"
     return f"kernel.{kernel_name}"
 
 
@@ -69,59 +59,40 @@ def _add_run_timing_args(args: dict[str, Any], timing: Any) -> None:
 
 
 @dataclass
-class _KernelLayerWeights:
-    """Kernel-ready weights for one transformer layer."""
+class _L3Callable:
+    """HOST-dispatched compiled program and launch metadata."""
 
-    input_rms_weight: torch.Tensor
-    wq: torch.Tensor
-    wk: torch.Tensor
-    wv: torch.Tensor
-    q_norm_weight: torch.Tensor
-    k_norm_weight: torch.Tensor
-    wo: torch.Tensor
-    post_rms_weight: torch.Tensor
-    w_gate: torch.Tensor
-    w_up: torch.Tensor
-    w_down: torch.Tensor
-
-
-@dataclass
-class _L2Callable:
-    """Assembled non-L3 callable and launch metadata."""
-
-    chip_callable: object
+    compiled: object
     name: str
-    runtime_name: str
     block_dim: int
     aicpu_thread_num: int
-    param_infos: tuple[object, ...]
+    dispatch_args: tuple[Any, ...] = ()
 
 
 @dataclass
 class _CompiledKernels:
     """Compiled Qwen3-14B kernels and immutable runtime tensors."""
 
-    prefill: _L2Callable
-    decode: _L2Callable
-    final_rms: _L2Callable | None
-    lm_head: _L2Callable | None
+    prefill: _L3Callable
+    decode: _L3Callable
     final_norm_weight: torch.Tensor
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
     padded_vocab: int
     padded_lm_head_weight: torch.Tensor
-    layers: list[_KernelLayerWeights]
     decode_weights: dict[str, torch.Tensor]
+    prefill_hidden_buffer: torch.Tensor
+    prefill_seq_lens_buffer: torch.Tensor
+    prefill_chunk_lens_buffer: torch.Tensor
+    prefill_chunk_offsets_buffer: torch.Tensor
+    prefill_block_table_buffer: torch.Tensor
+    prefill_slot_mapping_buffer: torch.Tensor
+    prefill_logits_buffer: torch.Tensor
+    decode_hidden_buffer: torch.Tensor
+    decode_seq_lens_buffer: torch.Tensor
+    decode_block_table_buffer: torch.Tensor
+    decode_slot_mapping_buffer: torch.Tensor
     decode_logits_buffer: torch.Tensor
-    # L3-wrapped generate artifacts. Populated only when l3_mode=True.
-    stacked_weights: dict[str, torch.Tensor] | None = None
-    l3_generate_chip_callables: dict[str, object] | None = None
-    l3_generate_entry_fn: object | None = None
-    l3_generate_sub_worker_fns: dict[str, object] | None = None
-    l3_generate_dc: object | None = None  # DistributedConfig
-    l3_generate_platform: str | None = None
-    l3_generate_runtime_name: str | None = None
-    l3_generate_param_infos: object | None = None
 
 
 @dataclass
@@ -139,7 +110,7 @@ class _PrefillInputs:
 
 @dataclass
 class _DecodeInputs:
-    """Padded host tensors passed to the decode kernel."""
+    """Active user rows prepared for decode."""
 
     actual_batch: int
     hidden: torch.Tensor
@@ -149,11 +120,33 @@ class _DecodeInputs:
 
 
 @dataclass
-class _L2ProgramHandle:
-    """L2 callable registration state for one runner process."""
+class _DecodeKernelInputs:
+    """Fixed-batch tensors passed to the fused decode kernel."""
 
-    callable_id: int
-    runtime_name: str
+    actual_batch: int
+    hidden: torch.Tensor
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    slot_mapping: torch.Tensor
+    logits: torch.Tensor
+
+
+@dataclass
+class _StaticDeviceTensor:
+    """A shared host tensor to upload into the shared L3 worker once."""
+
+    tensor: torch.Tensor
+
+
+@dataclass
+class _StaticKernelArgs:
+    """Static worker-resident kernel arguments reused across dispatches."""
+
+    final_norm_weight: _StaticDeviceTensor
+    rope_cos: _StaticDeviceTensor
+    rope_sin: _StaticDeviceTensor
+    padded_lm_head_weight: _StaticDeviceTensor
+    decode_weights: dict[str, _StaticDeviceTensor]
 
 
 class Qwen314BModelRunner(ModelRunner):
@@ -162,49 +155,58 @@ class Qwen314BModelRunner(ModelRunner):
     def __init__(
         self,
         *,
-        model_id: str,
         compiled: _CompiledKernels,
-        platform: str,
-        device_id: int,
-        save_kernels_dir: str | None,
-        l3_trace: bool,
     ) -> None:
         super().__init__()
-        self._model_id = model_id
         self._compiled = compiled
-        self._platform = platform
-        self._device_id = device_id
-        self._save_kernels_dir = save_kernels_dir
-        self._l3_trace = l3_trace
-        self._l2_workers: dict[str, LlmWorker] = {}
-        self._l2_programs: dict[int, _L2ProgramHandle] = {}
-        self._l2_child_allocs: dict[tuple[str, int], tuple[int, int]] = {}
+        self._l3_worker: Any | None = None
+        self._l3_static_tensors: dict[tuple[int, tuple[int, ...], torch.dtype], object] = {}
+        self._static_args: _StaticKernelArgs | None = None
+        self._pending_kv_cache_specs: dict[str, tuple[ModelConfig, RuntimeConfig]] = {}
+        if compiled is not None:
+            self._share_static_kernel_tensors()
+            self._static_args = self._build_static_kernel_args()
 
-    def _kv_cache_runtime_name(self) -> str:
-        if self._compiled.prefill.runtime_name != self._compiled.decode.runtime_name:
-            raise ValueError(
-                "device-side KV cache requires prefill and decode to use the same L2 runtime: "
-                f"{self._compiled.prefill.runtime_name!r} != {self._compiled.decode.runtime_name!r}"
-            )
-        return self._compiled.prefill.runtime_name
+    def init_kv_cache(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> None:
+        """Create the L3 worker-resident cache before the first request."""
+        if model_id in self._kv_caches:
+            return
+        self._pending_kv_cache_specs[model_id] = (config, runtime)
+        with profile_span("Qwen314BModelRunner.prepare_l3_worker", cat="executor"):
+            self._shared_l3_worker()
+        with profile_span("Qwen314BModelRunner.upload_static_tensors", cat="executor"):
+            self._materialize_static_tensors()
+        with profile_span("Qwen314BModelRunner.init_kv_cache", cat="executor"):
+            ModelRunner.init_kv_cache(self, model_id, config, runtime)
 
-    def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> WorkerTensor:
-        """Allocate one KV cache tensor on the L2 NPU worker."""
-        worker = self._worker_for_runtime(self._kv_cache_runtime_name())
-        return worker.alloc_tensor(shape, dtype)
+    def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> DeviceTensor:
+        """Allocate one worker-resident KV cache tensor shared by prefill/decode."""
+        return self._shared_l3_worker().alloc_tensor(shape, dtype)
 
-    def _free_kv_cache_tensor(self, tensor: WorkerTensor) -> None:
-        """Free one KV cache tensor from the L2 NPU worker."""
-        worker = self._l2_workers.get(self._kv_cache_runtime_name())
-        if worker is not None and worker.initialized:
+    def _free_kv_cache_tensor(self, tensor: DeviceTensor) -> None:
+        """Release one worker-resident KV cache tensor."""
+        worker = self._l3_worker
+        if worker is not None:
             worker.free_tensor(tensor)
+
+    def _materialize_kv_cache(self, model: RuntimeModel) -> Any:
+        """Return the worker-resident KV cache, allocating only as a fallback."""
+        kv_cache = self._kv_caches.get(model.config.model_id)
+        if kv_cache is not None:
+            return kv_cache
+        spec = self._pending_kv_cache_specs.get(model.config.model_id)
+        if spec is None:
+            spec = (model.config, model.runtime)
+            self._pending_kv_cache_specs[model.config.model_id] = spec
+        ModelRunner.init_kv_cache(self, model.config.model_id, spec[0], spec[1])
+        return self._kv_caches[model.config.model_id]
 
     @staticmethod
     def _validate_kv_cache_bounds(
         model: RuntimeModel,
         block_table: torch.Tensor,
         slot_mapping: torch.Tensor,
-        cache: WorkerTensor,
+        cache: Any,
     ) -> None:
         """Fail on host before an invalid KV page id reaches the NPU kernel."""
         valid_blocks = block_table[block_table >= 0]
@@ -224,64 +226,77 @@ class Qwen314BModelRunner(ModelRunner):
                 f"slot_mapping_shape={tuple(slot_mapping.shape)}"
             )
 
+    def _share_static_kernel_tensors(self) -> None:
+        """Move static kernel inputs to shared memory before worker creation."""
+        for tensor in self._iter_static_host_tensors():
+            self._share_cpu_tensor(tensor)
+
+    def _iter_static_host_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return host tensors that must be shared before the worker forks."""
+        compiled = self._compiled
+        return (
+            compiled.final_norm_weight,
+            compiled.rope_cos,
+            compiled.rope_sin,
+            compiled.padded_lm_head_weight,
+            *compiled.decode_weights.values(),
+            compiled.prefill_hidden_buffer,
+            compiled.prefill_seq_lens_buffer,
+            compiled.prefill_chunk_lens_buffer,
+            compiled.prefill_chunk_offsets_buffer,
+            compiled.prefill_block_table_buffer,
+            compiled.prefill_slot_mapping_buffer,
+            compiled.prefill_logits_buffer,
+            compiled.decode_hidden_buffer,
+            compiled.decode_seq_lens_buffer,
+            compiled.decode_block_table_buffer,
+            compiled.decode_slot_mapping_buffer,
+            compiled.decode_logits_buffer,
+        )
+
+    def _build_static_kernel_args(self) -> _StaticKernelArgs:
+        """Create static device-upload markers once per runner."""
+        compiled = self._compiled
+        return _StaticKernelArgs(
+            final_norm_weight=self._static_device_tensor(compiled.final_norm_weight),
+            rope_cos=self._static_device_tensor(compiled.rope_cos),
+            rope_sin=self._static_device_tensor(compiled.rope_sin),
+            padded_lm_head_weight=self._static_device_tensor(compiled.padded_lm_head_weight),
+            decode_weights={
+                name: self._static_device_tensor(tensor)
+                for name, tensor in compiled.decode_weights.items()
+            },
+        )
+
+    def _require_static_args(self) -> _StaticKernelArgs:
+        """Return prebuilt static args for dispatch."""
+        if self._static_args is None:
+            raise RuntimeError("Qwen314BModelRunner static kernel args are not initialized")
+        return self._static_args
+
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         """Run the JIT all-layer prefill kernel and return next-token logits."""
         compiled = self._compiled
         prefill_inputs = self._prepare_prefill_inputs(model, batch)
-        dw = compiled.decode_weights
-        t_prefill_start = time.perf_counter()
 
-        kv_cache = self._kv_caches.get(model.config.model_id)
-        if kv_cache is None:
-            raise RuntimeError(f"KV cache for model {model.config.model_id!r} is not initialized")
+        logits_padded = compiled.prefill_logits_buffer
+
+        kv_cache = self._materialize_kv_cache(model)
         k_cache = kv_cache.key_pages
         v_cache = kv_cache.value_pages
         self._validate_kv_cache_bounds(model, prefill_inputs.block_table, prefill_inputs.slot_mapping, k_cache)
-        logits_padded = torch.zeros(
-            (prefill_inputs.actual_batch, compiled.padded_vocab),
-            dtype=torch.float32,
-        ).share_memory_()
 
-        self._run_l2_program(
+        self._run_distributed_program(
             compiled.prefill,
-            prefill_inputs.hidden,
-            prefill_inputs.seq_lens,
-            prefill_inputs.chunk_lens,
-            prefill_inputs.chunk_offsets,
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_input_rms_weight"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wq"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wk"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wv"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_q_norm_weight"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_k_norm_weight"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, compiled.rope_cos),
-            self._l2_child_tensor(compiled.prefill.runtime_name, compiled.rope_sin),
-            prefill_inputs.block_table,
-            prefill_inputs.slot_mapping,
-            k_cache,
-            v_cache,
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_wo"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_post_rms_weight"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_w_gate"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_w_up"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, dw["decode_w_down"]),
-            self._l2_child_tensor(compiled.prefill.runtime_name, compiled.final_norm_weight),
-            self._l2_child_tensor(compiled.prefill.runtime_name, compiled.padded_lm_head_weight),
-            logits_padded,
+            *self._prefill_kernel_args(prefill_inputs, k_cache, v_cache, logits_padded),
         )
-        if _TIMING_ENABLED:
-            print(
-                f"[timing] prefill: fused {len(model.layers)} layers, "
-                f"{(time.perf_counter() - t_prefill_start) * 1000:.2f} ms",
-                flush=True,
-            )
 
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             seq_len = int(batch.seq_lens[batch_idx].item())
             alloc.tokens_used = max(alloc.tokens_used, seq_len)
         return PrefillResult(
             last_hidden=None,
-            logits=logits_padded[:, : model.config.vocab_size],
+            logits=logits_padded[: prefill_inputs.actual_batch, : model.config.vocab_size],
         )
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
@@ -303,11 +318,6 @@ class Qwen314BModelRunner(ModelRunner):
         compiled = self._compiled
         model_id = model.config.model_id
         decode_inputs = self._prepare_decode_inputs(model, batch)
-        actual_batch = decode_inputs.actual_batch
-        dw = compiled.decode_weights
-        rt = compiled.decode.runtime_name
-        kernel_batch = model.runtime.max_batch_size
-        max_blocks = self._max_blocks_per_seq(model)
 
         kv_cache = self._kv_caches.get(model_id)
         if kv_cache is None:
@@ -315,231 +325,234 @@ class Qwen314BModelRunner(ModelRunner):
         k_cache = kv_cache.key_pages
         v_cache = kv_cache.value_pages
 
+        kernel_inputs = self._pad_decode_inputs(model, decode_inputs)
+
+        # Padded block_table / slot_mapping only ever reference row 0's
+        # already-valid pages, so bound-check exactly what the kernel will read.
+        self._validate_kv_cache_bounds(model, kernel_inputs.block_table, kernel_inputs.slot_mapping, k_cache)
+
+        self._run_distributed_program(
+            compiled.decode,
+            *self._decode_kernel_args(kernel_inputs, k_cache, v_cache),
+        )
+        for batch_idx, alloc in enumerate(batch.kv_allocations):
+            alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
+        return DecodeResult(
+            hidden_states=decode_inputs.hidden.float(),
+            logits=kernel_inputs.logits[: kernel_inputs.actual_batch, : model.config.vocab_size].to(
+                decode_inputs.hidden.device
+            ),
+        )
+
+    def _prefill_kernel_args(
+        self,
+        inputs: _PrefillInputs,
+        k_cache: DeviceTensor,
+        v_cache: DeviceTensor,
+        logits: torch.Tensor,
+    ) -> tuple[Any, ...]:
+        """Return arguments in ``qwen3_prefill_host`` signature order."""
+        static = self._require_static_args()
+        weights = static.decode_weights
+        return (
+            inputs.hidden,
+            inputs.seq_lens,
+            inputs.chunk_lens,
+            inputs.chunk_offsets,
+            weights["decode_input_rms_weight"],
+            weights["decode_wq"],
+            weights["decode_wk"],
+            weights["decode_wv"],
+            weights["decode_q_norm_weight"],
+            weights["decode_k_norm_weight"],
+            static.rope_cos,
+            static.rope_sin,
+            inputs.block_table,
+            inputs.slot_mapping,
+            k_cache,
+            v_cache,
+            weights["decode_wo"],
+            weights["decode_post_rms_weight"],
+            weights["decode_w_gate"],
+            weights["decode_w_up"],
+            weights["decode_w_down"],
+            static.final_norm_weight,
+            static.padded_lm_head_weight,
+            logits,
+        )
+
+    def _decode_kernel_args(
+        self,
+        inputs: _DecodeKernelInputs,
+        k_cache: DeviceTensor,
+        v_cache: DeviceTensor,
+    ) -> tuple[Any, ...]:
+        """Return arguments in ``qwen3_decode_host`` signature order."""
+        static = self._require_static_args()
+        weights = static.decode_weights
+        return (
+            inputs.hidden,
+            weights["decode_input_rms_weight"],
+            weights["decode_wq"],
+            weights["decode_wk"],
+            weights["decode_wv"],
+            weights["decode_q_norm_weight"],
+            weights["decode_k_norm_weight"],
+            inputs.seq_lens,
+            inputs.block_table,
+            inputs.slot_mapping,
+            static.rope_cos,
+            static.rope_sin,
+            k_cache,
+            v_cache,
+            weights["decode_wo"],
+            weights["decode_w_gate"],
+            weights["decode_w_up"],
+            weights["decode_w_down"],
+            weights["decode_post_rms_weight"],
+            static.final_norm_weight,
+            static.padded_lm_head_weight,
+            inputs.logits,
+        )
+
+    def _pad_decode_inputs(self, model: RuntimeModel, inputs: _DecodeInputs) -> _DecodeKernelInputs:
+        """Pad active decode rows to the fixed kernel batch.
+
+        The fused decode kernel computes all ``max_batch_size`` rows. Inactive
+        rows replicate row 0 so their KV writes are idempotent instead of
+        targeting unrelated pages.
+        """
+        compiled = self._compiled
+        actual_batch = inputs.actual_batch
+        kernel_batch = model.runtime.max_batch_size
+        max_blocks = self._max_blocks_per_seq(model)
+
         if kernel_batch > compiled.decode_logits_buffer.shape[0]:
             raise ValueError(
                 f"kernel batch {kernel_batch} exceeds logits buffer batch "
                 f"{compiled.decode_logits_buffer.shape[0]}"
             )
 
-        # Pad active inputs up to the fixed kernel batch by replicating row 0.
-        def _pad_rows(active: torch.Tensor, rows_each: int) -> torch.Tensor:
-            view = active.reshape(actual_batch, rows_each)
-            padded = view[0:1].expand(kernel_batch - actual_batch, rows_each)
-            return torch.cat([view, padded], dim=0).reshape(-1).contiguous()
+        hidden = compiled.decode_hidden_buffer
+        hidden[:actual_batch].copy_(inputs.hidden)
+        if actual_batch < kernel_batch:
+            hidden[actual_batch:].copy_(inputs.hidden[0:1].expand(kernel_batch - actual_batch, -1))
 
-        hidden = torch.zeros((kernel_batch, model.config.hidden_size), dtype=torch.bfloat16)
-        hidden[:actual_batch] = decode_inputs.hidden
-        hidden[actual_batch:] = decode_inputs.hidden[0:1]
-        hidden = hidden.share_memory_()
-        seq_lens = _pad_rows(decode_inputs.seq_lens, 1).to(torch.int32).share_memory_()
-        block_table = _pad_rows(decode_inputs.block_table, max_blocks).to(torch.int32).share_memory_()
-        slot_mapping = _pad_rows(decode_inputs.slot_mapping, 1).to(torch.int32).share_memory_()
-
-        # Padded block_table / slot_mapping only ever reference row 0's
-        # already-valid pages, so bound-check exactly what the kernel will read.
-        self._validate_kv_cache_bounds(model, block_table, slot_mapping, k_cache)
-
-        logits_padded = compiled.decode_logits_buffer  # full [kernel_batch, vocab]; trimmed below
-        # Argument order MUST match decode_layer.decode_fwd (PAGED):
-        #   hidden_states, input_rms_weight, wq, wk, wv, q_norm_weight,
-        #   k_norm_weight, seq_lens, block_table, slot_mapping, rope_cos, rope_sin,
-        #   k_cache, v_cache, wo, w_gate, w_up, w_down, post_rms_weight,
-        #   final_norm_weight, lm_head_weight, out.
-        self._run_l2_program(
-            compiled.decode,
-            hidden,
-            self._l2_child_tensor(rt, dw["decode_input_rms_weight"]),
-            self._l2_child_tensor(rt, dw["decode_wq"]),
-            self._l2_child_tensor(rt, dw["decode_wk"]),
-            self._l2_child_tensor(rt, dw["decode_wv"]),
-            self._l2_child_tensor(rt, dw["decode_q_norm_weight"]),
-            self._l2_child_tensor(rt, dw["decode_k_norm_weight"]),
-            seq_lens,
-            block_table,
-            slot_mapping,
-            self._l2_child_tensor(rt, compiled.rope_cos),
-            self._l2_child_tensor(rt, compiled.rope_sin),
-            k_cache,
-            v_cache,
-            self._l2_child_tensor(rt, dw["decode_wo"]),
-            self._l2_child_tensor(rt, dw["decode_w_gate"]),
-            self._l2_child_tensor(rt, dw["decode_w_up"]),
-            self._l2_child_tensor(rt, dw["decode_w_down"]),
-            self._l2_child_tensor(rt, dw["decode_post_rms_weight"]),
-            self._l2_child_tensor(rt, compiled.final_norm_weight),
-            self._l2_child_tensor(rt, compiled.padded_lm_head_weight),
-            logits_padded,
-        )
-        for batch_idx, alloc in enumerate(batch.kv_allocations):
-            alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
-        return DecodeResult(
-            hidden_states=decode_inputs.hidden.float(),
-            logits=logits_padded[:actual_batch, : model.config.vocab_size].to(decode_inputs.hidden.device),
+        return _DecodeKernelInputs(
+            actual_batch=actual_batch,
+            hidden=hidden,
+            seq_lens=self._copy_replicated_rows(
+                compiled.decode_seq_lens_buffer,
+                inputs.seq_lens,
+                actual_batch,
+                kernel_batch,
+                rows_each=1,
+            ),
+            block_table=self._copy_replicated_rows(
+                compiled.decode_block_table_buffer,
+                inputs.block_table,
+                actual_batch,
+                kernel_batch,
+                rows_each=max_blocks,
+            ),
+            slot_mapping=self._copy_replicated_rows(
+                compiled.decode_slot_mapping_buffer,
+                inputs.slot_mapping,
+                actual_batch,
+                kernel_batch,
+                rows_each=1,
+            ),
+            logits=compiled.decode_logits_buffer,
         )
 
-    def _project_logits(self, model: RuntimeModel, hidden: torch.Tensor) -> torch.Tensor:
-        """Run final RMSNorm and LM head kernels for a hidden-state batch."""
-        compiled = self._compiled
-        hidden_size = model.config.hidden_size
-        vocab_size = model.config.vocab_size
-        padded_vocab = compiled.padded_vocab
-
-        if compiled.final_rms is None or compiled.lm_head is None:
-            raise RuntimeError("standalone final_rms/lm_head kernels are not compiled")
-
-        actual_batch = hidden.shape[0]
-        if actual_batch > _LOGITS_BATCH_TILE:
-            raise ValueError(
-                f"logit batch {actual_batch} exceeds _LOGITS_BATCH_TILE {_LOGITS_BATCH_TILE}"
-            )
-
-        x = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16).share_memory_()
-        x[:actual_batch] = hidden.to(torch.bfloat16).cpu()
-        if not isinstance(compiled.final_rms, _L2Callable) or not isinstance(compiled.lm_head, _L2Callable):
-            normed = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16)
-            compiled.final_rms(x, compiled.final_norm_weight, normed, config=None)
-            logits_padded = torch.zeros((_LOGITS_BATCH_TILE, padded_vocab), dtype=torch.float32)
-            compiled.lm_head(normed, compiled.padded_lm_head_weight, logits_padded, config=None)
-            return logits_padded[:actual_batch, :vocab_size].to(hidden.device)
-
-        normed: torch.Tensor | WorkerTensor
-        x_arg: torch.Tensor | WorkerTensor = x
-        worker: LlmWorker | None = None
-        if compiled.final_rms.runtime_name == compiled.lm_head.runtime_name:
-            worker = self._worker_for_runtime(compiled.final_rms.runtime_name)
-            x_arg = worker.alloc_tensor(x.shape, x.dtype, init=x)
-            normed = worker.alloc_tensor(x.shape, x.dtype)
-        else:
-            normed = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16).share_memory_()
-
-        try:
-            self._run_l2_program(
-                compiled.final_rms,
-                x_arg,
-                self._l2_child_tensor(compiled.final_rms.runtime_name, compiled.final_norm_weight),
-                normed,
-            )
-
-            logits_padded = torch.zeros((_LOGITS_BATCH_TILE, padded_vocab), dtype=torch.float32).share_memory_()
-            self._run_l2_program(
-                compiled.lm_head,
-                normed,
-                self._l2_child_tensor(compiled.lm_head.runtime_name, compiled.padded_lm_head_weight),
-                logits_padded,
-            )
-        finally:
-            if isinstance(x_arg, WorkerTensor):
-                if worker is None:
-                    raise RuntimeError("missing L2 worker for child-memory logits projection")
-                worker.free_tensor(x_arg)
-            if isinstance(normed, WorkerTensor):
-                if worker is None:
-                    raise RuntimeError("missing L2 worker for child-memory logits projection")
-                worker.free_tensor(normed)
-        return logits_padded[:actual_batch, :vocab_size].to(hidden.device)
-
-    def _run_l2_program(self, callable_spec: _L2Callable, *args: Any) -> Any:
-        """Run a compiled non-L3 program through the LLM Simpler worker."""
-        from simpler.task_interface import CallConfig  # noqa: PLC0415
-
+    def _run_distributed_program(self, callable_spec: _L3Callable, *args: Any) -> Any:
+        """Run a compiled HOST wrapper through the shared PyPTO L3 worker."""
         span_args = {
             "kernel": callable_spec.name,
-            "runtime": callable_spec.runtime_name,
             "block_dim": callable_spec.block_dim,
             "aicpu_thread_num": callable_spec.aicpu_thread_num,
         }
         with profile_span(
-            _l2_trace_name(callable_spec.name),
+            _kernel_trace_name(callable_spec.name),
             cat="kernel",
             level="kernel",
             args=span_args,
         ):
-            handle = self._ensure_l2_program(callable_spec)
-            orch_args = self._build_l2_orch_args(callable_spec, args)
-
-            cfg = CallConfig()
-            cfg.block_dim = callable_spec.block_dim
-            cfg.aicpu_thread_num = callable_spec.aicpu_thread_num
-
-            worker = self._l2_workers[handle.runtime_name]
-            timing = worker.run(handle.callable_id, orch_args, cfg)
+            worker = self._shared_l3_worker()
+            l3_args = callable_spec.dispatch_args + tuple(self._coerce_l3_arg(worker, arg) for arg in args)
+            worker_run_args = dict(span_args)
+            with profile_span(
+                f"{_kernel_trace_name(callable_spec.name)}.worker_run",
+                cat="kernel",
+                level="kernel",
+                args=worker_run_args,
+            ):
+                timing = worker.run(callable_spec.compiled, *l3_args)
+                _add_run_timing_args(worker_run_args, timing)
             _add_run_timing_args(span_args, timing)
             return timing
 
-    def _worker_for_runtime(self, runtime_name: str) -> LlmWorker:
-        """Return an initialized worker for ``runtime_name``."""
-        worker = self._l2_workers.get(runtime_name)
-        if worker is not None:
-            return worker
-        worker = LlmWorker(
-            level=2,
-            platform=self._platform,
-            runtime=runtime_name,
-            device_id=self._device_id,
-            auto_init=True,
-        )
-        self._l2_workers[runtime_name] = worker
+    def _shared_l3_worker(self) -> Any:
+        """Return the worker shared by the generation prefill/decode path."""
+        worker = self._l3_worker
+        if worker is None:
+            from pypto.runtime import DistributedWorker  # noqa: PLC0415
+
+            worker = DistributedWorker([self._compiled.prefill.compiled, self._compiled.decode.compiled])
+            self._l3_worker = worker
         return worker
 
-    def _ensure_l2_program(self, callable_spec: _L2Callable) -> _L2ProgramHandle:
-        """Register and cache one executor-assembled non-L3 callable."""
-        key = id(callable_spec)
-        cached = self._l2_programs.get(key)
+    def _coerce_l3_arg(self, worker: Any, arg: Any) -> Any:
+        """Convert static upload markers to worker-resident tensors."""
+        if not isinstance(arg, _StaticDeviceTensor):
+            return arg
+        tensor = arg.tensor
+        key = (tensor.data_ptr(), tuple(tensor.shape), tensor.dtype)
+        cached = self._l3_static_tensors.get(key)
         if cached is not None:
             return cached
+        dev = worker.alloc_tensor(tensor.shape, tensor.dtype, init=tensor)
+        self._l3_static_tensors[key] = dev
+        return dev
 
-        worker = self._worker_for_runtime(callable_spec.runtime_name)
+    def _materialize_static_tensors(self) -> None:
+        """Upload static kernel tensors into the shared L3 worker before serving."""
+        worker = self._shared_l3_worker()
+        static = self._require_static_args()
+        for arg in (
+            static.final_norm_weight,
+            static.rope_cos,
+            static.rope_sin,
+            static.padded_lm_head_weight,
+            *static.decode_weights.values(),
+        ):
+            self._coerce_l3_arg(worker, arg)
 
-        handle = _L2ProgramHandle(
-            callable_id=worker.register(callable_spec.chip_callable),
-            runtime_name=callable_spec.runtime_name,
-        )
-        self._l2_programs[key] = handle
-        return handle
-
-    def _l2_child_tensor(
-        self,
-        runtime_name: str,
-        tensor: torch.Tensor,
+    @staticmethod
+    def _copy_replicated_rows(
+        dst: torch.Tensor,
+        active: torch.Tensor,
+        actual_batch: int,
+        kernel_batch: int,
         *,
-        upload: bool = True,
-        refresh: bool = False,
-    ) -> WorkerTensor:
-        """Return a worker-resident view for a CPU tensor's backing storage."""
-        from simpler_setup.torch_interop import torch_dtype_to_datatype  # noqa: PLC0415
+        rows_each: int,
+    ) -> torch.Tensor:
+        """Copy active rows and fill inactive rows by replicating row 0."""
+        active_view = active.reshape(actual_batch, rows_each)
+        dst_view = dst.reshape(kernel_batch, rows_each)
+        dst_view[:actual_batch].copy_(active_view)
+        if actual_batch < kernel_batch:
+            dst_view[actual_batch:].copy_(active_view[0:1].expand(kernel_batch - actual_batch, rows_each))
+        return dst
 
+    @staticmethod
+    def _static_device_tensor(tensor: torch.Tensor) -> _StaticDeviceTensor:
+        """Mark a CPU tensor for one-time upload to the shared worker."""
         if tensor.device.type != "cpu":
-            raise ValueError("child-memory tensor must be on CPU")
+            raise ValueError("worker-resident tensor must be on CPU")
         if not tensor.is_contiguous():
-            raise ValueError("child-memory tensor must be contiguous")
-        tensor = self._share_cpu_tensor(tensor)
-        storage = tensor.untyped_storage()
-        storage_ptr = int(storage.data_ptr())
-        storage_nbytes = int(storage.nbytes())
-        tensor_offset = int(tensor.data_ptr()) - storage_ptr
-        if tensor_offset < 0 or tensor_offset + int(tensor.nbytes) > storage_nbytes:
-            raise ValueError("tensor view is outside its backing storage")
-
-        key = (runtime_name, storage_ptr)
-        alloc = self._l2_child_allocs.get(key)
-        if alloc is None:
-            worker = self._worker_for_runtime(runtime_name)
-            dev_ptr = worker.malloc(storage_nbytes)
-            if upload:
-                worker.copy_to(dev_ptr, storage_ptr, storage_nbytes)
-            alloc = (dev_ptr, storage_nbytes)
-            self._l2_child_allocs[key] = alloc
-        elif upload and refresh:
-            worker = self._worker_for_runtime(runtime_name)
-            worker.copy_to(alloc[0], storage_ptr, storage_nbytes)
-
-        dev_base, _ = alloc
-        shape = tuple(int(dim) for dim in tensor.shape)
-        return WorkerTensor(
-            data_ptr=dev_base + tensor_offset,
-            shape=shape,
-            dtype=torch_dtype_to_datatype(tensor.dtype),
-        )
+            raise ValueError("worker-resident tensor must be contiguous")
+        return _StaticDeviceTensor(Qwen314BModelRunner._share_cpu_tensor(tensor))
 
     @staticmethod
     def _share_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -549,554 +562,32 @@ class Qwen314BModelRunner(ModelRunner):
         return tensor
 
     def close(self) -> None:
-        """Release non-L3 child-memory allocations and L2 workers."""
-        self.close_kv_cache()
-        for (runtime_name, _), (dev_ptr, _nbytes) in list(self._l2_child_allocs.items()):
-            worker = self._l2_workers.get(runtime_name)
-            if worker is not None and worker.initialized:
-                worker.free(dev_ptr)
-        self._l2_child_allocs.clear()
-        self._l2_programs.clear()
-        for worker in self._l2_workers.values():
-            worker.close()
-        self._l2_workers.clear()
-
-    @staticmethod
-    def _build_l2_orch_args(callable_spec: _L2Callable, args: tuple[Any, ...]):
-        """Build ``ChipStorageTaskArgs`` for a compiled L2 program call."""
-        from simpler.task_interface import ChipStorageTaskArgs, ContinuousTensor, scalar_to_uint64  # noqa: PLC0415
-        from simpler_setup.torch_interop import make_tensor_arg  # noqa: PLC0415
-
-        param_infos = callable_spec.param_infos
-        if len(args) != len(param_infos):
-            names = [p.name for p in param_infos]
-            raise TypeError(
-                f"compiled program expects {len(param_infos)} arguments, got {len(args)}. Parameters: {names}"
-            )
-
-        orch_args = ChipStorageTaskArgs()
-        for info, arg in zip(param_infos, args, strict=True):
-            if info.shape is None:
-                if not isinstance(arg, ctypes._SimpleCData):
-                    raise TypeError(f"scalar parameter {info.name!r} must be passed as a ctypes scalar")
-                orch_args.add_scalar(scalar_to_uint64(arg))
-                continue
-            if isinstance(arg, WorkerTensor):
-                orch_args.add_tensor(arg.to_continuous_tensor())
-                continue
-            if isinstance(arg, ContinuousTensor):
-                orch_args.add_tensor(arg)
-                continue
-            if not isinstance(arg, torch.Tensor):
-                raise TypeError(f"tensor parameter {info.name!r} expects torch.Tensor, got {type(arg).__name__}")
-            if arg.device.type != "cpu":
-                raise ValueError(f"tensor parameter {info.name!r} must be on CPU for Simpler L2 dispatch")
-            if not arg.is_contiguous():
-                raise ValueError(f"tensor parameter {info.name!r} must be contiguous")
-            if not arg.is_shared():
-                arg.share_memory_()
-            orch_args.add_tensor(make_tensor_arg(arg))
-        return orch_args
-
-    # ── L3-wrapped generate: entire prefill + decode loop in one worker.run() ──
-
-    def run_generate_l3(
-        self,
-        model: RuntimeModel,
-        prefill_batch: PrefillBatch,
-        max_new_tokens: int,
-        eos_token_id: int | None,
-    ) -> tuple[list[int], torch.Tensor]:
-        """Run the full generate loop inside a single Worker(level=3).
-
-        Dispatches prefill chunks + final_rms + lm_head + decode loop entirely
-        within one worker.run() call, using sub_worker for CPU-side sampling
-        and embedding lookup between device dispatches.
-
-        Returns (generated_token_ids, final_hidden).
-        """
-        from simpler.task_interface import CallConfig  # noqa: PLC0415
-        from simpler.worker import Worker  # noqa: PLC0415
-
-        _verbose = self._l3_trace
-        timer = StageTimer(
-            enabled=_verbose,
-            prefix="L3-breakdown",
-            title="run_generate_l3 stage timings",
-        )
-
-        def _mark(label: str) -> None:
-            timer.mark(label)
-
-        compiled = self._compiled
-        if compiled.l3_generate_chip_callables is None:
-            raise RuntimeError("L3 generate artifacts not compiled.")
-        if max_new_tokens > model.runtime.max_new_tokens:
-            raise ValueError(
-                f"max_new_tokens={max_new_tokens} exceeds compiled L3 limit "
-                f"{model.runtime.max_new_tokens}"
-            )
-
-        _mark("entry_validate")
-        prefill_inputs = self._prepare_prefill_inputs(model, prefill_batch, padded=True)
-        _mark("prepare_prefill_inputs")
-        actual_batch = prefill_inputs.actual_batch
-        if actual_batch != 1:
-            raise ValueError(
-                "run_generate_l3 currently supports batch_size=1 only; "
-                f"got {actual_batch} requests."
-            )
-        hidden_size = model.config.hidden_size
-        max_seq = model.runtime.max_seq_len
-        vocab_size = model.config.vocab_size
-        padded_vocab = compiled.padded_vocab
-
-        kv_cache = self._kv_caches.get(model.config.model_id)
-        if kv_cache is None:
-            raise RuntimeError(f"KV cache for model {model.config.model_id!r} is not initialized")
-        k_cache_all = kv_cache.key_pages
-        v_cache_all = kv_cache.value_pages
-        _mark("kv_cache_materialize")
-
-        # Build initial decode hidden: last prompt token embedding per batch.
-        decode_hidden = torch.zeros((actual_batch, hidden_size), dtype=torch.bfloat16)
-        decode_slot_mapping = torch.zeros((actual_batch,), dtype=torch.int32)
-        for b in range(actual_batch):
-            seq_len_b = int(prefill_inputs.seq_lens[b].item())
-            decode_hidden[b] = prefill_inputs.hidden[b, seq_len_b - 1, :]
-            decode_slot_mapping[b] = int(
-                prefill_inputs.slot_mapping[b * max_seq + seq_len_b - 1].item()
-            )
-
-        # Pre-allocate all shared-memory tensors for the full generate loop.
-        prefill_out = torch.zeros_like(prefill_inputs.hidden).share_memory_()
-        # decode_out and rms_x share one padded buffer so no CPU copy is needed
-        # between them.  l3_generate writes to decode_out (the first actual_batch
-        # rows); final_rms reads rms_x (all _LOGITS_BATCH_TILE rows).  The padding
-        # rows stay zero throughout, satisfying the zero-pad contract of final_rms.
-        _decode_out_storage = torch.zeros(
-            (_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16
-        ).share_memory_()
-        decode_out = _decode_out_storage[:actual_batch, :]   # [actual_batch, hidden_size]
-        rms_x = _decode_out_storage                          # [_LOGITS_BATCH_TILE, hidden_size]
-        # final_rms / lm_head intermediates.
-        rms_gamma = model.final_norm_weight.view(1, hidden_size).float().cpu().share_memory_()
-        rms_normed = torch.zeros((_LOGITS_BATCH_TILE, hidden_size), dtype=torch.bfloat16).share_memory_()
-        lm_head_weight = compiled.padded_lm_head_weight.share_memory_()
-        logits_padded = torch.zeros((_LOGITS_BATCH_TILE, padded_vocab), dtype=torch.float32).share_memory_()
-        _mark("alloc_io_buffers")
-        # Sub-worker communication tensors.
-        embed_tokens = model.embed_tokens.to(torch.bfloat16).cpu().share_memory_()
-        _mark("embed_tokens_to_shm")
-        done_flag = torch.zeros((1,), dtype=torch.int32).share_memory_()
-        generated_ids = torch.full((max_new_tokens,), -1, dtype=torch.int64).share_memory_()
-        token_count = torch.zeros((1,), dtype=torch.int32).share_memory_()
-        # Mutable decode inputs (updated by sub_worker between steps).
-        decode_hidden_buf = decode_hidden.clone().share_memory_()
-        decode_seq_lens = prefill_inputs.seq_lens.clone().share_memory_()
-        decode_slot_mapping_buf = decode_slot_mapping.clone().share_memory_()
-
-        # Ensure all prefill inputs are in shared memory.
-        prefill_hidden = prefill_inputs.hidden.share_memory_()
-        prefill_seq_lens = prefill_inputs.seq_lens.share_memory_()
-        prefill_slot_mapping = prefill_inputs.slot_mapping.share_memory_()
-        block_table = prefill_inputs.block_table.share_memory_()
-        rope_cos = compiled.rope_cos.share_memory_()
-        rope_sin = compiled.rope_sin.share_memory_()
-        k_cache_all = k_cache_all.share_memory_()
-        v_cache_all = v_cache_all.share_memory_()
-        _mark("kv_and_prefill_to_shm")
-
-        # Ensure stacked weights are in shared memory.
-        sm_sw = {}
-        for k, v in compiled.stacked_weights.items():
-            sm_sw[k] = v.share_memory_() if not v.is_shared() else v
-        _mark("stacked_weights_to_shm")
-
-        # SSA-name substrings that identify static weight parameters in the
-        # tensors_dict built by _build_full_tensors().  Used in
-        # generate_orch_fn to pre-upload these tensors once per generate call
-        # (child_memory=True) so all decode dispatches skip H2D re-upload.
-        _sw_substrings: frozenset[str] = frozenset(sm_sw.keys()) | {
-            "rope_cos", "rope_sin", "final_norm_weight", "lm_head_weight",
-        }
-
-        # ── Sub-worker callable ──
-        # Runs in a forked child process. Reads logits → argmax → embedding lookup
-        # → writes decode_hidden_buf / decode_seq_lens / decode_slot_mapping_buf.
-        _eos_id = eos_token_id
-        _vocab = vocab_size
-        _actual_batch = actual_batch
-        _page_size = model.runtime.page_size
-
-        # Pre-capture references for the sub_worker closure.
-        # These are shared-memory tensors visible in the forked child.
-        _embed_tokens = embed_tokens
-        _done_flag = done_flag
-        _generated_ids = generated_ids
-        _token_count = token_count
-        _decode_hidden_buf = decode_hidden_buf
-        _decode_seq_lens = decode_seq_lens
-        _decode_slot_mapping_buf = decode_slot_mapping_buf
-        _logits_padded = logits_padded
-        _prefill_batch = prefill_batch
-
-        # L3 tracing: enabled by the executor's l3_trace flag (typically wired
-        # to --profile-verbose). When disabled, all per-stage timestamp prints
-        # are suppressed.
-        _l3_trace_enabled = self._l3_trace
-
-        # Shared-memory anchors so forked sub-worker callbacks can print times
-        # relative to a common start (set at prefill submit_start in the parent).
-        # Slot 0: start anchor (perf_counter seconds).
-        # Slot 1: timestamp of the previous printed event (for Δprev).
-        _t_anchors = torch.zeros(2, dtype=torch.float64).share_memory_()
-
-        def _fmt_rel(t_now: float) -> str:
-            t0 = float(_t_anchors[0].item())
-            t_prev = float(_t_anchors[1].item())
-            if t0 <= 0.0:
-                return "t=+0.000ms (Δ+0.000ms)"
-            rel_ms = (t_now - t0) * 1000.0
-            d_ms = (t_now - t_prev) * 1000.0 if t_prev > 0.0 else 0.0
-            _t_anchors[1] = t_now
-            return f"t=+{rel_ms:.2f}ms (Δ+{d_ms:.2f}ms)"
-
-        # Track when each sample_and_prepare finishes so we can split
-        # chip-task time vs sub-worker IPC + work time.
-        _sample_done_ts = [0.0]  # timestamp of last sample_and_prepare return
-
-        def sample_and_prepare_fn(task_args):
-            """Sub-worker: sample token from logits, prepare next decode inputs."""
-            _t_enter = time.perf_counter()
-            if _done_flag[0].item():
-                return  # EOS already hit, no-op.
-
-            # Read logits (written by lm_head chip task into logits_padded).
-            logits = _logits_padded[0, :_vocab]
-            token_id = int(logits.argmax().item())
-
-            step = int(_token_count[0].item())
-            if _l3_trace_enabled:
-                _prev_done = _sample_done_ts[0]
-                chip_ms = (_t_enter - _prev_done) * 1000.0 if _prev_done > 0.0 else 0.0
-                print(
-                    f"[L3-step] step={step:02d} sample_enter {_fmt_rel(_t_enter)}"
-                    f"  chip_tasks={chip_ms:.1f}ms",
-                    flush=True,
-                )
-            _generated_ids[step] = token_id
-            _token_count[0] = step + 1
-
-            if _eos_id is not None and token_id == _eos_id:
-                _done_flag[0] = 1
-                _t_exit = time.perf_counter()
-                _sample_done_ts[0] = _t_exit
-                if _l3_trace_enabled:
-                    work_ms = (_t_exit - _t_enter) * 1000.0
-                    print(
-                        f"[L3-step] step={step:02d} sample_exit  {_fmt_rel(_t_exit)}"
-                        f"  sample_work={work_ms:.1f}ms",
-                        flush=True,
-                    )
-                return
-
-            if step + 1 >= max_new_tokens:
-                _done_flag[0] = 1
-                _t_exit = time.perf_counter()
-                _sample_done_ts[0] = _t_exit
-                if _l3_trace_enabled:
-                    work_ms = (_t_exit - _t_enter) * 1000.0
-                    print(
-                        f"[L3-step] step={step:02d} sample_exit  {_fmt_rel(_t_exit)}"
-                        f"  sample_work={work_ms:.1f}ms",
-                        flush=True,
-                    )
-                return
-
-            # Embedding lookup.
-            _decode_hidden_buf[0, :] = _embed_tokens[token_id]
-
-            # Update seq_lens.
-            for b in range(_actual_batch):
-                new_seq_len = int(_decode_seq_lens[b].item()) + 1
-                _decode_seq_lens[b] = new_seq_len
-                # Update slot_mapping for next position.
-                alloc = _prefill_batch.kv_allocations[b]
-                page_idx = (new_seq_len - 1) // _page_size
-                slot_in_page = (new_seq_len - 1) % _page_size
-                if page_idx < len(alloc.page_ids):
-                    _decode_slot_mapping_buf[b] = alloc.page_ids[page_idx] * _page_size + slot_in_page
-
-            _t_exit = time.perf_counter()
-            _sample_done_ts[0] = _t_exit
-            if _l3_trace_enabled:
-                work_ms = (_t_exit - _t_enter) * 1000.0
-                print(
-                    f"[L3-step] step={step:02d} sample_exit  {_fmt_rel(_t_exit)}"
-                    f"  sample_work={work_ms:.1f}ms",
-                    flush=True,
-                )
-
-        # ── Build the orchestrator function ──
-
-        lg_entry_fn = compiled.l3_generate_entry_fn
-        lg_chip_callables = compiled.l3_generate_chip_callables
-        lg_dc = compiled.l3_generate_dc
-        lg_param_infos = compiled.l3_generate_param_infos
-
-        def _submit_l3_generate(orch, config, tensors_dict, _keep):
-            """Submit one l3_generate entry_fn call (dispatches all-layers L2 tasks)."""
-            kwargs = {
-                "tensors": tensors_dict,
-                "callables": lg_callable_ids,
-                "sub_ids": sub_ids,
-                "_keep": _keep,
-            }
-            entry_params = inspect.signature(lg_entry_fn).parameters
-            if "contexts" in entry_params:
-                kwargs["contexts"] = getattr(worker, "chip_contexts", None)
-            if "world_size" in entry_params:
-                kwargs["world_size"] = 1
-            lg_entry_fn(
-                orch, None, config,
-                **kwargs,
-            )
-
-        _has_prefill_tensor = torch.tensor(True, dtype=torch.bool).share_memory_()
-
-        def _build_full_tensors():
-            """Build the tensor dict for the single l3_generate dispatch.
-
-            host_orch now owns the full generation loop (prefill step 0 +
-            pl.unroll(max_new_tokens) decode steps), so this is called once.
-            has_prefill is always True: step 0 inside host_orch runs prefill_all
-            then the first decode; subsequent iterations run decode-only.
-            """
-            td = {}
-            for info, val in zip(lg_param_infos, [
-                prefill_hidden,           # prefill_hidden
-                prefill_seq_lens,         # prefill_seq_lens
-                prefill_slot_mapping,     # prefill_slot_mapping
-                decode_hidden_buf,        # decode_hidden
-                decode_seq_lens,          # decode_seq_lens (mutated by sample_and_prepare sub-worker)
-                decode_slot_mapping_buf,  # decode_slot_mapping
-                sm_sw["input_rms_weight"],
-                sm_sw["wq"],
-                sm_sw["wk"],
-                sm_sw["wv"],
-                sm_sw["q_norm_weight"],
-                sm_sw["k_norm_weight"],
-                rope_cos,
-                rope_sin,
-                block_table,
-                k_cache_all,
-                v_cache_all,
-                sm_sw["wo"],
-                sm_sw["post_rms_weight"],
-                sm_sw["w_gate"],
-                sm_sw["w_up"],
-                sm_sw["w_down"],
-                _has_prefill_tensor,      # has_prefill = True
-                prefill_out,              # prefill_out
-                decode_out,               # decode_out
-                rms_x,                    # rms_x  (shares storage with decode_out)
-                rms_gamma,                # final_norm_weight
-                rms_normed,               # rms_normed
-                lm_head_weight,           # lm_head_weight_t
-                logits_padded,            # logits_padded
-            ], strict=True):
-                if not val.is_shared():
-                    val = val.share_memory_()
-                td[info.name] = val
-            return td
-
-        # KV cache device pointers collected inside generate_orch_fn so the
-        # post-run sync-back step can copy updated K/V values back to host.
-        # Format: list of (host_ptr: int, dev_ptr: int, nbytes: int).
-        _kv_dev_ptrs: list[tuple[int, int, int]] = []
-
-        def generate_orch_fn(orch, _args, _cfg):
-            _keep: list = []
-            call_config = CallConfig()
-            call_config.block_dim = lg_dc.block_dim
-            call_config.aicpu_thread_num = lg_dc.aicpu_thread_num
-
-            _t_pf = time.perf_counter()
-            _t_anchors[0] = _t_pf
-            _t_anchors[1] = _t_pf
-            _sample_done_ts[0] = _t_pf  # baseline for step 0 chip_tasks measurement
-            if _l3_trace_enabled:
-                print(f"[L3-step] host_orch submit_start {_fmt_rel(_t_pf)}", flush=True)
-
-            # Single dispatch: host_orch drives prefill + all decode steps
-            # (pl.unroll(max_new_tokens) inside host_orch).
-            td = _build_full_tensors()
-
-            from simpler.task_interface import ContinuousTensor as _CT  # noqa: PLC0415
-            from simpler_setup.torch_interop import (  # noqa: PLC0415
-                torch_dtype_to_datatype as _td2dt,
-            )
-
-            # Pre-upload static weight tensors once per generate call.
-            # child_memory=True → runtime skips H2D + D2H on every dispatch.
-            # ~3 400 ms of init_runtime per step reduced to ~11 ms.
-            for _pname, _t in list(td.items()):
-                if not isinstance(_t, torch.Tensor):
-                    continue
-                if not any(_sub in _pname for _sub in _sw_substrings):
-                    continue
-                _nbytes = int(_t.nbytes)
-                _dev_ptr = orch.malloc(worker_id=0, size=_nbytes)
-                orch.copy_to(worker_id=0, dst=_dev_ptr, src=_t.data_ptr(), size=_nbytes)
-                _shapes = tuple(int(s) for s in _t.shape)
-                _dt = _td2dt(_t.dtype)
-                td[_pname] = _CT.make(_dev_ptr, _shapes, _dt, child_memory=True)
-
-            # Pre-upload KV cache (k_cache_all / v_cache_all) once per
-            # generate call.  The kernel writes updated K/V values in-place on
-            # device; child_memory=True skips H2D and D2H on every decode step,
-            # saving ~280 ms H2D + ~360 ms D2H per step (~640 ms × 16 steps).
-            # After worker.run() drains (all tasks done), a second worker.run()
-            # call copies the final device state back to the host KV cache via
-            # orch.copy_from so subsequent generate calls see updated values.
-            for _pname, _t in list(td.items()):
-                if not isinstance(_t, torch.Tensor):
-                    continue
-                if "k_cache_all" not in _pname and "v_cache_all" not in _pname:
-                    continue
-                _nbytes = int(_t.nbytes)
-                _dev_ptr = orch.malloc(worker_id=0, size=_nbytes)
-                orch.copy_to(worker_id=0, dst=_dev_ptr, src=_t.data_ptr(), size=_nbytes)
-                _shapes = tuple(int(s) for s in _t.shape)
-                _dt = _td2dt(_t.dtype)
-                _kv_dev_ptrs.append((_t.data_ptr(), _dev_ptr, _nbytes))
-                td[_pname] = _CT.make(_dev_ptr, _shapes, _dt, child_memory=True)
-
-            _submit_l3_generate(orch, call_config, td, _keep)
-
-            if _l3_trace_enabled:
-                print(f"[L3-step] all submits done {_fmt_rel(time.perf_counter())}", flush=True)
-
-        # ── Create Worker and execute ──
-
-        lg_sub_fns = dict(compiled.l3_generate_sub_worker_fns or {})
-        # Override the placeholder sample_and_prepare sub-worker emitted by the
-        # l3_generate compiler with the real closure that reads shared-memory
-        # tensors and performs argmax → embedding lookup → slot-map update.
-        lg_sub_fns["sample_and_prepare"] = sample_and_prepare_fn
-
-        num_sub = max(lg_dc.num_sub_workers, len(lg_sub_fns))
-
-        _mark("setup_closures_and_buffers")
-
-        worker = Worker(
-            level=3,
-            device_ids=[self._device_id],
-            num_sub_workers=num_sub,
-            platform=compiled.l3_generate_platform,
-            runtime=compiled.l3_generate_runtime_name,
-        )
-
-        _mark("Worker_ctor")
-
-        # Register chip callables and sub-worker callables before worker.init().
-        lg_callable_ids: dict[str, int] = {}
-        for name, callable_obj in lg_chip_callables.items():
-            lg_callable_ids[name] = worker.register(callable_obj)
-
-        sub_ids: dict[str, int] = {}
-        for name, fn in lg_sub_fns.items():
-            sub_ids[name] = worker.register(fn)
-
-        _mark("worker_register")
-
-        worker.init()
-        _mark("worker_init")
+        """Release shared L3 worker resources and clear static tensor caches."""
         try:
-            _t_run_start = time.perf_counter()
-            l3_span_args = {
-                "model_id": model.config.model_id,
-                "max_new_tokens": max_new_tokens,
-                "batch_size": actual_batch,
-            }
-            with profile_span(
-                "kernel.l3_generate",
-                cat="kernel",
-                level="kernel",
-                args=l3_span_args,
-            ):
-                timing = worker.run(generate_orch_fn)
-                _add_run_timing_args(l3_span_args, timing)
-            _mark("worker_run_generate")
-
-            # Sync KV cache back to host.  worker.run() above calls _drain()
-            # internally, so all chip tasks (including the last decode step)
-            # have completed by the time we reach here.  The child_memory
-            # buffers are still live (worker.close() not yet called), so a
-            # second worker.run() can copy them back to the host tensors.
-            if _kv_dev_ptrs:
-                def _kv_sync_orch_fn(orch, _args, _cfg):  # noqa: E306
-                    for _host_ptr, _dev_ptr, _nbytes in _kv_dev_ptrs:
-                        orch.copy_from(
-                            worker_id=0, dst=_host_ptr, src=_dev_ptr, size=_nbytes,
-                        )
-                kv_sync_span_args: dict[str, Any] = {}
-                with profile_span(
-                    "kernel.l3_kv_sync",
-                    cat="kernel",
-                    level="kernel",
-                    args=kv_sync_span_args,
-                ):
-                    timing = worker.run(_kv_sync_orch_fn)
-                    _add_run_timing_args(kv_sync_span_args, timing)
-            _mark("worker_run_kv_sync")
-
-            _t_run_end = time.perf_counter()
-            print(
-                f"[L3-timer] worker.run total wall-clock: "
-                f"{(_t_run_end-_t_run_start)*1000:.1f}ms",
-                flush=True,
-            )
+            self.close_kv_cache()
         finally:
-            worker.close()
-            _mark("worker_close")
-
-        # Update KV allocations.
-        final_token_count = int(token_count[0].item())
-        for batch_idx, alloc in enumerate(prefill_batch.kv_allocations):
-            base_seq = int(prefill_inputs.seq_lens[batch_idx].item())
-            alloc.tokens_used = max(alloc.tokens_used, base_seq + final_token_count)
-
-        ids = generated_ids[:final_token_count].tolist()
-        ret_val = ids, decode_out[:actual_batch].float()
-        _mark("post_process")
-
-        timer.report()
-        return ret_val
+            worker = self._l3_worker
+            try:
+                if worker is not None:
+                    worker.close()
+            finally:
+                self._l3_worker = None
+                self._l3_static_tensors.clear()
 
     def _prepare_prefill_inputs(
         self,
         model: RuntimeModel,
         batch: PrefillBatch,
-        *,
-        padded: bool = False,
     ) -> _PrefillInputs:
         """Pack variable-length prefill requests into kernel input tensors."""
+        compiled = self._compiled
         batch_count = len(batch.kv_allocations) if batch.kv_allocations else int(batch.seq_lens.shape[0])
         actual_batch = self._validate_batch_size(model, batch_count)
         max_seq = model.runtime.max_seq_len
-        hidden_size = model.config.hidden_size
         page_size = model.runtime.page_size
         max_blocks = self._max_blocks_per_seq(model)
-        if padded:
-            if batch.kv_allocations:
-                max_blocks = max(max_blocks, max(len(alloc.page_ids) for alloc in batch.kv_allocations))
+        kernel_batch = model.runtime.max_batch_size
 
-        seq_lens = torch.empty((actual_batch,), dtype=torch.int32)
-        chunk_lens = torch.empty((actual_batch,), dtype=torch.int32)
-        chunk_offsets = torch.empty((actual_batch,), dtype=torch.int32)
-        block_table = torch.full((actual_batch * max_blocks,), -1, dtype=torch.int32)
         seq_len_values = [int(batch.seq_lens[idx].item()) for idx in range(actual_batch)]
         chunk_len_values: list[int] = []
         chunk_start_values: list[int] = []
@@ -1131,12 +622,20 @@ class Qwen314BModelRunner(ModelRunner):
             chunk_len_values.append(chunk_len)
             chunk_start_values.append(chunk_start)
         total_tokens = sum(chunk_len_values)
-        if padded:
-            hidden = torch.zeros((actual_batch, max_seq, hidden_size), dtype=torch.bfloat16)
-            slot_mapping = torch.full((actual_batch * max_seq,), -1, dtype=torch.int32)
-        else:
-            hidden = torch.empty((total_tokens, hidden_size), dtype=torch.bfloat16)
-            slot_mapping = torch.empty((total_tokens,), dtype=torch.int32)
+        max_tokens = kernel_batch * max_seq
+        if total_tokens > max_tokens:
+            raise ValueError(f"prefill total tokens {total_tokens} exceeds kernel capacity {max_tokens}")
+
+        hidden = compiled.prefill_hidden_buffer[:total_tokens]
+        seq_lens = compiled.prefill_seq_lens_buffer
+        chunk_lens = compiled.prefill_chunk_lens_buffer
+        chunk_offsets = compiled.prefill_chunk_offsets_buffer
+        block_table = compiled.prefill_block_table_buffer
+        slot_mapping = compiled.prefill_slot_mapping_buffer[:total_tokens]
+        seq_lens.zero_()
+        chunk_lens.zero_()
+        chunk_offsets.zero_()
+        block_table.fill_(-1)
 
         token_offset = 0
         for batch_idx in range(actual_batch):
@@ -1152,10 +651,7 @@ class Qwen314BModelRunner(ModelRunner):
             chunk_lens[batch_idx] = chunk_len
             chunk_offsets[batch_idx] = token_offset
             embeddings = batch.input_embeddings[batch_idx, :chunk_len, :].to(torch.bfloat16).cpu()
-            if padded:
-                hidden[batch_idx, chunk_start:seq_len, :] = embeddings
-            else:
-                hidden[token_offset : token_offset + chunk_len, :] = embeddings
+            hidden[token_offset : token_offset + chunk_len, :] = embeddings
 
             if alloc is not None:
                 page_ids = alloc.page_ids
@@ -1166,20 +662,17 @@ class Qwen314BModelRunner(ModelRunner):
             self._write_block_table_row(block_table, batch_idx, max_blocks, page_ids)
 
             slot_row = self._compute_slot_mapping(page_ids, chunk_len, page_size, start_pos=chunk_start)
-            if padded:
-                slot_mapping[batch_idx * max_seq + chunk_start : batch_idx * max_seq + seq_len] = slot_row
-            else:
-                slot_mapping[token_offset : token_offset + chunk_len] = slot_row
+            slot_mapping[token_offset : token_offset + chunk_len] = slot_row
             token_offset += chunk_len
 
         return _PrefillInputs(
             actual_batch=actual_batch,
-            hidden=hidden.share_memory_(),
-            seq_lens=seq_lens.share_memory_(),
-            chunk_lens=chunk_lens.share_memory_(),
-            chunk_offsets=chunk_offsets.share_memory_(),
-            block_table=block_table.share_memory_(),
-            slot_mapping=slot_mapping.share_memory_(),
+            hidden=hidden,
+            seq_lens=seq_lens,
+            chunk_lens=chunk_lens,
+            chunk_offsets=chunk_offsets,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
         )
 
     def _prepare_decode_inputs(
@@ -1226,10 +719,10 @@ class Qwen314BModelRunner(ModelRunner):
 
         return _DecodeInputs(
             actual_batch=actual_batch,
-            hidden=hidden.share_memory_(),
-            seq_lens=seq_lens.share_memory_(),
-            block_table=block_table.share_memory_(),
-            slot_mapping=slot_mapping.share_memory_(),
+            hidden=hidden,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
         )
 
     @staticmethod

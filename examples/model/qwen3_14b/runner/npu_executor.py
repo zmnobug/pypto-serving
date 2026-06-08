@@ -11,37 +11,45 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
-from simpler.task_interface import ContinuousTensor
 
 from examples.model.qwen3_14b.runner.npu_runner import (
     _CompiledKernels,
-    _KernelLayerWeights,
-    _L2Callable,
+    _L3Callable,
     Qwen314BModelRunner,
 )
+from examples.model.qwen3_14b.runner import qwen3_l3_dispatch
 from python.core._profiling import StageTimer
 from python.core.model_runner import ModelRunner
 from python.core.pypto_executor import PyptoExecutor as CorePyptoExecutor
-from python.core.types import (
-    GenerateConfig,
-    GenerateResult,
-    ModelRecord,
-    PrefillBatch,
-    RequestState,
-    RuntimeModel,
-)
+from python.core.types import RuntimeModel
 from python.core.utils import rope_tables, round_up
-from python.profile import profile_span
 
 
 _VOCAB_PAD_MULTIPLE = 512  # must be a multiple of lm_head.VOCAB_CHUNK (64)
 _QWEN14B_PAGE_SIZE = 128
 _QWEN14B_BLOCK_DIM = 24
+
+
+@dataclass
+class _KernelLayerWeights:
+    """Kernel-ready weights for one transformer layer."""
+
+    input_rms_weight: torch.Tensor
+    wq: torch.Tensor
+    wk: torch.Tensor
+    wv: torch.Tensor
+    q_norm_weight: torch.Tensor
+    k_norm_weight: torch.Tensor
+    wo: torch.Tensor
+    post_rms_weight: torch.Tensor
+    w_gate: torch.Tensor
+    w_up: torch.Tensor
+    w_down: torch.Tensor
 
 
 def _find_pypto_lib_qwen14b_dir() -> Path:
@@ -88,54 +96,6 @@ def _load_pypto_lib_qwen14b_module(module_name: str) -> object:
     return module
 
 
-def _patch_orch_make_tensor_arg(module: object) -> None:
-    """Allow ``make_tensor_arg`` in a generated orchestration module to pass
-    ``ContinuousTensor`` objects through unchanged.
-
-    The generated ``host_orch.py`` always calls ``make_tensor_arg(t)`` for
-    every entry in the ``tensors`` dict.  When we pre-upload static weights
-    and replace them with ``ContinuousTensor(child_memory=True)`` objects,
-    the default ``make_tensor_arg`` (which expects a ``torch.Tensor``) would
-    crash.  Patching it here lets child_memory tensors pass through as-is
-    so the runtime skips H2D/D2H for those buffers.
-    """
-    _orig = getattr(module, "make_tensor_arg", None)
-    if _orig is None or getattr(_orig, "_child_memory_patched", False):
-        return
-
-    def _patched(tensor: object) -> object:
-        if isinstance(tensor, ContinuousTensor):
-            return tensor
-        return _orig(tensor)  # type: ignore[misc]
-
-    _patched._child_memory_patched = True  # type: ignore[attr-defined]
-    module.make_tensor_arg = _patched  # type: ignore[attr-defined]
-
-
-class _StackedLayerView:
-    """Adapter exposing HF-format LayerWeights in kernel orientation.
-
-    stack_layer_weights() expects each per-layer weight already in the
-    orientation the kernel ingests (transposed BF16 contiguous CPU). This
-    view computes that view lazily per attribute access so the stacker can
-    iterate ``getattr(layer, attr)`` against the standard LayerWeights.
-    """
-
-    _KERNEL_2D_ATTRS = ("wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down")
-
-    def __init__(self, layer) -> None:
-        self._layer = layer
-
-    def __getattr__(self, name: str) -> torch.Tensor:
-        weight = getattr(self._layer, name)
-        if name in self._KERNEL_2D_ATTRS:
-            return weight.transpose(0, 1).to(torch.bfloat16).contiguous().cpu()
-        # Norm gammas (input_rms_weight, q/k/post norm). The stacker
-        # flattens to [dim] then re-stacks; cast to FP32 to match the
-        # kernel signature ([num_layers, dim], FP32).
-        return weight.view(-1).float().contiguous().cpu()
-
-
 class Qwen314BPyptoExecutor(CorePyptoExecutor):
     """PyPTO executor that compiles and registers the Qwen3-14B kernels."""
 
@@ -146,7 +106,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         platform: str = "a2a3sim",
         device_id: int = 0,
         save_kernels_dir: str | None = None,
-        l3_mode: bool = False,
         l3_trace: bool = False,
     ) -> None:
         super().__init__(
@@ -155,9 +114,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             device_id=device_id,
             save_kernels_dir=save_kernels_dir,
         )
-        self._l3_mode = l3_mode
         self._l3_trace = l3_trace
-        self._l2_compile_root: Path | None = None
 
     @property
     def profile_verbose(self) -> bool:
@@ -169,125 +126,8 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         if not isinstance(compiled, _CompiledKernels):
             raise TypeError("Qwen314BPyptoExecutor requires Qwen3-14B compiled kernels.")
         return Qwen314BModelRunner(
-            model_id=model_id,
             compiled=compiled,
-            platform=self._platform,
-            device_id=self._device_id,
-            save_kernels_dir=self._save_kernels_dir,
-            l3_trace=self._l3_trace,
         )
-
-    def validate_generate_batch(
-        self,
-        record: ModelRecord,
-        batch_size: int,
-        config: GenerateConfig,
-    ) -> None:
-        """Reject generation settings unsupported by the Qwen3-14B L3 path."""
-        if not self._l3_mode:
-            return
-        if batch_size != 1:
-            raise NotImplementedError(
-                "L3 generate fast path currently supports batch_size=1; "
-                f"got {batch_size} prompts."
-            )
-        if any(config.stop):
-            raise NotImplementedError(
-                "L3 generate fast path does not support generate_config.stop; "
-                "the device-side decode loop cannot break on host-side string matches."
-            )
-
-    def prompt_allocation_length(
-        self,
-        record: ModelRecord,
-        prompt_len: int,
-        config: GenerateConfig,
-    ) -> int:
-        """Return prompt KV length, including generated-token capacity for L3."""
-        if not self._l3_mode:
-            return prompt_len
-        max_seq = record.runtime.max_seq_len
-        if config.max_new_tokens < 1:
-            raise ValueError(
-                f"L3 mode requires max_new_tokens >= 1, got {config.max_new_tokens}."
-            )
-        if prompt_len > max_seq:
-            raise ValueError(
-                f"L3 mode: prompt length ({prompt_len}) exceeds max_seq_len ({max_seq}). "
-                f"Either shorten the prompt or increase --max-seq-len to at least {prompt_len}."
-            )
-        alloc_len = prompt_len + config.max_new_tokens
-        if alloc_len > max_seq:
-            allowed_new_tokens = max_seq - prompt_len
-            raise ValueError(
-                f"L3 mode: prompt length ({prompt_len}) + max_new_tokens "
-                f"({config.max_new_tokens}) = {alloc_len} exceeds max_seq_len ({max_seq}). "
-                f"Either reduce --max-new-tokens to at most {allowed_new_tokens}, "
-                f"or increase --max-seq-len to at least {alloc_len}."
-            )
-        return alloc_len
-
-    def try_generate_batch(
-        self,
-        record: ModelRecord,
-        requests: list[RequestState],
-        prefill_batch: PrefillBatch,
-        config: GenerateConfig,
-    ) -> list[GenerateResult] | None:
-        """Run the single-dispatch L3 generation path when L3 mode is enabled."""
-        if not self._l3_mode:
-            return None
-        generated_ids, _ = self.run_generate_l3(
-            record.runtime_model,
-            prefill_batch,
-            max_new_tokens=config.max_new_tokens,
-            eos_token_id=record.config.eos_token_id,
-        )
-        request = requests[0]
-        request.generated_token_ids = list(generated_ids)
-        request.output_text = record.tokenizer.decode(generated_ids)
-        if (
-            generated_ids
-            and record.config.eos_token_id is not None
-            and generated_ids[-1] == record.config.eos_token_id
-        ):
-            finish_reason = "eos"
-        else:
-            finish_reason = "length"
-        return [
-            GenerateResult(
-                text=request.output_text,
-                token_ids=list(request.generated_token_ids),
-                finish_reason=finish_reason,
-            )
-        ]
-
-    def run_generate_l3(
-        self,
-        model: RuntimeModel,
-        prefill_batch: PrefillBatch,
-        max_new_tokens: int,
-        eos_token_id: int | None,
-    ) -> tuple[list[int], torch.Tensor]:
-        """Delegate L3 generation to the registered Qwen3-14B runner."""
-        runner = self._runners[model.config.model_id]
-        if not isinstance(runner, Qwen314BModelRunner):
-            raise TypeError("Qwen314BPyptoExecutor requires a Qwen314BModelRunner.")
-        with profile_span(
-            "executor.run_generate_l3",
-            cat="executor",
-            args={
-                "model_id": model.config.model_id,
-                "batch_size": len(prefill_batch.request_ids),
-                "max_new_tokens": max_new_tokens,
-            },
-        ):
-            return runner.run_generate_l3(
-                model,
-                prefill_batch,
-                max_new_tokens,
-                eos_token_id,
-            )
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
         """Compile Qwen3-14B PyPTO kernels and pack runtime artifacts."""
@@ -300,7 +140,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         def _mark(label: str) -> None:
             timer.mark(label)
 
-        qwen3_l3_generate = _load_pypto_lib_qwen14b_module("l3_generate")
         qwen3_prefill_fwd = _load_pypto_lib_qwen14b_module("prefill_fwd")
         # The fused all-layer decode lives in decode_layer.decode_fwd (the
         # standalone decode_fwd.py module was removed in pypto-lib). It is now
@@ -308,9 +147,9 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         # device-resident paged KV pool prefill writes (self._kv_caches), so no
         # contiguous bridge / MAX_SEQ env is needed.
         qwen3_decode_layer = _load_pypto_lib_qwen14b_module("decode_layer")
+        qwen3_l3_dispatch.prefill_fwd = qwen3_prefill_fwd.prefill_fwd
+        qwen3_l3_dispatch.decode_fwd = qwen3_decode_layer.decode_fwd
 
-        build_qwen3_14b_l3_generate_program = qwen3_l3_generate.build_qwen3_14b_l3_generate_program
-        stack_layer_weights_full = qwen3_l3_generate.stack_layer_weights_full
         _mark("imports")
 
         self._validate_supported_shape(model)
@@ -343,7 +182,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         page_size = model.runtime.page_size
         max_blocks_per_seq = (model.runtime.max_seq_len + page_size - 1) // page_size
         prefill = self._compile_prefill_fwd_callable(
-            qwen3_prefill_fwd.prefill_fwd,
+            qwen3_l3_dispatch.qwen3_prefill_host,
             batch=kernel_batch,
             max_seq=model.runtime.max_seq_len,
             hidden_size=model.config.hidden_size,
@@ -358,7 +197,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         )
         _mark("compile_prefill")
         decode = self._compile_decode_fwd_callable(
-            qwen3_decode_layer.decode_fwd,
+            qwen3_l3_dispatch.qwen3_decode_host,
             batch=kernel_batch,
             max_seq=model.runtime.max_seq_len,
             block_table_stride=max_blocks_per_seq,
@@ -372,9 +211,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             page_size=page_size,
         )
         _mark("compile_decode")
-        final_rms = None
-        lm_head = None
-
         rope_cos_raw, rope_sin_raw = rope_tables(
             model.runtime.max_seq_len,
             model.config.head_dim,
@@ -384,127 +220,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         rope_sin = self._shared_tensor(rope_sin_raw)
 
         _mark("rope_tables")
-
-        # L3 artefacts (built only when l3_mode=True).
-        l3_generate: object | None = None
-        stacked_weights: dict[str, torch.Tensor] | None = None
-        if self._l3_mode:
-            l3_generate_program = build_qwen3_14b_l3_generate_program(
-                num_layers=model.config.num_hidden_layers,
-                batch=kernel_batch,
-                max_seq=model.runtime.max_seq_len,
-                hidden_size=model.config.hidden_size,
-                intermediate_size=model.config.intermediate_size,
-                num_heads=model.config.num_attention_heads,
-                num_kv_heads=model.config.num_key_value_heads,
-                head_dim=model.config.head_dim,
-                max_new_tokens=model.runtime.max_new_tokens,
-                padded_vocab=padded_vocab,
-                page_size=model.runtime.page_size,
-            )
-            # pypto.runtime.run hard-codes DistributedConfig(block_dim=1), so we call
-            # ir.compile directly to override it.
-            from pypto import ir  # noqa: PLC0415
-            from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
-
-            _rc = self._run_config(codegen_only=True)
-            l3_generate = ir.compile(
-                l3_generate_program,
-                output_dir=_rc.save_kernels_dir,
-                strategy=_rc.strategy,
-                backend_type=_rc.backend_type,
-                dump_passes=_rc.dump_passes,
-                diagnostic_phase=_rc.diagnostic_phase,
-                disabled_diagnostics=_rc.disabled_diagnostics,
-                platform=_rc.platform,
-                profiling=_rc.compile_profiling,
-                distributed_config=DistributedConfig(
-                    device_ids=[self._device_id],
-                    block_dim=_QWEN14B_BLOCK_DIM,
-                    num_sub_workers=0,
-                    aicpu_thread_num=4,
-                ),
-            )
-            _mark("compile_l3_generate")
-            # stack_layer_weights_full expects each weight already in
-            # kernel orientation ([in_dim, out_dim] for 2D matmul weights).
-            # Adapt via a per-layer view that mirrors _kernel_weight().
-            stacked_layers = [_StackedLayerView(layer) for layer in model.layers]
-            stacked_weights = stack_layer_weights_full(
-                stacked_layers,
-                hidden=model.config.hidden_size,
-                kv_hidden=model.config.num_key_value_heads * model.config.head_dim,
-                inter=model.config.intermediate_size,
-                head_dim=model.config.head_dim,
-            )
-            _mark("stack_layer_weights")
-
-        # L3-wrapped generate: pre-extract l3_generate setup artifacts
-        # (expensive compile_and_assemble + module loading done once,
-        # reused per generate call).
-        l3_generate_chip_callables: dict[str, object] | None = None
-        l3_generate_entry_fn: object | None = None
-        l3_generate_sub_worker_fns: dict[str, object] | None = None
-        l3_generate_dc: object | None = None
-        l3_generate_platform: str | None = None
-        l3_generate_runtime_name: str | None = None
-        l3_generate_param_infos: object | None = None
-        if self._l3_mode:
-            from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
-            from pypto.runtime.distributed_runner import _load_generated_module  # noqa: PLC0415
-            from pypto.pypto_core.ir import FunctionType  # noqa: PLC0415
-
-            # Pre-extract l3_generate setup artifacts.
-            lg_dc = l3_generate._distributed_config
-            lg_output_dir = l3_generate.output_dir
-            lg_chip_callables: dict[str, object] = {}
-            lg_runtime_name = "tensormap_and_ringbuffer"
-            lg_next_levels_dir = lg_output_dir / "next_levels"
-            for func in l3_generate._program.functions.values():
-                if func.func_type in (FunctionType.Orchestration, FunctionType.Opaque):
-                    chip_dir = lg_next_levels_dir / func.name
-                    if chip_dir.exists():
-                        cc, lg_runtime_name, _ = compile_and_assemble(
-                            chip_dir, l3_generate.platform,
-                        )
-                        lg_chip_callables[func.name] = cc
-            lg_orch_path = lg_output_dir / "orchestration" / "host_orch.py"
-            lg_orch_module = _load_generated_module(lg_orch_path)
-            # Patch make_tensor_arg so pre-uploaded ContinuousTensor objects
-            # (child_memory=True) are passed through unchanged instead of
-            # triggering a crash when the generated code calls make_tensor_arg
-            # on a non-torch.Tensor value.
-            _patch_orch_make_tensor_arg(lg_orch_module)
-            lg_entry_fn = None
-            for attr_name in ("entry", "host_orch"):
-                lg_entry_fn = getattr(lg_orch_module, attr_name, None)
-                if lg_entry_fn is not None:
-                    break
-            if lg_entry_fn is None:
-                for name in dir(lg_orch_module):
-                    obj = getattr(lg_orch_module, name)
-                    if callable(obj) and not name.startswith("_"):
-                        lg_entry_fn = obj
-                        break
-            lg_sub_worker_fns: dict[str, object] = {}
-            lg_sub_workers_dir = lg_output_dir / "sub_workers"
-            if lg_sub_workers_dir.exists():
-                for py_file in sorted(lg_sub_workers_dir.glob("*.py")):
-                    mod = _load_generated_module(py_file)
-                    fn_name = py_file.stem
-                    fn = getattr(mod, fn_name, None)
-                    if fn is not None:
-                        lg_sub_worker_fns[fn_name] = fn
-            lg_param_infos, _, _ = l3_generate._get_metadata()
-
-            l3_generate_chip_callables = lg_chip_callables
-            l3_generate_entry_fn = lg_entry_fn
-            l3_generate_sub_worker_fns = lg_sub_worker_fns
-            l3_generate_dc = lg_dc
-            l3_generate_platform = l3_generate.platform
-            l3_generate_runtime_name = lg_runtime_name
-            l3_generate_param_infos = lg_param_infos
-            _mark("l3_extract_artifacts")
 
         lm_head_weight = model.lm_head
         if padded_vocab != lm_head_weight.shape[0]:
@@ -529,10 +244,40 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             for name, tensor in self._stack_decode_weights(layers).items()
         }
         _mark("stack_decode_weights")
+        prefill_hidden_buffer = torch.empty(
+            (kernel_batch * model.runtime.max_seq_len, model.config.hidden_size),
+            dtype=torch.bfloat16,
+        ).share_memory_()
+        prefill_seq_lens_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
+        prefill_chunk_lens_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
+        prefill_chunk_offsets_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
+        prefill_block_table_buffer = torch.empty(
+            (kernel_batch * max_blocks_per_seq,),
+            dtype=torch.int32,
+        ).share_memory_()
+        prefill_slot_mapping_buffer = torch.empty(
+            (kernel_batch * model.runtime.max_seq_len,),
+            dtype=torch.int32,
+        ).share_memory_()
+        prefill_logits_buffer = torch.empty(
+            (kernel_batch, padded_vocab),
+            dtype=torch.float32,
+        ).share_memory_()
+        _mark("prefill_buffers")
         decode_logits_buffer = torch.empty(
             (kernel_batch, padded_vocab),
             dtype=torch.float32,
         ).share_memory_()
+        decode_hidden_buffer = torch.empty(
+            (kernel_batch, model.config.hidden_size),
+            dtype=torch.bfloat16,
+        ).share_memory_()
+        decode_seq_lens_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
+        decode_block_table_buffer = torch.empty(
+            (kernel_batch * max_blocks_per_seq,),
+            dtype=torch.int32,
+        ).share_memory_()
+        decode_slot_mapping_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
         _mark("decode_logits_buffer")
 
         timer.report()
@@ -540,64 +285,24 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return _CompiledKernels(
             prefill=prefill,
             decode=decode,
-            final_rms=final_rms,
-            lm_head=lm_head,
             final_norm_weight=final_norm_weight,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
             padded_vocab=padded_vocab,
             padded_lm_head_weight=padded_lm_head_weight,
-            layers=layers,
             decode_weights=decode_weights,
+            prefill_hidden_buffer=prefill_hidden_buffer,
+            prefill_seq_lens_buffer=prefill_seq_lens_buffer,
+            prefill_chunk_lens_buffer=prefill_chunk_lens_buffer,
+            prefill_chunk_offsets_buffer=prefill_chunk_offsets_buffer,
+            prefill_block_table_buffer=prefill_block_table_buffer,
+            prefill_slot_mapping_buffer=prefill_slot_mapping_buffer,
+            prefill_logits_buffer=prefill_logits_buffer,
+            decode_hidden_buffer=decode_hidden_buffer,
+            decode_seq_lens_buffer=decode_seq_lens_buffer,
+            decode_block_table_buffer=decode_block_table_buffer,
+            decode_slot_mapping_buffer=decode_slot_mapping_buffer,
             decode_logits_buffer=decode_logits_buffer,
-            stacked_weights=stacked_weights,
-            l3_generate_chip_callables=l3_generate_chip_callables,
-            l3_generate_entry_fn=l3_generate_entry_fn,
-            l3_generate_sub_worker_fns=l3_generate_sub_worker_fns,
-            l3_generate_dc=l3_generate_dc,
-            l3_generate_platform=l3_generate_platform,
-            l3_generate_runtime_name=l3_generate_runtime_name,
-            l3_generate_param_infos=l3_generate_param_infos,
-        )
-
-    def _compile_l2_callable(self, name: str, program: object) -> _L2Callable:
-        """Compile one non-L3 program and assemble it into a Simpler callable."""
-        from pypto.ir.compiled_program import CompiledProgram  # noqa: PLC0415
-        from pypto.runtime import compile_program  # noqa: PLC0415
-        from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
-
-        config = self._run_config(codegen_only=True)
-        work_dir = self._l2_work_dir(name)
-        compile_program(
-            program,
-            work_dir,
-            strategy=config.strategy,
-            backend_type=config.backend_type,
-            dump_passes=config.dump_passes,
-            diagnostic_phase=config.diagnostic_phase,
-            disabled_diagnostics=config.disabled_diagnostics,
-            profiling=config.compile_profiling,
-        )
-        chip_callable, runtime_name, runtime_config = compile_and_assemble(
-            work_dir,
-            self._platform,
-            pto_isa_commit=config.pto_isa_commit,
-        )
-        runtime_config = runtime_config or {}
-        compiled_view = CompiledProgram(
-            program,
-            str(work_dir),
-            backend_type=config.backend_type,
-            platform=self._platform,
-        )
-        param_infos, _, _ = compiled_view._get_metadata()
-        return _L2Callable(
-            chip_callable=chip_callable,
-            name=name,
-            runtime_name=runtime_name,
-            block_dim=int(runtime_config.get("block_dim", _QWEN14B_BLOCK_DIM)),
-            aicpu_thread_num=int(runtime_config.get("aicpu_thread_num", 4)),
-            param_infos=tuple(param_infos),
         )
 
     def _compile_prefill_fwd_callable(
@@ -615,8 +320,8 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         num_layers: int,
         vocab_size: int,
         page_size: int,
-    ) -> _L2Callable:
-        """Compile the top-level ``@pl.jit`` prefill_fwd into an L2 callable."""
+    ) -> _L3Callable:
+        """Compile the prefill HOST wrapper into a distributed program."""
         kv_hidden = num_kv_heads * head_dim
         total_tokens = batch * max_seq
         runtime_cache_blocks = (max_seq + page_size - 1) // page_size
@@ -664,8 +369,8 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         num_layers: int,
         vocab_size: int,
         page_size: int,
-    ) -> _L2Callable:
-        """Compile the fused all-layer PAGED ``decode_layer.decode_fwd`` into an L2 callable.
+    ) -> _L3Callable:
+        """Compile the fused all-layer PAGED decode HOST wrapper into a distributed program.
 
         Signature (22 args; PAGED KV via block_table + slot_mapping, same pool as
         prefill):
@@ -715,64 +420,45 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         name: str,
         jit_fn: object,
         dummy_args: list[torch.Tensor],
-    ) -> _L2Callable:
-        """Compile a top-level ``@pl.jit`` kernel into an L2 callable."""
-        import pypto.language as pl_mod  # noqa: PLC0415
-        from pypto.jit.cache import make_cache_key  # noqa: PLC0415
-        from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
-        from pypto.runtime.runner import _patch_orchestration_headers  # noqa: PLC0415
+    ) -> _L3Callable:
+        """Compile a HOST wrapper into a PyPTO DistributedCompiledProgram."""
+        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
+        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+        from pypto.runtime import RunConfig  # noqa: PLC0415
 
-        param_names, _arguments, tensor_meta, scalar_values, scalar_dtypes, dynamic_dims = jit_fn._bind_args(
-            tuple(dummy_args), {}
+        config = self._run_config(codegen_only=True)
+        distributed_config = DistributedConfig(
+            device_ids=[self._device_id],
+            num_sub_workers=0,
+            block_dim=_QWEN14B_BLOCK_DIM,
+            aicpu_thread_num=4,
         )
-        key = make_cache_key(
-            source_hash=jit_fn._get_source_hash(),
-            param_names=param_names,
-            tensor_shapes={name: meta.shape for name, meta in tensor_meta.items()},
-            tensor_dtypes={name: meta.dtype for name, meta in tensor_meta.items()},
-            dynamic_dims=dynamic_dims[id(jit_fn._func)],
-            scalar_values=scalar_values,
-            platform=self._platform,
+        run_config = RunConfig(
+            platform=config.platform,
+            device_id=config.device_id,
+            backend_type=config.backend_type,
+            strategy=config.strategy,
+            dump_passes=config.dump_passes,
+            save_kernels=config.save_kernels,
+            save_kernels_dir=config.save_kernels_dir,
+            codegen_only=True,
+            pto_isa_commit=config.pto_isa_commit,
+            diagnostic_phase=config.diagnostic_phase,
+            disabled_diagnostics=config.disabled_diagnostics,
+            compile_profiling=config.compile_profiling,
+            distributed_config=distributed_config,
         )
-        if key not in jit_fn._cache:
-            jit_fn._cache[key] = jit_fn._compile(
-                tensor_meta,
-                scalar_values,
-                scalar_dtypes,
-                dynamic_dims,
-                pl_mod,
-                platform=self._platform,
+        compiled = jit_fn.compile(*dummy_args, config=run_config)
+        if not isinstance(compiled, DistributedCompiledProgram):
+            raise TypeError(
+                f"{name} did not compile to DistributedCompiledProgram; got {type(compiled).__name__}"
             )
-        compiled = jit_fn._cache[key]
-        work_dir = Path(compiled.output_dir)
-        _patch_orchestration_headers(work_dir)
-        chip_callable, runtime_name, runtime_config = compile_and_assemble(
-            work_dir,
-            self._platform,
-            pto_isa_commit=self._run_config(codegen_only=True).pto_isa_commit,
-        )
-        runtime_config = runtime_config or {}
-        param_infos, _, _ = compiled._get_metadata()
-        return _L2Callable(
-            chip_callable=chip_callable,
+        return _L3Callable(
+            compiled=compiled,
             name=name,
-            runtime_name=runtime_name,
-            block_dim=int(runtime_config.get("block_dim", _QWEN14B_BLOCK_DIM)),
-            aicpu_thread_num=int(runtime_config.get("aicpu_thread_num", 4)),
-            param_infos=tuple(param_infos),
+            block_dim=_QWEN14B_BLOCK_DIM,
+            aicpu_thread_num=4,
         )
-
-    def _l2_work_dir(self, name: str) -> Path:
-        """Return a dedicated compile directory for one non-L3 program."""
-        if self._save_kernels_dir is not None:
-            root = Path(self._save_kernels_dir)
-        else:
-            if self._l2_compile_root is None:
-                self._l2_compile_root = Path(tempfile.mkdtemp(prefix="qwen3_14b_l2_"))
-            root = self._l2_compile_root
-        work_dir = root / name
-        work_dir.mkdir(parents=True, exist_ok=True)
-        return work_dir
 
     @staticmethod
     def _load_runtime_config(output_dir: Path) -> dict[str, Any]:

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import torch
 
-from python.runtime.worker import WorkerTensor
+from pypto.runtime import DeviceTensor
 
 from .types import (
     DecodeBatch,
@@ -32,8 +32,8 @@ from .types import (
 class _KvCachePool:
     """Worker-resident flat all-layer KV cache for one model."""
 
-    key_pages: WorkerTensor
-    value_pages: WorkerTensor
+    key_pages: DeviceTensor
+    value_pages: DeviceTensor
 
 
 class ModelRunner(ABC):
@@ -77,12 +77,12 @@ class ModelRunner(ABC):
         self._kv_caches.clear()
 
     @abstractmethod
-    def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> WorkerTensor:
+    def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> DeviceTensor:
         """Allocate one worker-resident KV cache tensor."""
         raise NotImplementedError
 
     @abstractmethod
-    def _free_kv_cache_tensor(self, tensor: WorkerTensor) -> None:
+    def _free_kv_cache_tensor(self, tensor: DeviceTensor) -> None:
         """Free one worker-resident KV cache tensor."""
         raise NotImplementedError
 

@@ -10,20 +10,12 @@
 from __future__ import annotations
 
 import argparse
-import os
 import statistics
 import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
-
-# R4 mitigation: PTO2_RING_HEAP nominal value is multiplied ×4 by the
-# runtime, so 2 GiB nominal → 8 GiB actual GM heap. This leaves HBM
-# headroom for the all-layers stacked weights (~2.14 GiB) + KV cache
-# (~4 GiB) + shared mem (~23 GiB) on a 62 GiB device. Override via env
-# in the launching shell if you need a different value.
-os.environ.setdefault("PTO2_RING_HEAP", str(2 * 1024 ** 3))
 
 
 def _bootstrap_package_root() -> None:
@@ -147,34 +139,29 @@ def _install_num_layers_override(engine: LLMEngine, n: int) -> None:
 
 
 def InstallProfiling(engine: LLMEngine, model_id: str, collector: _TimingCollector) -> None:
-    """Wrap executor.run_prefill / run_decode and the four compiled kernels so
+    """Wrap executor.run_prefill / run_decode and compiled kernels so
     timings flow into `collector`. Must run AFTER engine.init_model().
     """
     executor = engine._executor  # type: ignore[attr-defined]
     compiled = executor._compiled[model_id]  # type: ignore[attr-defined]
 
-    # Non-L3 kernels are either directly callable compiled programs (older
-    # path) or _L2Callable descriptors dispatched by Qwen314BModelRunner.
-    if hasattr(compiled.prefill, "chip_callable"):
+    # Kernels are dispatched by Qwen314BModelRunner.
+    if hasattr(compiled.prefill, "chip_callable") or hasattr(compiled.prefill, "compiled"):
         runner = executor._runners[model_id]  # type: ignore[attr-defined]
-        orig_run_l2 = runner._run_l2_program  # type: ignore[attr-defined]
-        l2_names = {
+        orig_run_program = runner._run_distributed_program  # type: ignore[attr-defined]
+        kernel_names = {
             id(compiled.prefill): ("kernel.prefill_fwd", False),
             id(compiled.decode): ("kernel.decode_layer", True),
         }
-        if compiled.final_rms is not None:
-            l2_names[id(compiled.final_rms)] = ("kernel.final_rms", False)
-        if compiled.lm_head is not None:
-            l2_names[id(compiled.lm_head)] = ("kernel.lm_head", False)
 
-        def timed_run_l2(callable_spec, *args, **kwargs):
-            kernel_info = l2_names.get(id(callable_spec))
+        def timed_run_program(callable_spec, *args, **kwargs):
+            kernel_info = kernel_names.get(id(callable_spec))
             if kernel_info is None:
-                return orig_run_l2(callable_spec, *args, **kwargs)
+                return orig_run_program(callable_spec, *args, **kwargs)
             name, group_by_decode_step = kernel_info
             t0 = time.perf_counter()
             try:
-                timing = orig_run_l2(callable_spec, *args, **kwargs)
+                timing = orig_run_program(callable_spec, *args, **kwargs)
             finally:
                 dt = time.perf_counter() - t0
                 collector.kernel_times[name].append(dt)
@@ -186,33 +173,14 @@ def InstallProfiling(engine: LLMEngine, model_id: str, collector: _TimingCollect
             collector.RecordRunTiming(name, timing)
             return timing
 
-        runner._run_l2_program = timed_run_l2  # type: ignore[attr-defined]
+        runner._run_distributed_program = timed_run_program  # type: ignore[attr-defined]
     else:
         # Per-layer kernel wrappers. compiled.prefill / compiled.decode are invoked
-        # once per transformer layer inside run_prefill / run_decode respectively
-        # (baseline non-L3 path only).
+        # once per transformer layer inside run_prefill / run_decode respectively.
         compiled.prefill = collector.WrapKernel(compiled.prefill, "kernel.prefill_fwd")
         compiled.decode = collector.WrapKernel(
             compiled.decode, "kernel.decode_layer", group_by_decode_step=True
         )
-        if compiled.final_rms is not None:
-            compiled.final_rms = collector.WrapKernel(compiled.final_rms, "kernel.final_rms")
-        if compiled.lm_head is not None:
-            compiled.lm_head = collector.WrapKernel(compiled.lm_head, "kernel.lm_head")
-
-    # L3 generate wrapper. run_generate_l3 is invoked once per generate call
-    # (replaces run_prefill + run_decode in L3 mode).
-    if callable(getattr(executor, "run_generate_l3", None)):
-        orig_l3_generate = executor.run_generate_l3
-
-        def timed_l3_generate(*args, **kwargs):
-            t0 = time.perf_counter()
-            try:
-                return orig_l3_generate(*args, **kwargs)
-            finally:
-                collector.kernel_times["kernel.l3_generate"].append(time.perf_counter() - t0)
-
-        executor.run_generate_l3 = timed_l3_generate
 
     # Top-level executor API wrappers.
     orig_prefill = executor.run_prefill
@@ -277,9 +245,6 @@ def PrintTimingReport(collector: _TimingCollector, num_tokens: int, verbose: boo
     for kname in (
         "kernel.prefill_fwd",
         "kernel.decode_layer",
-        "kernel.l3_generate",
-        "kernel.final_rms",
-        "kernel.lm_head",
     ):
         print(f"  {kname:24s}: {SummarizeTimes(collector.kernel_times.get(kname, []))}")
         host_times = collector.kernel_host_wall_times.get(kname, [])
@@ -389,21 +354,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stream", action="store_true", default=False)
     parser.add_argument("--save-kernels-dir", default=None)
     parser.add_argument(
-        "--l3",
-        action="store_true",
-        dest="l3_mode",
-        help="Enable L3 mode: prefill and decode are dispatched as a single "
-             "all-layers L2 program inside a shared Worker(level=3) per "
-             "generate call.",
-    )
-    parser.add_argument(
         "--num-layers-override",
         type=int,
         default=None,
         help="Validation knob: truncate the loaded model to N transformer "
              "layers before compile/dispatch. Used to reduce HBM footprint "
-             "while validating the L3 stacked-decode path on Qwen3-14B "
-             "(40 layers won't fit alongside 23 GiB of PTO2 shared memory).",
+             "while validating Qwen3-14B kernels on memory-constrained devices.",
     )
     parser.add_argument(
         "--profile",
@@ -435,7 +391,6 @@ def main() -> None:
         platform=args.platform,
         device_id=args.device_id,
         save_kernels_dir=args.save_kernels_dir,
-        l3_mode=args.l3_mode,
         l3_trace=args.profile_verbose,
     )
     engine = LLMEngine(
@@ -489,7 +444,6 @@ def main() -> None:
                 "model_id": args.model_id,
                 "max_new_tokens": args.max_new_tokens,
                 "stream": args.stream,
-                "l3": args.l3_mode,
             },
         ):
             if args.stream:
@@ -514,7 +468,10 @@ def main() -> None:
             collector.phases["generate_total"] = gen_elapsed
             PrintTimingReport(collector, num_tokens=num_tokens, verbose=args.profile_verbose)
     finally:
-        merge_profile()
+        try:
+            executor.close()
+        finally:
+            merge_profile()
 
 
 if __name__ == "__main__":
