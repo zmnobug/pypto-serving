@@ -302,7 +302,12 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
         qwen3_l3_generate = _load_pypto_lib_qwen14b_module("l3_generate")
         qwen3_prefill_fwd = _load_pypto_lib_qwen14b_module("prefill_fwd")
-        qwen3_decode_fwd = _load_pypto_lib_qwen14b_module("decode_fwd")
+        # The fused all-layer decode lives in decode_layer.decode_fwd (the
+        # standalone decode_fwd.py module was removed in pypto-lib). It is now
+        # PAGED: it consumes block_table + slot_mapping and reads/writes the SAME
+        # device-resident paged KV pool prefill writes (self._kv_caches), so no
+        # contiguous bridge / MAX_SEQ env is needed.
+        qwen3_decode_layer = _load_pypto_lib_qwen14b_module("decode_layer")
 
         build_qwen3_14b_l3_generate_program = qwen3_l3_generate.build_qwen3_14b_l3_generate_program
         stack_layer_weights_full = qwen3_l3_generate.stack_layer_weights_full
@@ -310,9 +315,31 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
         self._validate_supported_shape(model)
         kernel_batch = model.runtime.max_batch_size
+        if int(qwen3_decode_layer.BATCH) != kernel_batch:
+            raise ValueError(
+                "decode_layer.decode_fwd is compiled for a fixed kernel BATCH of "
+                f"{int(qwen3_decode_layer.BATCH)}, but runtime max_batch_size is "
+                f"{kernel_batch}; they must match (decode statically computes and "
+                "writes BATCH rows / BATCH logit rows)."
+            )
+        if int(model.config.num_hidden_layers) != int(qwen3_decode_layer.NUM_LAYERS):
+            raise ValueError(
+                "decode_layer.decode_fwd fuses a FIXED "
+                f"NUM_LAYERS={int(qwen3_decode_layer.NUM_LAYERS)} loop (the layer count "
+                "is a kernel constant, not derived from the weight tensors), but the "
+                f"model has {model.config.num_hidden_layers} layers. The fused decode "
+                "does not support --num-layers-override; run the full model."
+            )
         self._validate_total_kv_pages(model, kernel_batch)
 
         padded_vocab = round_up(model.config.vocab_size, _VOCAB_PAD_MULTIPLE)
+        if padded_vocab != int(qwen3_decode_layer.VOCAB):
+            raise ValueError(
+                f"decode_layer.decode_fwd hard-codes VOCAB={int(qwen3_decode_layer.VOCAB)} "
+                f"(config.VOCAB) for its fused LM head, but the runtime padded vocab is "
+                f"{padded_vocab} (round_up({model.config.vocab_size}, {_VOCAB_PAD_MULTIPLE})); "
+                "they must match for the decode logits buffer / lm_head weight to line up."
+            )
         page_size = model.runtime.page_size
         max_blocks_per_seq = (model.runtime.max_seq_len + page_size - 1) // page_size
         prefill = self._compile_prefill_fwd_callable(
@@ -331,7 +358,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         )
         _mark("compile_prefill")
         decode = self._compile_decode_fwd_callable(
-            qwen3_decode_fwd.decode_fwd,
+            qwen3_decode_layer.decode_fwd,
             batch=kernel_batch,
             max_seq=model.runtime.max_seq_len,
             block_table_stride=max_blocks_per_seq,
@@ -638,33 +665,48 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         vocab_size: int,
         page_size: int,
     ) -> _L2Callable:
-        """Compile the top-level ``@pl.jit`` decode_fwd into an L2 callable."""
+        """Compile the fused all-layer PAGED ``decode_layer.decode_fwd`` into an L2 callable.
+
+        Signature (22 args; PAGED KV via block_table + slot_mapping, same pool as
+        prefill):
+          hidden_states, input_rms_weight, wq, wk, wv, q_norm_weight,
+          k_norm_weight, seq_lens, block_table, slot_mapping, rope_cos, rope_sin,
+          k_cache, v_cache, wo, w_gate, w_up, w_down, post_rms_weight,
+          final_norm_weight, lm_head_weight, out.
+
+        k_cache/v_cache are the PAGED pool (rows = num_layers * batch *
+        runtime_cache_blocks * num_kv_heads * page_size — identical to prefill);
+        the kernel derives the per-layer stride + max_blocks_per_seq from the
+        tensor dims. Projection weights are stacked ``[num_layers*HIDDEN, ...]``
+        and norm gammas ``[num_layers, dim]`` — exactly what
+        ``_stack_decode_weights`` produces.
+        """
         kv_hidden = num_kv_heads * head_dim
         runtime_cache_blocks = (max_seq + page_size - 1) // page_size
-        cache_rows = batch * runtime_cache_blocks * num_layers * num_kv_heads * page_size
+        cache_rows = num_layers * batch * runtime_cache_blocks * num_kv_heads * page_size
         dummy_args = [
-            torch.empty((batch, hidden_size), dtype=torch.bfloat16),
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),
-            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),
-            torch.empty((num_layers, head_dim), dtype=torch.float32),
-            torch.empty((num_layers, head_dim), dtype=torch.float32),
-            torch.empty((batch,), dtype=torch.int32),
-            torch.empty((batch * block_table_stride,), dtype=torch.int32),
-            torch.empty((batch,), dtype=torch.int32),
-            torch.empty((max_seq, head_dim), dtype=torch.float32),
-            torch.empty((max_seq, head_dim), dtype=torch.float32),
-            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
-            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),
-            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
-            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
-            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((1, hidden_size), dtype=torch.float32),
-            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((batch, vocab_size), dtype=torch.float32),
+            torch.empty((batch, hidden_size), dtype=torch.bfloat16),                          # hidden_states
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),                      # input_rms_weight
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),        # wq
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),          # wk
+            torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),          # wv
+            torch.empty((num_layers, head_dim), dtype=torch.float32),                          # q_norm_weight
+            torch.empty((num_layers, head_dim), dtype=torch.float32),                          # k_norm_weight
+            torch.empty((batch,), dtype=torch.int32),                                          # seq_lens
+            torch.empty((batch * block_table_stride,), dtype=torch.int32),                     # block_table
+            torch.empty((batch,), dtype=torch.int32),                                          # slot_mapping
+            torch.empty((max_seq, head_dim), dtype=torch.float32),                             # rope_cos
+            torch.empty((max_seq, head_dim), dtype=torch.float32),                             # rope_sin
+            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),                         # k_cache (paged pool)
+            torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),                         # v_cache (paged pool)
+            torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),        # wo
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_gate
+            torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),  # w_up
+            torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),  # w_down
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),                       # post_rms_weight
+            torch.empty((1, hidden_size), dtype=torch.float32),                                # final_norm_weight
+            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),                      # lm_head_weight
+            torch.empty((batch, vocab_size), dtype=torch.float32),                             # out
         ]
         return self._compile_jit_fwd_callable("decode_fwd", jit_fn, dummy_args)
 
