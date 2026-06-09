@@ -285,55 +285,96 @@ class Qwen314BModelRunner(ModelRunner):
         )
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
-        """Run the JIT all-layer decode kernel and return next-token logits."""
-        compiled = self._compiled
-        decode_inputs = self._prepare_decode_inputs(model, batch)
-        hidden = decode_inputs.hidden
-        dw = compiled.decode_weights
+        """Run the fused all-layer PAGED ``decode_layer.decode_fwd`` and return logits.
 
-        kv_cache = self._kv_caches.get(model.config.model_id)
+        ``decode_fwd`` runs all NUM_LAYERS + the LM head in one dispatch over the
+        PAGED KV pool, addressing KV via ``block_table`` + ``slot_mapping`` — the
+        SAME device-resident KV pool prefill writes (``self._kv_caches``), so prompt
+        KV is already in place with no bridge. KV is keyed by block_table page id, not by
+        kernel row, so a request may occupy any row each step (no stable-slot shim).
+
+        The kernel is FIXED-BATCH (it computes all max_batch_size rows and writes
+        each row's current-token KV). Pad the active batch up to the kernel batch by
+        REPLICATING active row 0's inputs into the padding rows: those rows then
+        recompute row 0's K/V and write row 0's own slot with byte-identical values
+        (an idempotent, safe write), and their logits are trimmed off below. This
+        avoids padded rows clobbering an unrelated request's physical page.
+        """
+        compiled = self._compiled
+        model_id = model.config.model_id
+        decode_inputs = self._prepare_decode_inputs(model, batch)
+        actual_batch = decode_inputs.actual_batch
+        dw = compiled.decode_weights
+        rt = compiled.decode.runtime_name
+        kernel_batch = model.runtime.max_batch_size
+        max_blocks = self._max_blocks_per_seq(model)
+
+        kv_cache = self._kv_caches.get(model_id)
         if kv_cache is None:
-            raise RuntimeError(f"KV cache for model {model.config.model_id!r} is not initialized")
+            raise RuntimeError(f"KV cache for model {model_id!r} is not initialized")
         k_cache = kv_cache.key_pages
         v_cache = kv_cache.value_pages
-        self._validate_kv_cache_bounds(model, decode_inputs.block_table, decode_inputs.slot_mapping, k_cache)
 
-        if decode_inputs.actual_batch > compiled.decode_logits_buffer.shape[0]:
+        if kernel_batch > compiled.decode_logits_buffer.shape[0]:
             raise ValueError(
-                f"decode batch {decode_inputs.actual_batch} exceeds logits buffer batch "
+                f"kernel batch {kernel_batch} exceeds logits buffer batch "
                 f"{compiled.decode_logits_buffer.shape[0]}"
             )
-        logits_padded = compiled.decode_logits_buffer[: decode_inputs.actual_batch]
+
+        # Pad active inputs up to the fixed kernel batch by replicating row 0.
+        def _pad_rows(active: torch.Tensor, rows_each: int) -> torch.Tensor:
+            view = active.reshape(actual_batch, rows_each)
+            padded = view[0:1].expand(kernel_batch - actual_batch, rows_each)
+            return torch.cat([view, padded], dim=0).reshape(-1).contiguous()
+
+        hidden = torch.zeros((kernel_batch, model.config.hidden_size), dtype=torch.bfloat16)
+        hidden[:actual_batch] = decode_inputs.hidden
+        hidden[actual_batch:] = decode_inputs.hidden[0:1]
+        hidden = hidden.share_memory_()
+        seq_lens = _pad_rows(decode_inputs.seq_lens, 1).to(torch.int32).share_memory_()
+        block_table = _pad_rows(decode_inputs.block_table, max_blocks).to(torch.int32).share_memory_()
+        slot_mapping = _pad_rows(decode_inputs.slot_mapping, 1).to(torch.int32).share_memory_()
+
+        # Padded block_table / slot_mapping only ever reference row 0's
+        # already-valid pages, so bound-check exactly what the kernel will read.
+        self._validate_kv_cache_bounds(model, block_table, slot_mapping, k_cache)
+
+        logits_padded = compiled.decode_logits_buffer  # full [kernel_batch, vocab]; trimmed below
+        # Argument order MUST match decode_layer.decode_fwd (PAGED):
+        #   hidden_states, input_rms_weight, wq, wk, wv, q_norm_weight,
+        #   k_norm_weight, seq_lens, block_table, slot_mapping, rope_cos, rope_sin,
+        #   k_cache, v_cache, wo, w_gate, w_up, w_down, post_rms_weight,
+        #   final_norm_weight, lm_head_weight, out.
         self._run_l2_program(
             compiled.decode,
             hidden,
-            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_input_rms_weight"]),
-            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_wq"]),
-            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_wk"]),
-            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_wv"]),
-            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_q_norm_weight"]),
-            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_k_norm_weight"]),
-            decode_inputs.seq_lens,
-            decode_inputs.block_table,
-            decode_inputs.slot_mapping,
-            self._l2_child_tensor(compiled.decode.runtime_name, compiled.rope_cos),
-            self._l2_child_tensor(compiled.decode.runtime_name, compiled.rope_sin),
+            self._l2_child_tensor(rt, dw["decode_input_rms_weight"]),
+            self._l2_child_tensor(rt, dw["decode_wq"]),
+            self._l2_child_tensor(rt, dw["decode_wk"]),
+            self._l2_child_tensor(rt, dw["decode_wv"]),
+            self._l2_child_tensor(rt, dw["decode_q_norm_weight"]),
+            self._l2_child_tensor(rt, dw["decode_k_norm_weight"]),
+            seq_lens,
+            block_table,
+            slot_mapping,
+            self._l2_child_tensor(rt, compiled.rope_cos),
+            self._l2_child_tensor(rt, compiled.rope_sin),
             k_cache,
             v_cache,
-            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_wo"]),
-            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_post_rms_weight"]),
-            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_w_gate"]),
-            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_w_up"]),
-            self._l2_child_tensor(compiled.decode.runtime_name, dw["decode_w_down"]),
-            self._l2_child_tensor(compiled.decode.runtime_name, compiled.final_norm_weight),
-            self._l2_child_tensor(compiled.decode.runtime_name, compiled.padded_lm_head_weight),
+            self._l2_child_tensor(rt, dw["decode_wo"]),
+            self._l2_child_tensor(rt, dw["decode_w_gate"]),
+            self._l2_child_tensor(rt, dw["decode_w_up"]),
+            self._l2_child_tensor(rt, dw["decode_w_down"]),
+            self._l2_child_tensor(rt, dw["decode_post_rms_weight"]),
+            self._l2_child_tensor(rt, compiled.final_norm_weight),
+            self._l2_child_tensor(rt, compiled.padded_lm_head_weight),
             logits_padded,
         )
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
         return DecodeResult(
-            hidden_states=hidden.float(),
-            logits=logits_padded[:, : model.config.vocab_size].to(hidden.device),
+            hidden_states=decode_inputs.hidden.float(),
+            logits=logits_padded[:actual_batch, : model.config.vocab_size].to(decode_inputs.hidden.device),
         )
 
     def _project_logits(self, model: RuntimeModel, hidden: torch.Tensor) -> torch.Tensor:

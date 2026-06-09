@@ -321,6 +321,59 @@ def PrintTimingReport(collector: _TimingCollector, num_tokens: int, verbose: boo
             )
 
 
+def InstallThroughputMeter(engine: LLMEngine) -> dict:
+    """Wrap executor.run_prefill / run_decode with always-on wall-clock meters.
+
+    Unlike InstallProfiling this touches only the two public dispatch methods
+    (no profiling internals), so it is safe to install unconditionally and feeds
+    the token/s summary printed for every run.
+    """
+    executor = engine._executor  # type: ignore[attr-defined]
+    meters = {"prefill_s": 0.0, "decode_s": 0.0, "decode_steps": 0}
+    orig_prefill = executor.run_prefill
+    orig_decode = executor.run_decode
+
+    def metered_prefill(*args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return orig_prefill(*args, **kwargs)
+        finally:
+            meters["prefill_s"] += time.perf_counter() - t0
+
+    def metered_decode(*args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return orig_decode(*args, **kwargs)
+        finally:
+            meters["decode_s"] += time.perf_counter() - t0
+            meters["decode_steps"] += 1
+
+    executor.run_prefill = metered_prefill
+    executor.run_decode = metered_decode
+    return meters
+
+
+def PrintThroughput(num_tokens: int, gen_elapsed: float, meters: dict) -> None:
+    """Print a concise token/s summary (always shown; no --profile needed)."""
+    print("\n=== throughput ===")
+    if num_tokens > 0 and gen_elapsed > 0:
+        print(
+            f"[perf] generated {num_tokens} tokens in {gen_elapsed:.3f}s "
+            f"-> {num_tokens / gen_elapsed:.2f} tok/s (overall, incl. prefill)"
+        )
+    else:
+        print(f"[perf] generated {num_tokens} tokens in {gen_elapsed:.3f}s")
+    steps = int(meters.get("decode_steps", 0))
+    decode_s = float(meters.get("decode_s", 0.0))
+    prefill_s = float(meters.get("prefill_s", 0.0))
+    if steps > 0 and decode_s > 0:
+        print(
+            f"[perf] prefill/TTFT {prefill_s:.3f}s | decode {decode_s:.3f}s over "
+            f"{steps} steps -> {steps / decode_s:.2f} tok/s "
+            f"({decode_s / steps * 1000:.1f} ms/token)"
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run local Qwen3-14B generation with the bundled PyPTO kernels.")
     parser.add_argument("--model-dir", required=True, help="Local model directory, e.g. a Hugging Face snapshot.")
@@ -423,6 +476,10 @@ def main() -> None:
             stream=args.stream,
         )
 
+        # Always-on token/s meter (installed after init_model; independent of
+        # --profile so every run prints a throughput summary).
+        meters = InstallThroughputMeter(engine)
+
         num_tokens = 0
         gen_t0 = time.perf_counter()
         with profile_span(
@@ -450,8 +507,11 @@ def main() -> None:
                 print(f"token_ids: {result.token_ids}")
                 print(f"finish_reason: {result.finish_reason}")
 
+        gen_elapsed = time.perf_counter() - gen_t0
+        PrintThroughput(num_tokens, gen_elapsed, meters)
+
         if collector is not None:
-            collector.phases["generate_total"] = time.perf_counter() - gen_t0
+            collector.phases["generate_total"] = gen_elapsed
             PrintTimingReport(collector, num_tokens=num_tokens, verbose=args.profile_verbose)
     finally:
         merge_profile()
