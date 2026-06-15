@@ -47,12 +47,11 @@ python -m python.cli --help
 
 ## NPU Generation
 
-One-shot generation, non-L3 path:
+One-shot generation:
 
 ```bash
 task-submit --device auto --max-time 0 --run \
-  "PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=1048576 PTO2_RING_DEP_POOL=1048576 \
-  python examples/model/qwen3_14b/npu_generate.py \
+  "python examples/model/qwen3_14b/npu_generate.py \
     --model-dir /path/to/Qwen3-14B \
     --prompt 'Huawei is' \
     --platform a2a3 \
@@ -60,13 +59,15 @@ task-submit --device auto --max-time 0 --run \
     --max-new-tokens 5"
 ```
 
+Offline generation does not require the larger PTO2 ring settings used for
+concurrent HTTP serving.
+
 Add `--profile` to print timing and write a Chrome trace when `SA_PROFILE_OUTPUT`
 or `SA_PROFILE_LEVEL` is set:
 
 ```bash
 task-submit --device auto --max-time 0 --run \
-  "PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=1048576 PTO2_RING_DEP_POOL=1048576 \
-  SA_PROFILE_OUTPUT=/tmp/pypto-serving-profile-offline SA_PROFILE_LEVEL=verbose \
+  "SA_PROFILE_OUTPUT=/tmp/pypto-serving-profile-offline SA_PROFILE_LEVEL=verbose \
   python examples/model/qwen3_14b/npu_generate.py \
     --model-dir /path/to/Qwen3-14B \
     --prompt 'Huawei is' \
@@ -84,8 +85,7 @@ server command:
 
 ```bash
 task-submit --device auto --run \
-  "PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=262144 PTO2_RING_DEP_POOL=262144 \
-  python -m python.cli.main \
+  "python -m python.cli.main \
     --model /path/to/Qwen3-14B \
     --backend npu \
     --platform a2a3 \
@@ -120,6 +120,24 @@ Run the serving benchmark:
 ```bash
 python tests/bench_serving.py --port 8899 --stream -n 8 -c 4 --max-tokens 16
 ```
+
+Single-request HTTP serving does not require the larger PTO2 ring settings. For
+concurrent NPU serving, start the server with the larger PTO2 ring settings:
+
+```bash
+task-submit --device auto --run \
+  "PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=1048576 PTO2_RING_DEP_POOL=1048576 \
+  python -m python.cli.main \
+    --model /path/to/Qwen3-14B \
+    --backend npu \
+    --platform a2a3 \
+    --device {} \
+    --port 8899"
+```
+
+Without these settings, multi-request serving may return HTTP 200 while
+generating no tokens and logging worker runtime failures such as `rtMalloc
+failed: 207001`, `507018`, or `507046`.
 
 ## Notes
 

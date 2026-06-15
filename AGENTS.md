@@ -64,4 +64,4 @@ task-submit --device auto --max-time 0 --run \
     --max-new-tokens 5"
 ```
 
-Use `--l3` for the L3 generation path and `--profile` for timing reports.
+Use `--profile` for timing reports.

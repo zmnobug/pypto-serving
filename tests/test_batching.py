@@ -29,9 +29,9 @@ from examples.model.qwen3_14b.runner.cpu_executor import CpuModelExecutor
 from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
 from examples.model.qwen3_14b.runner.npu_runner import Qwen314BModelRunner as ModelRunner
 from examples.model.qwen3_14b.runner.npu_runner import _CompiledKernels
-from examples.model.qwen3_14b.runner.npu_runner import _L2Callable
+from examples.model.qwen3_14b.runner.npu_runner import _L3Callable
 from examples.model.qwen3_14b.runner.npu_runner import _add_run_timing_args
-from examples.model.qwen3_14b.runner.npu_runner import _l2_trace_name
+from examples.model.qwen3_14b.runner.npu_runner import _kernel_trace_name
 from examples.model.qwen3_14b.runner.npu_runner import _run_timing_us
 from python.runtime.worker import WorkerTensor
 
@@ -84,6 +84,64 @@ def _model(
     )
 
 
+def _compiled_kernels(
+    model: RuntimeModel,
+    *,
+    callable_: _L3Callable | None = None,
+    decode_weights: dict[str, torch.Tensor] | None = None,
+) -> _CompiledKernels:
+    kernel_batch = model.runtime.max_batch_size
+    max_seq = model.runtime.max_seq_len
+    hidden_size = model.config.hidden_size
+    intermediate_size = model.config.intermediate_size
+    head_dim = model.config.head_dim
+    kv_hidden = model.config.num_key_value_heads * head_dim
+    max_blocks = (max_seq + model.runtime.page_size - 1) // model.runtime.page_size
+    if callable_ is None:
+        callable_ = _L3Callable(
+            compiled=object(),
+            name="fake",
+            block_dim=1,
+            aicpu_thread_num=1,
+        )
+    if decode_weights is None:
+        decode_weights = {
+            "decode_input_rms_weight": torch.ones(1, hidden_size),
+            "decode_wq": torch.zeros(hidden_size, hidden_size),
+            "decode_wk": torch.zeros(hidden_size, kv_hidden),
+            "decode_wv": torch.zeros(hidden_size, kv_hidden),
+            "decode_q_norm_weight": torch.ones(1, head_dim),
+            "decode_k_norm_weight": torch.ones(1, head_dim),
+            "decode_wo": torch.zeros(hidden_size, hidden_size),
+            "decode_post_rms_weight": torch.ones(1, hidden_size),
+            "decode_w_gate": torch.zeros(hidden_size, intermediate_size),
+            "decode_w_up": torch.zeros(hidden_size, intermediate_size),
+            "decode_w_down": torch.zeros(intermediate_size, hidden_size),
+        }
+    return _CompiledKernels(
+        prefill=callable_,
+        decode=callable_,
+        final_norm_weight=torch.ones(1, hidden_size),
+        rope_cos=torch.zeros(max_seq, head_dim),
+        rope_sin=torch.zeros(max_seq, head_dim),
+        padded_vocab=model.config.vocab_size,
+        padded_lm_head_weight=torch.zeros(model.config.vocab_size, hidden_size),
+        decode_weights=decode_weights,
+        prefill_hidden_buffer=torch.empty(kernel_batch * max_seq, hidden_size, dtype=torch.bfloat16),
+        prefill_seq_lens_buffer=torch.empty(kernel_batch, dtype=torch.int32),
+        prefill_chunk_lens_buffer=torch.empty(kernel_batch, dtype=torch.int32),
+        prefill_chunk_offsets_buffer=torch.empty(kernel_batch, dtype=torch.int32),
+        prefill_block_table_buffer=torch.empty(kernel_batch * max_blocks, dtype=torch.int32),
+        prefill_slot_mapping_buffer=torch.empty(kernel_batch * max_seq, dtype=torch.int32),
+        prefill_logits_buffer=torch.empty(kernel_batch, model.config.vocab_size),
+        decode_hidden_buffer=torch.zeros(kernel_batch, hidden_size, dtype=torch.bfloat16),
+        decode_seq_lens_buffer=torch.zeros(kernel_batch, dtype=torch.int32),
+        decode_block_table_buffer=torch.zeros(kernel_batch * max_blocks, dtype=torch.int32),
+        decode_slot_mapping_buffer=torch.zeros(kernel_batch, dtype=torch.int32),
+        decode_logits_buffer=torch.zeros(kernel_batch, model.config.vocab_size),
+    )
+
+
 def test_kv_cache_capacity_uses_actual_runtime_batch_size():
     model = _model(max_batch_size=1, max_seq_len=128, page_size=64)
     manager = KvCacheManager()
@@ -93,17 +151,12 @@ def test_kv_cache_capacity_uses_actual_runtime_batch_size():
     assert k_cache.shape[0] == 1 * 2 * model.config.num_key_value_heads * model.runtime.page_size
 
 
-def test_prefill_inputs_use_actual_user_batch_without_padding_lanes():
+def test_prefill_inputs_pack_actual_tokens_into_fixed_kernel_buffers():
     model = _model(max_batch_size=15)
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
     runner = ModelRunner(
-        model_id=model.config.model_id,
-        compiled=None,  # type: ignore[arg-type]
-        platform="a2a3sim",
-        device_id=0,
-        save_kernels_dir=None,
-        l3_trace=False,
+        compiled=_compiled_kernels(model),
     )
     allocations = [
         manager.allocate_for_prompt(model.config.model_id, f"req-{idx}", idx + 1)
@@ -136,11 +189,16 @@ def test_prefill_inputs_use_actual_user_batch_without_padding_lanes():
 
     assert prepared.actual_batch == 2
     assert prepared.hidden.shape == (3, model.config.hidden_size)
-    assert prepared.seq_lens.tolist() == [1, 2]
-    assert prepared.chunk_lens.tolist() == [1, 2]
-    assert prepared.chunk_offsets.tolist() == [0, 1]
-    assert prepared.block_table.shape == (2 * 2,)
+    assert prepared.seq_lens.shape == (model.runtime.max_batch_size,)
+    assert prepared.seq_lens[:2].tolist() == [1, 2]
+    assert prepared.seq_lens[2:].tolist() == [0] * (model.runtime.max_batch_size - 2)
+    assert prepared.chunk_lens[:2].tolist() == [1, 2]
+    assert prepared.chunk_lens[2:].tolist() == [0] * (model.runtime.max_batch_size - 2)
+    assert prepared.chunk_offsets[:2].tolist() == [0, 1]
+    assert prepared.chunk_offsets[2:].tolist() == [0] * (model.runtime.max_batch_size - 2)
+    assert prepared.block_table.shape == (model.runtime.max_batch_size * 2,)
     assert prepared.block_table[0].item() == allocations[0].page_ids[0]
+    assert prepared.block_table[4:].tolist() == [-1] * (prepared.block_table.numel() - 4)
     assert prepared.slot_mapping.shape == (3,)
     assert prepared.slot_mapping[2].item() == manager.slot_mapping_for_request(allocations[1], 1)
 
@@ -150,12 +208,7 @@ def test_prefill_inputs_pack_resumed_chunk_positions():
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
     runner = ModelRunner(
-        model_id=model.config.model_id,
-        compiled=None,  # type: ignore[arg-type]
-        platform="a2a3sim",
-        device_id=0,
-        save_kernels_dir=None,
-        l3_trace=False,
+        compiled=_compiled_kernels(model),
     )
     alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 4)
 
@@ -186,12 +239,7 @@ def test_prefill_inputs_reject_non_contiguous_chunk_positions():
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
     runner = ModelRunner(
-        model_id=model.config.model_id,
         compiled=None,  # type: ignore[arg-type]
-        platform="a2a3sim",
-        device_id=0,
-        save_kernels_dir=None,
-        l3_trace=False,
     )
     alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 4)
 
@@ -219,12 +267,7 @@ def test_decode_inputs_use_actual_user_batch_without_padding_lanes():
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
     runner = ModelRunner(
-        model_id=model.config.model_id,
         compiled=None,  # type: ignore[arg-type]
-        platform="a2a3sim",
-        device_id=0,
-        save_kernels_dir=None,
-        l3_trace=False,
     )
     alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 1)
     hidden_states = torch.ones(1, model.config.hidden_size)
@@ -280,41 +323,29 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
     executor = PyptoExecutor(manager)
     cached_layer = executor._kernel_layer_weights(model.layers[0])
     fake_kernel = _CopyKernel()
-    fake_callable = _L2Callable(
-        chip_callable=fake_kernel,
+    fake_callable = _L3Callable(
+        compiled=fake_kernel,
         name="fake",
-        runtime_name="fake-runtime",
         block_dim=1,
         aicpu_thread_num=1,
-        param_infos=(),
     )
-    compiled = _CompiledKernels(
-        prefill=fake_callable,
-        decode=fake_callable,
-        final_rms=None,
-        lm_head=None,
-        final_norm_weight=torch.ones(1, model.config.hidden_size),
-        rope_cos=torch.zeros(model.runtime.max_seq_len, model.config.head_dim),
-        rope_sin=torch.zeros(model.runtime.max_seq_len, model.config.head_dim),
-        padded_vocab=model.config.vocab_size,
-        padded_lm_head_weight=torch.zeros(model.config.vocab_size, model.config.hidden_size),
-        layers=[cached_layer],
+    compiled = _compiled_kernels(
+        model,
+        callable_=fake_callable,
         decode_weights=executor._stack_decode_weights([cached_layer]),
-        decode_logits_buffer=torch.zeros(1, model.config.vocab_size),
     )
     executor._compiled[model.config.model_id] = compiled
     runner = ModelRunner(
-        model_id=model.config.model_id,
         compiled=compiled,
-        platform=executor._platform,
-        device_id=executor._device_id,
-        save_kernels_dir=executor._save_kernels_dir,
-        l3_trace=executor._l3_trace,
     )
-    monkeypatch.setattr(runner, "_worker_for_runtime", lambda _runtime_name: _FakeWorker())
+    monkeypatch.setattr(runner, "_shared_l3_worker", lambda: _FakeWorker())
     runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
-    monkeypatch.setattr(runner, "_l2_child_tensor", lambda _runtime_name, tensor, **_kwargs: tensor)
-    monkeypatch.setattr(runner, "_run_l2_program", lambda callable_spec, *args: callable_spec.chip_callable(*args))
+    monkeypatch.setattr(runner, "_static_device_tensor", lambda tensor: tensor)
+    monkeypatch.setattr(
+        runner,
+        "_run_distributed_program",
+        lambda callable_spec, *args: callable_spec.compiled(*args),
+    )
     executor._runners[model.config.model_id] = runner
     monkeypatch.setattr(
         PyptoExecutor,
@@ -349,15 +380,15 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
     manager.free(decode_alloc)
 
 
-def test_l2_profile_helpers_emit_kernel_name_and_runtime_timing():
+def test_kernel_profile_helpers_emit_kernel_name_and_runtime_timing():
     args = {"runtime": "tensormap_and_ringbuffer"}
     host_wall_us, device_wall_us = _run_timing_us(
         SimpleNamespace(host_wall_us=1234.5, device_wall_us=678.0)
     )
     _add_run_timing_args(args, SimpleNamespace(host_wall_us=1234.5, device_wall_us=678.0))
 
-    assert _l2_trace_name("prefill_fwd") == "kernel.prefill_fwd"
-    assert _l2_trace_name("decode_fwd") == "kernel.decode_fwd"
+    assert _kernel_trace_name("prefill_fwd") == "kernel.prefill_fwd"
+    assert _kernel_trace_name("decode_fwd") == "kernel.decode_fwd"
     assert host_wall_us == 1234.5
     assert device_wall_us == 678.0
     assert args["host_wall_us"] == 1234.5
@@ -407,7 +438,7 @@ class _FakeWorker:
         self._next_ptr = 1
         self.initialized = True
 
-    def alloc_tensor(self, shape, dtype):
+    def alloc_tensor(self, shape, dtype, init=None):
         nbytes = torch.empty(tuple(shape), dtype=dtype).nbytes
         tensor = WorkerTensor(self._next_ptr, tuple(shape), self._DTYPES[dtype])
         self._next_ptr += nbytes
