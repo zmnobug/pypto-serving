@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -104,14 +105,14 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         kv_cache_manager=None,
         *,
         platform: str = "a2a3sim",
-        device_id: int = 0,
+        device_ids: Sequence[int] = (0,),
         save_kernels_dir: str | None = None,
         l3_trace: bool = False,
     ) -> None:
         super().__init__(
             kv_cache_manager,
             platform=platform,
-            device_id=device_id,
+            device_ids=device_ids,
             save_kernels_dir=save_kernels_dir,
         )
         self._l3_trace = l3_trace
@@ -428,7 +429,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
         config = self._run_config(codegen_only=True)
         distributed_config = DistributedConfig(
-            device_ids=[self._device_id],
+            device_ids=list(self._device_ids),
             num_sub_workers=0,
             block_dim=_QWEN14B_BLOCK_DIM,
             aicpu_thread_num=4,

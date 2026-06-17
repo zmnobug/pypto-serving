@@ -50,7 +50,7 @@ def test_qwen3_output_matches_expected_tokens():
     executor = Qwen314BPyptoExecutor(
         kv_cache_manager,
         platform=PLATFORM,
-        device_id=DEVICE_ID,
+        device_ids=(DEVICE_ID,),
     )
     engine = LLMEngine(kv_cache_manager=kv_cache_manager, executor=executor)
 

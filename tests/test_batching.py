@@ -14,18 +14,20 @@ import torch
 from simpler.task_interface import DataType
 
 from python.core.engine import LLMEngine
+from python.core.executor import ModelExecutor
 from python.core.kv_cache import KvCacheManager
 from python.core.types import (
     DecodeBatch,
+    DecodeResult,
     GenerateConfig,
     LayerWeights,
     ModelConfig,
     ModelRecord,
     PrefillBatch,
+    PrefillResult,
     RuntimeConfig,
     RuntimeModel,
 )
-from examples.model.qwen3_14b.runner.cpu_executor import CpuModelExecutor
 from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
 from examples.model.qwen3_14b.runner.npu_runner import Qwen314BModelRunner as ModelRunner
 from examples.model.qwen3_14b.runner.npu_runner import _CompiledKernels
@@ -294,7 +296,7 @@ def test_decode_inputs_use_actual_user_batch_without_padding_lanes():
 def test_engine_generate_batch_uses_batched_executor_results():
     model = _model(max_batch_size=2, eos_token_id=0)
     manager = KvCacheManager()
-    executor = CpuModelExecutor(manager)
+    executor = _ImmediateEosExecutor(manager)
     engine = LLMEngine(kv_cache_manager=manager, executor=executor)
     manager.register_model(model.config.model_id, model.config, model.runtime)
     engine._models[model.config.model_id] = ModelRecord(
@@ -380,6 +382,13 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
     manager.free(decode_alloc)
 
 
+def test_pypto_executor_preserves_device_group():
+    executor = PyptoExecutor(device_ids=[3, 4])
+
+    assert executor._device_ids == (3, 4)
+    assert executor._run_config(codegen_only=True).device_id == 3
+
+
 def test_kernel_profile_helpers_emit_kernel_name_and_runtime_timing():
     args = {"runtime": "tensormap_and_ringbuffer"}
     host_wall_us, device_wall_us = _run_timing_us(
@@ -421,6 +430,23 @@ class _CopyKernel:
             out.copy_(hidden)
         else:
             out.zero_()
+
+
+class _ImmediateEosExecutor(ModelExecutor):
+    def __init__(self, kv_cache_manager: KvCacheManager) -> None:
+        super().__init__(kv_cache_manager)
+
+    def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
+        logits = torch.full((len(batch.request_ids), model.config.vocab_size), -1.0)
+        logits[:, 0] = 1.0
+        hidden = torch.zeros(len(batch.request_ids), model.config.hidden_size)
+        return PrefillResult(last_hidden=hidden, logits=logits)
+
+    def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
+        logits = torch.full((len(batch.request_ids), model.config.vocab_size), -1.0)
+        logits[:, 0] = 1.0
+        hidden = torch.zeros(len(batch.request_ids), model.config.hidden_size)
+        return DecodeResult(hidden_states=hidden, logits=logits)
 
 
 class _NoopKernel:

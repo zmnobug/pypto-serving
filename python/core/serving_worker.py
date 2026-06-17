@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import os
+from pathlib import Path
 
 import torch
 
@@ -58,16 +60,26 @@ class WorkerProcess:
         from .sampler import Sampler
         from .types import ModelRecord
 
+        device_ids = self.config.worker_device_ids()
+        device_label = ",".join(str(device_id) for device_id in device_ids)
+        pypto_build_dir = self._configure_pypto_build_dir(device_ids)
         if mp.current_process().name != "MainProcess":
-            get_profiler(process_name=f"serving-worker-{self.config.device_id}")
+            get_profiler(process_name=f"serving-worker-{device_label}")
         with profile_span(
             "WorkerProcess.init_device_and_model",
             cat="worker",
-            args={"model_id": self.config.model_id, "device_id": self.config.device_id},
+            args={
+                "model_id": self.config.model_id,
+                "device_id": self.config.device_id,
+                "device_ids": list(device_ids),
+                "dp_rank": self.config.dp_rank,
+                "pypto_build_dir": str(pypto_build_dir),
+            },
         ):
             logger.info(
                 f"Worker initializing: platform={self.config.platform}, "
-                f"device={self.config.device_id}"
+                f"devices={list(device_ids)}, dp_rank={self.config.dp_rank}, "
+                f"pypto_build_dir={pypto_build_dir}"
             )
 
             self.sampler = Sampler()
@@ -75,7 +87,7 @@ class WorkerProcess:
             executor_cls = self._resolve_executor_cls()
             self.executor = executor_cls(
                 platform=self.config.platform,
-                device_id=self.config.device_id,
+                device_ids=device_ids,
                 **self.config.executor_kwargs,
             )
 
@@ -107,6 +119,14 @@ class WorkerProcess:
             return Qwen314BPyptoExecutor
         from .executor import ModelExecutor
         return ModelExecutor
+
+    def _configure_pypto_build_dir(self, device_ids: tuple[int, ...]) -> Path:
+        """Give each worker process an isolated PyPTO build base."""
+        base = Path(os.environ.get("PYPTO_PROG_BUILD_DIR") or "build_output")
+        device_label = "_".join(str(device_id) for device_id in device_ids)
+        worker_dir = base / f"serving_dp{self.config.dp_rank}_d{device_label}"
+        os.environ["PYPTO_PROG_BUILD_DIR"] = str(worker_dir)
+        return worker_dir
 
     def busy_loop(self) -> None:
         logger.info("Worker entering busy loop")
