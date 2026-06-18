@@ -369,8 +369,6 @@ class Scheduler:
     def _try_allocate_blocks(self, request: Request, num_blocks: int) -> bool:
         if num_blocks <= 0:
             return True
-        if self.kv_cache_manager.num_free_blocks < num_blocks:
-            return False
         block_ids = self.kv_cache_manager.allocate_block_ids(num_blocks)
         if block_ids is None:
             return False
@@ -432,16 +430,22 @@ class Scheduler:
             return
         if self.config.prefix_cache_backend == "radix":
             all_block_ids = request.cached_block_ids + request.allocated_block_ids
+            completed_len = min(request.num_computed_tokens, len(request.all_token_ids))
+            completed_pages = min(
+                completed_len // self.kv_cache_manager.block_size,
+                len(all_block_ids),
+            )
+            completed_len = completed_pages * self.kv_cache_manager.block_size
             self.kv_cache_manager.insert_radix_prefix(
                 request.model_id,
-                request.all_token_ids,
-                all_block_ids,
+                request.all_token_ids[:completed_len],
+                all_block_ids[:completed_pages],
             )
             self._debug_radix(
                 "insert",
                 request,
-                total_tokens=len(request.all_token_ids),
-                pages=len(all_block_ids),
+                total_tokens=completed_len,
+                pages=completed_pages,
             )
             return
         total_blocks_computed = request.num_computed_tokens // self.kv_cache_manager.block_size

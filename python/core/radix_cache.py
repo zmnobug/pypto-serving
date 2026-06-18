@@ -192,20 +192,13 @@ class RadixPrefixCache:
 
         evicted = 0
         while evicted < min_pages:
-            leaf = self._oldest_evictable_leaf()
-            if leaf is None:
+            leaves = self._evictable_leaves_by_lru()
+            if not leaves:
                 break
-            parent = leaf.parent
-            if parent is None:
-                break
-            if leaf.page_ids and self._release_pages is not None:
-                self._release_pages(list(leaf.page_ids))
-            evicted += len(leaf.page_ids)
-            parent.children.pop(self._child_key(leaf.extra_key, leaf.tokens), None)
-            leaf.parent = None
-            leaf.children.clear()
-            leaf.page_ids = []
-            leaf.tokens = ()
+            for leaf in leaves:
+                if evicted >= min_pages:
+                    break
+                evicted += self._evict_leaf(leaf)
         return evicted
 
     def total_pages(self) -> int:
@@ -256,11 +249,26 @@ class RadixPrefixCache:
         new_node.children[self._child_key(child.extra_key, suffix_tokens)] = child
         return new_node
 
-    def _oldest_evictable_leaf(self) -> RadixNode | None:
+    def _evictable_leaves_by_lru(self) -> list[RadixNode]:
         leaves = [node for node in self._iter_nodes() if self._is_evictable_leaf(node)]
-        if not leaves:
-            return None
-        return min(leaves, key=lambda node: node.last_access_time)
+        leaves.sort(key=lambda node: node.last_access_time)
+        return leaves
+
+    def _evict_leaf(self, leaf: RadixNode) -> int:
+        if not self._is_evictable_leaf(leaf):
+            return 0
+        parent = leaf.parent
+        if parent is None:
+            return 0
+        evicted = len(leaf.page_ids)
+        if leaf.page_ids and self._release_pages is not None:
+            self._release_pages(list(leaf.page_ids))
+        parent.children.pop(self._child_key(leaf.extra_key, leaf.tokens), None)
+        leaf.parent = None
+        leaf.children.clear()
+        leaf.page_ids = []
+        leaf.tokens = ()
+        return evicted
 
     def _is_evictable_leaf(self, node: RadixNode) -> bool:
         return node is not self.root and node.lock_ref == 0 and not node.children and bool(node.page_ids)

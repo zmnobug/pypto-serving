@@ -210,6 +210,8 @@ class KvCacheManager:
         if num_blocks <= 0:
             return []
         if self.num_free_blocks < num_blocks:
+            self.radix_cache.evict_pages(num_blocks - self.num_free_blocks)
+        if self.num_free_blocks < num_blocks:
             return None
         blocks: list[KVCacheBlock] = []
         for _ in range(num_blocks):
