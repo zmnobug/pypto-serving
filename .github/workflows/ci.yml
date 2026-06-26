@@ -167,7 +167,7 @@ jobs:
           tar -xzf "$CACHE_ARCHIVE" -C "$PTOAS_ROOT"
           chmod +x "$PTOAS_ROOT/ptoas"
           chmod +x "$PTOAS_ROOT/bin/ptoas"
-      
+
       - name: Run Qwen3 accuracy guard
         env:
           PYTHONPATH: ${{ github.workspace }}/dist-checkout
@@ -183,3 +183,26 @@ jobs:
         run: |
           source activate.sh
           python -m pytest tests/test_qwen3_serving.py -q -s
+
+  platform-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y meson ninja-build libhwloc-dev libboost-context-dev libopenmpi-dev
+
+      - name: Configure
+        run: meson setup platform/build platform/ -Dengines=mpi -DbuildTests=true
+
+      - name: Build
+        run: ninja -C platform/build
+
+      - name: Test
+        run: meson test -C platform/build --suite examples --timeout-multiplier 2

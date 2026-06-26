@@ -64,3 +64,9 @@ servingBuildDep = declare_dependency(
   dependencies: servingDependencies,
 )
 
+if meson.is_subproject() == false
+  if get_option('buildTests')
+    subdir('examples')
+  endif
+endif
+
