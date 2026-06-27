@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from simpler.task_interface import ContinuousTensor, DataType
+from simpler.task_interface import DataType
 from simpler.worker import Worker as SimplerWorker
 
 
@@ -118,10 +118,6 @@ class WorkerTensor:
     def torch_dtype(self) -> torch.dtype:
         """Return the corresponding ``torch.dtype``."""
         return _to_torch_dtype(self.dtype)
-
-    def to_continuous_tensor(self) -> ContinuousTensor:
-        """Return a Simpler tensor view that skips runtime malloc/free."""
-        return ContinuousTensor.make(self.data_ptr, self.shape, self.dtype, child_memory=True)
 
 
 class Worker:

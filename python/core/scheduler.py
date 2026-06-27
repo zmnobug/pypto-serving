@@ -64,6 +64,7 @@ class Request:
     cached_block_ids: list[int] = field(default_factory=list)
     allocated_block_ids: list[int] = field(default_factory=list)
     block_hashes: list[int] = field(default_factory=list)
+    num_blocks_cached: int = 0  # Track how many blocks have been published to prefix cache
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -229,6 +230,7 @@ class Scheduler:
                 if cached_blocks:
                     request.cached_block_ids = [b.block_id for b in cached_blocks]
                     request.num_computed_tokens = len(cached_blocks) * self.kv_cache_manager.block_size
+                    request.num_blocks_cached = len(cached_blocks)  # Mark cached blocks as already published
             else:
                 cached_blocks = []
 
@@ -386,6 +388,7 @@ class Scheduler:
         victim.num_computed_tokens = 0
         victim.cached_block_ids = []
         victim.allocated_block_ids = []
+        victim.num_blocks_cached = 0
         self.running = [r for r in self.running if r.request_id != victim.request_id]
         self.waiting.appendleft(victim)
         return {"request": victim, "returned_tokens": returned_tokens}
@@ -402,8 +405,13 @@ class Scheduler:
         """Register completed blocks in the prefix cache."""
         if not self.config.enable_prefix_cache:
             return
-        total_blocks_computed = request.num_computed_tokens // self.kv_cache_manager.block_size
-        already_cached = len(request.cached_block_ids)
+        total_blocks_computed = min(
+            request.num_computed_tokens // self.kv_cache_manager.block_size,
+            len(request.block_hashes)
+        )
+        already_cached = request.num_blocks_cached
+        if total_blocks_computed <= already_cached:
+            return  # Nothing new to cache
         all_block_ids = request.cached_block_ids + request.allocated_block_ids
         self.kv_cache_manager.cache_block_ids(
             all_block_ids,
@@ -411,3 +419,4 @@ class Scheduler:
             already_cached,
             total_blocks_computed,
         )
+        request.num_blocks_cached = total_blocks_computed
