@@ -178,6 +178,7 @@ class PrefillBatch:
     token_ids: torch.Tensor
     input_embeddings: torch.Tensor
     seq_lens: torch.Tensor
+    allow_device_greedy_sampling: bool = False
     kv_allocations: list[KvAllocation] = field(default_factory=list)
     positions: torch.Tensor | None = None
     block_ids: list[list[int]] = field(default_factory=list)
@@ -189,6 +190,8 @@ class PrefillResult:
 
     last_hidden: torch.Tensor | None
     logits: torch.Tensor
+    sampled_token_ids: torch.Tensor | None = None
+    next_hidden_states: torch.Tensor | None = None
 
 
 @dataclass
@@ -199,6 +202,7 @@ class DecodeBatch:
     token_ids: torch.Tensor
     hidden_states: torch.Tensor
     seq_lens: torch.Tensor
+    allow_device_greedy_sampling: bool = False
     kv_allocations: list[KvAllocation] = field(default_factory=list)
     block_ids: list[list[int]] = field(default_factory=list)
 
@@ -209,6 +213,8 @@ class DecodeResult:
 
     hidden_states: torch.Tensor
     logits: torch.Tensor
+    sampled_token_ids: torch.Tensor | None = None
+    next_hidden_states: torch.Tensor | None = None
 
 
 @dataclass

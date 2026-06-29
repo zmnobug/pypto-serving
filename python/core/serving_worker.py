@@ -213,6 +213,10 @@ class WorkerProcess:
                 block_ids_list.append(sr.block_ids)
 
             max_chunk = max(len(t) for t in chunk_tokens_list)
+            allow_device_greedy_sampling = (
+                self.executor.supports_device_sampling
+                and all(sr.request.temperature <= 0.0 for sr in scheduled)
+            )
             token_tensor = torch.zeros((batch_size, max_chunk), dtype=torch.long, device=device)
             embeddings = torch.zeros(
                 (batch_size, max_chunk, self.model_record.config.hidden_size),
@@ -238,6 +242,7 @@ class WorkerProcess:
                     token_ids=token_tensor,
                     input_embeddings=embeddings,
                     seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+                    allow_device_greedy_sampling=allow_device_greedy_sampling,
                     positions=positions_tensor,
                     block_ids=block_ids_list,
                 ),
@@ -257,7 +262,13 @@ class WorkerProcess:
                         top_p=request.top_p,
                         top_k=request.top_k,
                     )
-                    token_id = self.sampler.sample(logits, params)
+                    token_id = self._sample_result_row(
+                        prefill_result,
+                        logits,
+                        params,
+                        i,
+                        allow_device_greedy_sampling,
+                    )
                     new_tokens[request.request_id] = token_id
 
     def _batch_decode(
@@ -276,6 +287,10 @@ class WorkerProcess:
             decode_tokens = []
             block_ids_list = []
             seq_lens = []
+            allow_device_greedy_sampling = (
+                self.executor.supports_device_sampling
+                and all(sr.request.temperature <= 0.0 for sr in scheduled)
+            )
 
             for sr in scheduled:
                 request = sr.request
@@ -289,7 +304,14 @@ class WorkerProcess:
                 seq_lens.append(request.num_tokens)
 
             decode_token_tensor = torch.tensor(decode_tokens, dtype=torch.long, device=device)
-            decode_embeddings = self.executor.lookup_embeddings(runtime_model, decode_token_tensor)
+            if self.executor.supports_device_embedding:
+                decode_embeddings = torch.zeros(
+                    (len(decode_tokens), self.model_record.config.hidden_size),
+                    dtype=runtime_model.embed_tokens.dtype,
+                    device=device,
+                )
+            else:
+                decode_embeddings = self.executor.lookup_embeddings(runtime_model, decode_token_tensor)
 
             decode_result = self.executor.run_decode(
                 runtime_model,
@@ -298,6 +320,7 @@ class WorkerProcess:
                     token_ids=decode_token_tensor.unsqueeze(1),
                     hidden_states=decode_embeddings,
                     seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+                    allow_device_greedy_sampling=allow_device_greedy_sampling,
                     block_ids=block_ids_list,
                 ),
             )
@@ -314,8 +337,33 @@ class WorkerProcess:
                     top_p=request.top_p,
                     top_k=request.top_k,
                 )
-                token_id = self.sampler.sample(logits, params)
+                token_id = self._sample_result_row(
+                    decode_result,
+                    logits,
+                    params,
+                    i,
+                    allow_device_greedy_sampling,
+                )
                 new_tokens[request.request_id] = token_id
+
+    def _sample_result_row(
+        self,
+        result,
+        logits: torch.Tensor,
+        params: SamplingParams,
+        row_idx: int,
+        allow_device_sampled: bool,
+    ) -> int:
+        """Return a sampled token from executor output, falling back to host sampling."""
+        sampled = getattr(result, "sampled_token_ids", None)
+        if allow_device_sampled and sampled is not None:
+            flat = sampled.view(-1)
+            if flat.numel() <= row_idx:
+                raise ValueError(
+                    f"sampled_token_ids has {flat.numel()} rows, expected row {row_idx}"
+                )
+            return int(flat[row_idx].item())
+        return self.sampler.sample(logits, params)
 
 def _worker_entry(
     config: EngineConfig,

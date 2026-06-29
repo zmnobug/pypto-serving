@@ -122,6 +122,16 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         """Return whether compile and L3 execution timing logs are enabled."""
         return self._l3_trace
 
+    @property
+    def supports_device_sampling(self) -> bool:
+        """Qwen3 NPU runner can return greedy sampled token ids."""
+        return True
+
+    @property
+    def supports_device_embedding(self) -> bool:
+        """Qwen3 NPU decode embeds greedy token ids inside the device kernel."""
+        return True
+
     def _create_runner(self, model_id: str, compiled: object) -> ModelRunner:
         """Create the Qwen3-14B runtime runner for compiled kernels."""
         if not isinstance(compiled, _CompiledKernels):
@@ -148,8 +158,12 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         # device-resident paged KV pool prefill writes (self._kv_caches), so no
         # contiguous bridge / MAX_SEQ env is needed.
         qwen3_decode_layer = _load_pypto_lib_qwen14b_module("decode_layer")
+        qwen3_greedy_sample = _load_pypto_lib_qwen14b_module("greedy_sample")
+        qwen3_token_embed = _load_pypto_lib_qwen14b_module("token_embed")
         qwen3_l3_dispatch.prefill_fwd = qwen3_prefill_fwd.prefill_fwd
         qwen3_l3_dispatch.decode_fwd = qwen3_decode_layer.decode_fwd
+        qwen3_l3_dispatch.greedy_sample_fwd = qwen3_greedy_sample.greedy_sample_fwd
+        qwen3_l3_dispatch.token_embed_fwd = qwen3_token_embed.token_embed_fwd
 
         _mark("imports")
 
@@ -180,6 +194,40 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
                 f"{padded_vocab} (round_up({model.config.vocab_size}, {_VOCAB_PAD_MULTIPLE})); "
                 "they must match for the decode logits buffer / lm_head weight to line up."
             )
+        if model.config.vocab_size != int(qwen3_decode_layer.REAL_VOCAB):
+            raise ValueError(
+                "decode_layer.decode_fwd hard-codes REAL_VOCAB for padded-token masking, "
+                f"but the runtime model vocab_size is {model.config.vocab_size}; expected "
+                f"{int(qwen3_decode_layer.REAL_VOCAB)}."
+            )
+        if int(qwen3_greedy_sample.BATCH) != kernel_batch:
+            raise ValueError(
+                "greedy_sample_fwd is compiled for a fixed kernel BATCH of "
+                f"{int(qwen3_greedy_sample.BATCH)}, but runtime max_batch_size is {kernel_batch}."
+            )
+        if int(qwen3_greedy_sample.VOCAB) != padded_vocab:
+            raise ValueError(
+                "greedy_sample_fwd VOCAB must match the padded logits vocab: "
+                f"{int(qwen3_greedy_sample.VOCAB)} != {padded_vocab}."
+            )
+        if int(qwen3_token_embed.BATCH) != kernel_batch:
+            raise ValueError(
+                "token_embed_fwd is compiled for a fixed kernel BATCH of "
+                f"{int(qwen3_token_embed.BATCH)}, but runtime max_batch_size is {kernel_batch}."
+            )
+        if int(qwen3_token_embed.VOCAB) != padded_vocab:
+            raise ValueError(
+                "token_embed_fwd VOCAB must match the padded embedding vocab: "
+                f"{int(qwen3_token_embed.VOCAB)} != {padded_vocab}."
+            )
+        if int(qwen3_token_embed.HIDDEN) != model.config.hidden_size:
+            raise ValueError(
+                "token_embed_fwd HIDDEN must match model hidden_size: "
+                f"{int(qwen3_token_embed.HIDDEN)} != {model.config.hidden_size}."
+            )
+        sampled_ids_width = int(
+            getattr(qwen3_decode_layer, "SAMPLED_IDS_PAD", getattr(qwen3_greedy_sample, "SAMPLED_IDS_PAD", 1))
+        )
         page_size = model.runtime.page_size
         max_blocks_per_seq = (model.runtime.max_seq_len + page_size - 1) // page_size
         prefill = self._compile_prefill_fwd_callable(
@@ -195,6 +243,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             vocab_size=padded_vocab,
             block_table_stride=max_blocks_per_seq,
             page_size=page_size,
+            sampled_ids_width=sampled_ids_width,
         )
         _mark("compile_prefill")
         decode = self._compile_decode_fwd_callable(
@@ -210,8 +259,24 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             num_layers=model.config.num_hidden_layers,
             vocab_size=padded_vocab,
             page_size=page_size,
+            sampled_ids_width=sampled_ids_width,
         )
         _mark("compile_decode")
+        greedy_sample = self._compile_greedy_sample_callable(
+            qwen3_l3_dispatch.qwen3_greedy_sample_host,
+            batch=kernel_batch,
+            sampled_ids_width=sampled_ids_width,
+            vocab_size=padded_vocab,
+        )
+        _mark("compile_greedy_sample")
+        token_embed = self._compile_token_embed_callable(
+            qwen3_l3_dispatch.qwen3_token_embed_host,
+            batch=kernel_batch,
+            hidden_size=model.config.hidden_size,
+            sampled_ids_width=sampled_ids_width,
+            vocab_size=padded_vocab,
+        )
+        _mark("compile_token_embed")
         rope_cos_raw, rope_sin_raw = rope_tables(
             model.runtime.max_seq_len,
             model.config.head_dim,
@@ -225,14 +290,21 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         lm_head_weight = model.lm_head
         if padded_vocab != lm_head_weight.shape[0]:
             pad_rows = padded_vocab - lm_head_weight.shape[0]
-            padding = torch.zeros(
-                (pad_rows, lm_head_weight.shape[1]),
-                dtype=lm_head_weight.dtype,
-                device=lm_head_weight.device,
-            )
+            padding = lm_head_weight[:1].expand(pad_rows, -1).clone()
             lm_head_weight = torch.cat([lm_head_weight, padding], dim=0)
         padded_lm_head_weight = self._shared_tensor(lm_head_weight.to(torch.bfloat16).contiguous().cpu())
         _mark("pad_lm_head")
+        embed_weight = model.embed_tokens
+        if padded_vocab != embed_weight.shape[0]:
+            pad_rows = padded_vocab - embed_weight.shape[0]
+            padding = torch.zeros(
+                (pad_rows, embed_weight.shape[1]),
+                dtype=embed_weight.dtype,
+                device=embed_weight.device,
+            )
+            embed_weight = torch.cat([embed_weight, padding], dim=0)
+        padded_embed_weight = self._shared_tensor(embed_weight.to(torch.bfloat16).contiguous().cpu())
+        _mark("pad_embed")
         layers = []
         for layer in model.layers:
             layers.append(self._kernel_layer_weights(layer))
@@ -264,6 +336,14 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             (kernel_batch, padded_vocab),
             dtype=torch.float32,
         ).share_memory_()
+        prefill_sampled_ids_buffer = torch.empty(
+            (kernel_batch, sampled_ids_width),
+            dtype=torch.int32,
+        ).share_memory_()
+        prefill_next_hidden_buffer = torch.empty(
+            (kernel_batch, model.config.hidden_size),
+            dtype=torch.bfloat16,
+        ).share_memory_()
         _mark("prefill_buffers")
         decode_logits_buffer = torch.empty(
             (kernel_batch, padded_vocab),
@@ -279,6 +359,18 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             dtype=torch.int32,
         ).share_memory_()
         decode_slot_mapping_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
+        decode_token_ids_buffer = torch.empty(
+            (kernel_batch, sampled_ids_width),
+            dtype=torch.int32,
+        ).share_memory_()
+        decode_sampled_ids_buffer = torch.empty(
+            (kernel_batch, sampled_ids_width),
+            dtype=torch.int32,
+        ).share_memory_()
+        decode_next_hidden_buffer = torch.empty(
+            (kernel_batch, model.config.hidden_size),
+            dtype=torch.bfloat16,
+        ).share_memory_()
         _mark("decode_logits_buffer")
 
         timer.report()
@@ -286,11 +378,14 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return _CompiledKernels(
             prefill=prefill,
             decode=decode,
+            greedy_sample=greedy_sample,
+            token_embed=token_embed,
             final_norm_weight=final_norm_weight,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
             padded_vocab=padded_vocab,
             padded_lm_head_weight=padded_lm_head_weight,
+            padded_embed_weight=padded_embed_weight,
             decode_weights=decode_weights,
             prefill_hidden_buffer=prefill_hidden_buffer,
             prefill_seq_lens_buffer=prefill_seq_lens_buffer,
@@ -299,11 +394,16 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             prefill_block_table_buffer=prefill_block_table_buffer,
             prefill_slot_mapping_buffer=prefill_slot_mapping_buffer,
             prefill_logits_buffer=prefill_logits_buffer,
+            prefill_sampled_ids_buffer=prefill_sampled_ids_buffer,
+            prefill_next_hidden_buffer=prefill_next_hidden_buffer,
             decode_hidden_buffer=decode_hidden_buffer,
             decode_seq_lens_buffer=decode_seq_lens_buffer,
             decode_block_table_buffer=decode_block_table_buffer,
             decode_slot_mapping_buffer=decode_slot_mapping_buffer,
             decode_logits_buffer=decode_logits_buffer,
+            decode_token_ids_buffer=decode_token_ids_buffer,
+            decode_sampled_ids_buffer=decode_sampled_ids_buffer,
+            decode_next_hidden_buffer=decode_next_hidden_buffer,
         )
 
     def _compile_prefill_fwd_callable(
@@ -321,6 +421,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         num_layers: int,
         vocab_size: int,
         page_size: int,
+        sampled_ids_width: int,
     ) -> _L3Callable:
         """Compile the prefill HOST wrapper into a distributed program."""
         kv_hidden = num_kv_heads * head_dim
@@ -345,10 +446,10 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
             torch.empty((cache_rows, head_dim), dtype=torch.bfloat16),
             torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),
-            torch.empty((num_layers, hidden_size), dtype=torch.float32),
             torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
             torch.empty((num_layers * hidden_size, intermediate_size), dtype=torch.bfloat16),
             torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((num_layers, hidden_size), dtype=torch.float32),
             torch.empty((1, hidden_size), dtype=torch.float32),
             torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
             torch.empty((batch, vocab_size), dtype=torch.float32),
@@ -370,6 +471,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         num_layers: int,
         vocab_size: int,
         page_size: int,
+        sampled_ids_width: int,
     ) -> _L3Callable:
         """Compile the fused all-layer PAGED decode HOST wrapper into a distributed program.
 
@@ -413,8 +515,44 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             torch.empty((1, hidden_size), dtype=torch.float32),                                # final_norm_weight
             torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),                      # lm_head_weight
             torch.empty((batch, vocab_size), dtype=torch.float32),                             # out
+            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),                      # embed_weight
+            torch.empty((batch, sampled_ids_width), dtype=torch.int32),                        # sampled_ids_in
+            torch.empty((batch, sampled_ids_width), dtype=torch.int32),                        # sampled_ids_out
+            torch.empty((batch, hidden_size), dtype=torch.bfloat16),                           # next_hidden
         ]
         return self._compile_jit_fwd_callable("decode_fwd", jit_fn, dummy_args)
+
+    def _compile_greedy_sample_callable(
+        self,
+        jit_fn: object,
+        *,
+        batch: int,
+        sampled_ids_width: int,
+        vocab_size: int,
+    ) -> _L3Callable:
+        """Compile the greedy sampling HOST wrapper."""
+        dummy_args = [
+            torch.empty((batch, vocab_size), dtype=torch.float32),
+            torch.empty((batch, sampled_ids_width), dtype=torch.int32),
+        ]
+        return self._compile_jit_fwd_callable("greedy_sample_fwd", jit_fn, dummy_args)
+
+    def _compile_token_embed_callable(
+        self,
+        jit_fn: object,
+        *,
+        batch: int,
+        hidden_size: int,
+        sampled_ids_width: int,
+        vocab_size: int,
+    ) -> _L3Callable:
+        """Compile the embedding lookup HOST wrapper."""
+        dummy_args = [
+            torch.empty((batch, sampled_ids_width), dtype=torch.int32),
+            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
+            torch.empty((batch, hidden_size), dtype=torch.bfloat16),
+        ]
+        return self._compile_jit_fwd_callable("token_embed_fwd", jit_fn, dummy_args)
 
     def _compile_jit_fwd_callable(
         self,

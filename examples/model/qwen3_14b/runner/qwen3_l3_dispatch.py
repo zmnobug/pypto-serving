@@ -16,6 +16,8 @@ import pypto.language as pl
 
 prefill_fwd = None
 decode_fwd = None
+greedy_sample_fwd = None
+token_embed_fwd = None
 
 
 @pl.jit.host
@@ -63,10 +65,10 @@ def qwen3_prefill_host(
         k_cache,
         v_cache,
         wo,
+        post_rms_weight,
         w_gate,
         w_up,
         w_down,
-        post_rms_weight,
         final_norm_weight,
         lm_head_weight,
         out,
@@ -97,8 +99,12 @@ def qwen3_decode_host(
     final_norm_weight: pl.Tensor,
     lm_head_weight: pl.Tensor,
     out: pl.Out[pl.Tensor],
-) -> pl.Tensor:
-    return decode_fwd(
+    embed_weight: pl.Tensor,
+    sampled_ids_in: pl.Tensor,
+    sampled_ids: pl.Out[pl.Tensor],
+    next_hidden: pl.Out[pl.Tensor],
+) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
+    logits, sampled_ids, next_hidden = decode_fwd(
         hidden_states,
         input_rms_weight,
         wq,
@@ -121,4 +127,33 @@ def qwen3_decode_host(
         final_norm_weight,
         lm_head_weight,
         out,
+        embed_weight,
+        sampled_ids_in,
+        sampled_ids,
+        next_hidden,
+    )
+    return logits, sampled_ids, next_hidden
+
+
+@pl.jit.host
+def qwen3_greedy_sample_host(
+    logits: pl.Tensor,
+    sampled_ids: pl.Out[pl.Tensor],
+) -> pl.Tensor:
+    return greedy_sample_fwd(
+        logits,
+        sampled_ids,
+    )
+
+
+@pl.jit.host
+def qwen3_token_embed_host(
+    sampled_ids: pl.Tensor,
+    embed_weight: pl.Tensor,
+    next_hidden: pl.Out[pl.Tensor],
+) -> pl.Tensor:
+    return token_embed_fwd(
+        sampled_ids,
+        embed_weight,
+        next_hidden,
     )

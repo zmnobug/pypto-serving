@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import pytest
+import importlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -28,6 +30,9 @@ from python.core.types import (
     RuntimeConfig,
     RuntimeModel,
 )
+from python.core.scheduler import Request, ScheduledRequest
+from python.core.serving_worker import WorkerProcess
+from examples.model.qwen3_14b.runner.cpu_executor import CpuModelExecutor
 from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
 from examples.model.qwen3_14b.runner.npu_runner import Qwen314BModelRunner as ModelRunner
 from examples.model.qwen3_14b.runner.npu_runner import _CompiledKernels
@@ -123,11 +128,14 @@ def _compiled_kernels(
     return _CompiledKernels(
         prefill=callable_,
         decode=callable_,
+        greedy_sample=callable_,
+        token_embed=callable_,
         final_norm_weight=torch.ones(1, hidden_size),
         rope_cos=torch.zeros(max_seq, head_dim),
         rope_sin=torch.zeros(max_seq, head_dim),
         padded_vocab=model.config.vocab_size,
         padded_lm_head_weight=torch.zeros(model.config.vocab_size, hidden_size),
+        padded_embed_weight=torch.zeros(model.config.vocab_size, hidden_size),
         decode_weights=decode_weights,
         prefill_hidden_buffer=torch.empty(kernel_batch * max_seq, hidden_size, dtype=torch.bfloat16),
         prefill_seq_lens_buffer=torch.empty(kernel_batch, dtype=torch.int32),
@@ -136,11 +144,16 @@ def _compiled_kernels(
         prefill_block_table_buffer=torch.empty(kernel_batch * max_blocks, dtype=torch.int32),
         prefill_slot_mapping_buffer=torch.empty(kernel_batch * max_seq, dtype=torch.int32),
         prefill_logits_buffer=torch.empty(kernel_batch, model.config.vocab_size),
+        prefill_sampled_ids_buffer=torch.empty(kernel_batch, 1, dtype=torch.int32),
+        prefill_next_hidden_buffer=torch.empty(kernel_batch, hidden_size, dtype=torch.bfloat16),
         decode_hidden_buffer=torch.zeros(kernel_batch, hidden_size, dtype=torch.bfloat16),
         decode_seq_lens_buffer=torch.zeros(kernel_batch, dtype=torch.int32),
         decode_block_table_buffer=torch.zeros(kernel_batch * max_blocks, dtype=torch.int32),
         decode_slot_mapping_buffer=torch.zeros(kernel_batch, dtype=torch.int32),
         decode_logits_buffer=torch.zeros(kernel_batch, model.config.vocab_size),
+        decode_token_ids_buffer=torch.empty(kernel_batch, 1, dtype=torch.int32),
+        decode_sampled_ids_buffer=torch.empty(kernel_batch, 1, dtype=torch.int32),
+        decode_next_hidden_buffer=torch.empty(kernel_batch, hidden_size, dtype=torch.bfloat16),
     )
 
 
@@ -317,6 +330,178 @@ def test_engine_generate_batch_uses_batched_executor_results():
     assert [result.finish_reason for result in results] == ["eos", "eos"]
 
 
+def test_engine_uses_device_sampled_prefill_token_when_available():
+    model = _model(max_batch_size=1, eos_token_id=0)
+    model.embed_tokens = torch.arange(model.config.vocab_size * model.config.hidden_size, dtype=torch.float32).view(
+        model.config.vocab_size,
+        model.config.hidden_size,
+    )
+    manager = KvCacheManager()
+    executor = _DeviceSamplingExecutor(manager, first_token=3, second_token=0)
+    sampler = _FailingSampler()
+    engine = LLMEngine(kv_cache_manager=manager, executor=executor, sampler=sampler)
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    engine._models[model.config.model_id] = ModelRecord(
+        config=model.config,
+        runtime=model.runtime,
+        tokenizer=_Tokenizer(),
+        layer_specs=[],
+        runtime_model=model,
+    )
+
+    result = engine.generate_batch(
+        model.config.model_id,
+        ["abc"],
+        GenerateConfig(max_new_tokens=1, temperature=0.0),
+    )[0]
+
+    assert result.token_ids == [3]
+    assert executor.prefill_calls == 1
+    assert executor.decode_calls == 0
+    assert sampler.sample_calls == 0
+
+
+def test_engine_uses_zero_decode_placeholder_when_executor_embeds_on_device():
+    model = _model(max_batch_size=1, eos_token_id=0)
+    model.embed_tokens = torch.arange(model.config.vocab_size * model.config.hidden_size, dtype=torch.float32).view(
+        model.config.vocab_size,
+        model.config.hidden_size,
+    )
+    manager = KvCacheManager()
+    executor = _DeviceSamplingExecutor(manager, first_token=3, second_token=0)
+    sampler = _FailingSampler()
+    engine = LLMEngine(kv_cache_manager=manager, executor=executor, sampler=sampler)
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    engine._models[model.config.model_id] = ModelRecord(
+        config=model.config,
+        runtime=model.runtime,
+        tokenizer=_Tokenizer(),
+        layer_specs=[],
+        runtime_model=model,
+    )
+
+    result = engine.generate_batch(
+        model.config.model_id,
+        ["abc"],
+        GenerateConfig(max_new_tokens=2, temperature=0.0),
+    )[0]
+
+    assert result.token_ids == [3, 0]
+    assert executor.lookup_calls == 1
+    assert executor.decode_calls == 1
+    assert torch.equal(executor.decode_hidden_seen[0], torch.zeros_like(model.embed_tokens[3]))
+    assert sampler.sample_calls == 0
+
+
+def test_engine_skips_decode_host_embedding_when_executor_embeds_on_device():
+    model = _model(max_batch_size=1, eos_token_id=0)
+    model.embed_tokens = torch.arange(model.config.vocab_size * model.config.hidden_size, dtype=torch.float32).view(
+        model.config.vocab_size,
+        model.config.hidden_size,
+    )
+    manager = KvCacheManager()
+    executor = _DeviceSamplingExecutor(
+        manager,
+        first_token=3,
+        second_token=0,
+        return_next_hidden=False,
+    )
+    sampler = _FailingSampler()
+    engine = LLMEngine(kv_cache_manager=manager, executor=executor, sampler=sampler)
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    engine._models[model.config.model_id] = ModelRecord(
+        config=model.config,
+        runtime=model.runtime,
+        tokenizer=_Tokenizer(),
+        layer_specs=[],
+        runtime_model=model,
+    )
+
+    result = engine.generate_batch(
+        model.config.model_id,
+        ["abc"],
+        GenerateConfig(max_new_tokens=2, temperature=0.0),
+    )[0]
+
+    assert result.token_ids == [3, 0]
+    assert executor.lookup_calls == 1
+    assert executor.decode_calls == 1
+    assert torch.equal(executor.decode_hidden_seen[0], torch.zeros_like(model.embed_tokens[3]))
+    assert sampler.sample_calls == 0
+
+
+def test_engine_ignores_device_sampled_tokens_for_non_greedy_config():
+    model = _model(max_batch_size=1)
+    model.embed_tokens = torch.arange(model.config.vocab_size * model.config.hidden_size, dtype=torch.float32).view(
+        model.config.vocab_size,
+        model.config.hidden_size,
+    )
+    manager = KvCacheManager()
+    executor = _DeviceSamplingExecutor(manager, first_token=3, second_token=0)
+    sampler = _FixedSampler(token_id=7)
+    engine = LLMEngine(kv_cache_manager=manager, executor=executor, sampler=sampler)
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    engine._models[model.config.model_id] = ModelRecord(
+        config=model.config,
+        runtime=model.runtime,
+        tokenizer=_Tokenizer(),
+        layer_specs=[],
+        runtime_model=model,
+    )
+
+    result = engine.generate_batch(
+        model.config.model_id,
+        ["abc"],
+        GenerateConfig(max_new_tokens=1, temperature=0.8),
+    )[0]
+
+    assert result.token_ids == [7]
+    assert executor.prefill_calls == 1
+    assert executor.decode_calls == 0
+    assert sampler.sample_calls == 1
+
+
+def test_serving_worker_skips_decode_host_embedding_when_executor_embeds_on_device():
+    model = _model(max_batch_size=1, eos_token_id=0)
+    manager = KvCacheManager()
+    executor = _DeviceSamplingExecutor(
+        manager,
+        first_token=3,
+        second_token=0,
+        return_next_hidden=False,
+    )
+
+    def fail_lookup(model, token_ids):
+        raise AssertionError("serving worker decode should let the device kernel embed token ids")
+
+    executor.lookup_embeddings = fail_lookup
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.executor = executor
+    worker.sampler = _FailingSampler()
+    worker.model_record = SimpleNamespace(config=model.config)
+
+    request = Request(
+        request_id="decode",
+        prompt_token_ids=[1],
+        max_new_tokens=2,
+        temperature=0.0,
+    )
+    request.output_token_ids.append(3)
+    scheduled = ScheduledRequest(
+        request=request,
+        num_new_tokens=1,
+        is_prefill=False,
+        block_ids=[0],
+    )
+    new_tokens: dict[str, int] = {}
+
+    worker._batch_decode([scheduled], model, new_tokens)
+
+    assert new_tokens == {"decode": 0}
+    assert executor.decode_calls == 1
+    assert torch.equal(executor.decode_hidden_seen[0], torch.zeros(model.config.hidden_size))
+
+
 def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatch):
     model = _model(max_batch_size=1, page_size=256)
     model.layers = [_layer(model.config.hidden_size, model.config.intermediate_size, model.config.head_dim)]
@@ -406,6 +591,48 @@ def test_kernel_profile_helpers_emit_kernel_name_and_runtime_timing():
     assert args["device_wall_ms"] == 0.678
 
 
+def test_decode_host_inlines_embedding_and_sampling_into_decode_fwd():
+    qwen3_l3_dispatch = importlib.import_module(
+        "examples.model.qwen3_14b.runner.qwen3_l3_dispatch"
+    )
+    module_source = Path(qwen3_l3_dispatch.__file__).read_text(encoding="utf-8")
+    start = module_source.index("def qwen3_decode_host")
+    end = module_source.index("def qwen3_greedy_sample_host")
+    source = module_source[start:end]
+
+    assert source.count("decode_fwd(") == 1
+    assert "token_embed_fwd(" not in source
+    assert "greedy_sample_fwd(" not in source
+
+    kernel_dir = Path(qwen3_l3_dispatch.__file__).parents[4] / "pypto-lib" / "models" / "qwen3" / "14b"
+    if not kernel_dir.is_dir():
+        pytest.skip("pypto-lib submodule is not checked out")
+    decode_source = (kernel_dir / "decode_layer.py").read_text(encoding="utf-8")
+    assert 'name_hint="token_embed"' in decode_source
+    assert 'name_hint="greedy_sample"' in decode_source
+
+
+def test_prefill_host_keeps_sampling_as_standalone_kernel():
+    qwen3_l3_dispatch = importlib.import_module(
+        "examples.model.qwen3_14b.runner.qwen3_l3_dispatch"
+    )
+    module_source = Path(qwen3_l3_dispatch.__file__).read_text(encoding="utf-8")
+    start = module_source.index("def qwen3_prefill_host")
+    end = module_source.index("def qwen3_decode_host")
+    source = module_source[start:end]
+
+    assert source.count("prefill_fwd(") == 1
+    assert "greedy_sample_fwd(" not in source
+    assert "token_embed_fwd(" not in source
+
+    kernel_dir = Path(qwen3_l3_dispatch.__file__).parents[4] / "pypto-lib" / "models" / "qwen3" / "14b"
+    if not kernel_dir.is_dir():
+        pytest.skip("pypto-lib submodule is not checked out")
+    prefill_source = (kernel_dir / "prefill_fwd.py").read_text(encoding="utf-8")
+    assert 'name_hint="greedy_sample"' not in prefill_source
+    assert 'name_hint="token_embed"' not in prefill_source
+
+
 def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeights:
     kv_hidden = head_dim
     return LayerWeights(
@@ -454,10 +681,90 @@ class _NoopKernel:
         return None
 
 
+class _FailingSampler:
+    def __init__(self) -> None:
+        self.sample_calls = 0
+
+    def from_generate_config(self, config):
+        return None
+
+    def sample(self, logits, params) -> int:
+        self.sample_calls += 1
+        raise AssertionError("host sampler should not be used when device sampled ids are available")
+
+
+class _FixedSampler:
+    def __init__(self, token_id: int) -> None:
+        self.token_id = token_id
+        self.sample_calls = 0
+
+    def from_generate_config(self, config):
+        return None
+
+    def sample(self, logits, params) -> int:
+        self.sample_calls += 1
+        return self.token_id
+
+
+class _DeviceSamplingExecutor(ModelExecutor):
+    def __init__(
+        self,
+        kv_cache_manager: KvCacheManager,
+        *,
+        first_token: int,
+        second_token: int,
+        return_next_hidden: bool = True,
+    ) -> None:
+        super().__init__(kv_cache_manager)
+        self.first_token = first_token
+        self.second_token = second_token
+        self.return_next_hidden = return_next_hidden
+        self.prefill_calls = 0
+        self.decode_calls = 0
+        self.lookup_calls = 0
+        self.decode_hidden_seen: list[torch.Tensor] = []
+
+    @property
+    def supports_device_sampling(self) -> bool:
+        return True
+
+    @property
+    def supports_device_embedding(self) -> bool:
+        return True
+
+    def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
+        self.lookup_calls += 1
+        if self.lookup_calls > 1:
+            raise AssertionError("device-embedding decode should use a placeholder instead of host lookup")
+        return super().lookup_embeddings(model, token_ids)
+
+    def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
+        self.prefill_calls += 1
+        token = torch.tensor([self.first_token], dtype=torch.int64)
+        return PrefillResult(
+            last_hidden=None,
+            logits=torch.zeros(1, model.config.vocab_size),
+            sampled_token_ids=token.to(torch.int32),
+            next_hidden_states=model.embed_tokens.index_select(0, token) if self.return_next_hidden else None,
+        )
+
+    def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
+        self.decode_calls += 1
+        self.decode_hidden_seen.append(batch.hidden_states[0].detach().clone())
+        token = torch.tensor([self.second_token], dtype=torch.int64)
+        return DecodeResult(
+            hidden_states=batch.hidden_states,
+            logits=torch.zeros(1, model.config.vocab_size),
+            sampled_token_ids=token.to(torch.int32),
+            next_hidden_states=model.embed_tokens.index_select(0, token) if self.return_next_hidden else None,
+        )
+
+
 class _FakeWorker:
     _DTYPES = {
         torch.float32: DataType.FLOAT32,
         torch.bfloat16: DataType.BFLOAT16,
+        torch.int32: DataType.INT32,
     }
 
     def __init__(self) -> None:
