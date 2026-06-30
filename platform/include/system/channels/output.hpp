@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <thread>
@@ -71,7 +72,7 @@ class Output final : public Base
     {
       lock();
       full = isFull(message.getSize());
-      if (full == true) { unlock(); std::this_thread::yield(); }
+      if (full == true) { unlock(); std::this_thread::sleep_for(std::chrono::microseconds(1)); }
     }
     pushMessage(message);
     unlock();
