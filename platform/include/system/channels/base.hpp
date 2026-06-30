@@ -127,6 +127,13 @@ class Base
 
   protected:
 
+  __INLINE__ void checkReady() const
+  {
+    if (_isReady == false) HICR_THROW_LOGIC("Channel '%s' is not initialized. Call initialize() before using it.", _config.name.c_str());
+  }
+
+  std::mutex _lock;
+
   virtual void createChannels() = 0;
 
   __INLINE__ void validateConfig() const
@@ -188,6 +195,5 @@ class Base
   std::shared_ptr<HiCR::GlobalMemorySlot> _metadataChannelConsumerCoordinationBuffer;
   std::shared_ptr<HiCR::GlobalMemorySlot> _metadataChannelProducerCoordinationBuffer;
 
-  std::mutex _lock;
 };
 } // namespace serving::system::channels

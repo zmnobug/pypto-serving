@@ -15,7 +15,6 @@ This layer follows the design split described in GitHub issues #32 and #13:
 ```text
 platform/
   include/modules/                  module interfaces and platform modules
-  include/modules/configuration/    deployment graph configuration types
   include/system/                   engine lifecycle and system utilities
   include/system/channels/          HiCR-backed channel primitives
   examples/                         executable examples for modules and engine lifecycle

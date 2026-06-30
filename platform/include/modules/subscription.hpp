@@ -9,10 +9,10 @@
 #include <system/channels/input.hpp>
 #include <system/channels/message.hpp>
 
-using namespace serving::system;
-
 namespace serving::modules
 {
+
+namespace channels = serving::system::channels;
 
 using messageHandler_t = std::function<void(const std::shared_ptr<channels::Input>, const channels::Message &)>;
 

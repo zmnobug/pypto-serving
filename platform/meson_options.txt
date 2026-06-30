@@ -1,6 +1,6 @@
 option('engines',
        type : 'array',
-       choices : [ 'mpi' ], 
+       choices : [ 'mpi' ],
        description : 'Specifies which engines enable distributed execution',
        value: [ 'mpi' ]
 )
@@ -15,4 +15,4 @@ option('buildTests', type : 'boolean', value : false,
 
 option('compileWarningsAsErrors', type : 'boolean', value : false,
        description: 'Indicates whether a compilation warning should result in a fatal error. This is useful for CI testing but may result in inconveniences for normal users, hence it should be false by default'
-) 
+)

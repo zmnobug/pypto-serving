@@ -70,6 +70,7 @@ class Input final : public Base
 
   __INLINE__ bool hasMessage() const
   {
+    checkReady();
     _metadataChannel->updateDepth();
     if (_metadataChannel->isEmpty() == true) return false;
     _dataChannel->updateDepth();

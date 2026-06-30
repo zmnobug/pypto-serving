@@ -58,6 +58,7 @@ class Output final : public Base
 
   __INLINE__ bool isFull(const size_t messageSize) const
   {
+    checkReady();
     _metadataChannel->updateDepth();
     if (_metadataChannel->isFull() == true) return true;
     _dataChannel->updateDepth();
@@ -67,15 +68,13 @@ class Output final : public Base
 
   __INLINE__ void pushMessageLocking(const Message message)
   {
-    bool full = true;
-    while (full == true)
+    while (true)
     {
-      lock();
-      full = isFull(message.getSize());
-      if (full == true) { unlock(); std::this_thread::sleep_for(std::chrono::microseconds(1)); }
+      std::unique_lock<std::mutex> guard(_lock);
+      if (!isFull(message.getSize())) { pushMessage(message); return; }
+      guard.unlock();
+      std::this_thread::sleep_for(std::chrono::microseconds(1));
     }
-    pushMessage(message);
-    unlock();
   }
 
   __INLINE__ void pushMessage(const Message message) const
