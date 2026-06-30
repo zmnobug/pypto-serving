@@ -192,6 +192,7 @@ jobs:
         with:
           fetch-depth: 1
           submodules: recursive
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
