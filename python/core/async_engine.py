@@ -110,10 +110,12 @@ class ReplicaEngineCore:
 
         runtime = self.config.runtime_config or RuntimeConfig()
         block_size = runtime.page_size
-        max_blocks_per_seq = (runtime.max_seq_len + block_size - 1) // block_size
-        num_blocks = runtime.total_kv_pages or runtime.max_batch_size * max_blocks_per_seq
+        self._runtime = runtime
+        # Block metadata is initialised lazily after the worker reports the
+        # actual device-side KV cache page count (computed from remaining
+        # NPU memory after model weight upload).
         self.kv_cache_manager = KvCacheManager(
-            num_blocks=num_blocks,
+            num_blocks=None,
             block_size=block_size,
             enable_prefix_cache=self.config.enable_prefix_cache,
         )
@@ -140,8 +142,8 @@ class ReplicaEngineCore:
 
     async def start(self) -> None:
         """Start worker process and engine loop."""
-        with profile_span("ReplicaEngineCore.start", cat="serving"):
-            process, input_q, output_q, ready_event = spawn_worker(self.config)
+        with profile_span("AsyncLLMEngine.start", cat="serving"):
+            process, input_q, output_q, ready_event, num_pages_value = spawn_worker(self.config)
             self._worker_process = process
             self._input_queue = input_q
             self._output_queue = output_q
@@ -155,6 +157,19 @@ class ReplicaEngineCore:
                 self._shutdown_worker(timeout=5)
                 raise
             logger.info("Worker ready")
+
+            # Synchronise block metadata with the actual device-side KV cache size.
+            actual_num_pages = num_pages_value.value
+            if actual_num_pages <= 0:
+                raise RuntimeError(
+                    f"Worker reported invalid KV cache page count: {actual_num_pages}"
+                )
+            self.kv_cache_manager._init_blocks(actual_num_pages, self._runtime.page_size)
+            logger.info(
+                "KV cache block pool initialised: num_blocks=%d, block_size=%d",
+                actual_num_pages,
+                self._runtime.page_size,
+            )
 
         self._running = True
         self._loop_task = asyncio.create_task(self._engine_loop())
@@ -224,6 +239,10 @@ class ReplicaEngineCore:
             ctx = _RequestContext(request=request)
             self._request_contexts[request_id] = ctx
             self.scheduler.add_request(request)
+            logger.info(
+                "request %s received: prompt=%d tokens, max_new_tokens=%d",
+                request_id, len(prompt_token_ids), config.max_new_tokens,
+            )
             if on_queued is not None:
                 on_queued()
             profile_instant(
@@ -237,6 +256,13 @@ class ReplicaEngineCore:
                 output: TokenOutput = await ctx.queue.get()
                 yield output
                 if output.finished:
+                    e2e = time.time() - request.arrival_time
+                    n_out = len(request.output_token_ids)
+                    logger.info(
+                        "request %s finished: prompt=%d out=%d reason=%s e2e=%.2fs (%.1f tok/s)",
+                        request_id, len(prompt_token_ids), n_out, output.finish_reason,
+                        e2e, (n_out / e2e) if e2e > 0 else 0.0,
+                    )
                     break
         finally:
             if request_id in self._request_contexts:
