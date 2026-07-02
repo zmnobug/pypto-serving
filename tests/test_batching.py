@@ -76,7 +76,7 @@ def _model(
         bos_token_id=None,
         eos_token_id=eos_token_id,
         pad_token_id=None,
-        torch_dtype="float32",
+        torch_dtype="bfloat16",
     )
     runtime = RuntimeConfig(
         page_size=page_size,
@@ -547,6 +547,8 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         compiled=compiled,
     )
     monkeypatch.setattr(runner, "_shared_l3_worker", lambda: _FakeWorker())
+    monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime: 1)
+    monkeypatch.setattr(runner, "_print_memory_breakdown", lambda *a, **kw: None)
     runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
     monkeypatch.setattr(runner, "_static_device_tensor", lambda tensor: tensor)
     monkeypatch.setattr(
@@ -791,4 +793,7 @@ class _FakeWorker:
         return tensor
 
     def free_tensor(self, tensor):
+        return None
+
+    def run(self, compiled, *args, **kwargs):
         return None

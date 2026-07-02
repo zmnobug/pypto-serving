@@ -447,6 +447,7 @@ class Qwen314BModelRunner(ModelRunner):
 
         # -- decode (full fixed batch, minimal seq) -------------------------
         compiled.decode_hidden_buffer.zero_()
+        compiled.decode_token_ids_buffer.zero_()
         compiled.decode_seq_lens_buffer.zero_()
         compiled.decode_block_table_buffer.fill_(0)     # all reads from page 0
         compiled.decode_slot_mapping_buffer.fill_(-1)   # all writes to page 0
@@ -456,6 +457,7 @@ class Qwen314BModelRunner(ModelRunner):
 
         decode_kernel_inputs = _DecodeKernelInputs(
             actual_batch=batch,
+            token_ids=compiled.decode_token_ids_buffer,
             hidden=compiled.decode_hidden_buffer,
             seq_lens=compiled.decode_seq_lens_buffer,
             block_table=compiled.decode_block_table_buffer,

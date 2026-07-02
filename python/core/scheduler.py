@@ -270,31 +270,15 @@ class Scheduler:
             num_new = min(num_new, token_budget)
 
             if num_new <= 0:
-                # Fully prefix-cached: num_computed_tokens >= num_prompt_tokens,
-                # prefill done, KV reused from cache. Schedule as decode so the
-                # worker generates the first token from cached KV. Without this
-                # the request is skipped forever (num_new=0 → put back → loop).
+                # Full prefix-cache hit: leave 1 token for prefill so the
+                # output uses the SAME kernel as the cold run (prefill, not
+                # decode), producing identical first generated token.
                 if request.num_computed_tokens >= request.num_prompt_tokens:
-                    logger.info(
-                        "request %s: prefix cache full hit (%d tokens), "
-                        "skipping prefill → decode",
-                        request.request_id, request.num_computed_tokens,
-                    )
-                    request.status = RequestStatus.RUNNING
-                    self.running.append(request)
-                    all_block_ids = request.cached_block_ids + request.allocated_block_ids
-                    output.scheduled_requests.append(
-                        ScheduledRequest(
-                            request=request,
-                            num_new_tokens=0,
-                            is_prefill=False,
-                            num_computed_tokens=request.num_computed_tokens,
-                            block_ids=list(all_block_ids),
-                        )
-                    )
+                    request.num_computed_tokens = max(0, request.num_prompt_tokens - 1)
+                    num_new = 1
+                else:
+                    remaining_waiting.append(request)
                     continue
-                remaining_waiting.append(request)
-                continue
 
             num_blocks_needed = self._blocks_needed(request, num_new)
             if not self._try_allocate_blocks(request, num_blocks_needed):
@@ -384,10 +368,6 @@ class Scheduler:
         if request.eos_token_id is not None and last_token == request.eos_token_id:
             return RequestStatus.FINISHED_EOS
         if len(request.output_token_ids) >= request.max_new_tokens:
-            return RequestStatus.FINISHED_LENGTH
-        # Defence in depth: stop once the full sequence (prompt + generated)
-        # reaches max_seq_len, regardless of max_new_tokens.
-        if request.num_tokens >= self.config.max_seq_len:
             return RequestStatus.FINISHED_LENGTH
         return None
 

@@ -106,11 +106,11 @@ jobs:
         # run step — they break HCCL, so multi-card files unset them there.
         run: |
           source /home/ci-runner/miniconda3/etc/profile.d/conda.sh
-          conda activate py310-lib
+          conda activate py310-serving
           python -m venv venv --system-site-packages
           cat > activate.sh <<'EOF'
           source /home/ci-runner/miniconda3/etc/profile.d/conda.sh
-          conda activate py310-lib
+          conda activate py310-serving
           source "$GITHUB_WORKSPACE/dist-checkout/venv/bin/activate"
           source /usr/local/Ascend/cann-9.0.0/set_env.sh
           export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"

@@ -328,13 +328,13 @@ class WorkerProcess:
                 ),
             )
 
-            if decode_result.logits.dim() > 1:
-                decode_logits = decode_result.logits[: len(scheduled)]
-            else:
-                decode_logits = decode_result.logits.unsqueeze(0)
             for i, sr in enumerate(scheduled):
                 request = sr.request
-                logits = decode_logits[i] if decode_logits.dim() > 1 else decode_logits
+                logits = (
+                    decode_result.logits[i]
+                    if decode_result.logits.dim() > 1
+                    else decode_result.logits
+                )
                 params = SamplingParams(
                     temperature=request.temperature,
                     top_p=request.top_p,
