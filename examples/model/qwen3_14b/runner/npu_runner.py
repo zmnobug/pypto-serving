@@ -75,11 +75,14 @@ class _CompiledKernels:
 
     prefill: _L3Callable
     decode: _L3Callable
+    greedy_sample: _L3Callable
+    token_embed: _L3Callable
     final_norm_weight: torch.Tensor
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
     padded_vocab: int
     padded_lm_head_weight: torch.Tensor
+    padded_embed_weight: torch.Tensor
     decode_weights: dict[str, torch.Tensor]
     prefill_hidden_buffer: torch.Tensor
     prefill_seq_lens_buffer: torch.Tensor
@@ -88,11 +91,16 @@ class _CompiledKernels:
     prefill_block_table_buffer: torch.Tensor
     prefill_slot_mapping_buffer: torch.Tensor
     prefill_logits_buffer: torch.Tensor
+    prefill_sampled_ids_buffer: torch.Tensor
+    prefill_next_hidden_buffer: torch.Tensor
     decode_hidden_buffer: torch.Tensor
     decode_seq_lens_buffer: torch.Tensor
     decode_block_table_buffer: torch.Tensor
     decode_slot_mapping_buffer: torch.Tensor
     decode_logits_buffer: torch.Tensor
+    decode_token_ids_buffer: torch.Tensor
+    decode_sampled_ids_buffer: torch.Tensor
+    decode_next_hidden_buffer: torch.Tensor
 
 
 @dataclass
@@ -113,6 +121,7 @@ class _DecodeInputs:
     """Active user rows prepared for decode."""
 
     actual_batch: int
+    token_ids: torch.Tensor
     hidden: torch.Tensor
     seq_lens: torch.Tensor
     block_table: torch.Tensor
@@ -124,6 +133,7 @@ class _DecodeKernelInputs:
     """Fixed-batch tensors passed to the fused decode kernel."""
 
     actual_batch: int
+    token_ids: torch.Tensor
     hidden: torch.Tensor
     seq_lens: torch.Tensor
     block_table: torch.Tensor
@@ -146,6 +156,7 @@ class _StaticKernelArgs:
     rope_cos: _StaticDeviceTensor
     rope_sin: _StaticDeviceTensor
     padded_lm_head_weight: _StaticDeviceTensor
+    padded_embed_weight: _StaticDeviceTensor
     decode_weights: dict[str, _StaticDeviceTensor]
 
 
@@ -239,6 +250,7 @@ class Qwen314BModelRunner(ModelRunner):
             compiled.rope_cos,
             compiled.rope_sin,
             compiled.padded_lm_head_weight,
+            compiled.padded_embed_weight,
             *compiled.decode_weights.values(),
             compiled.prefill_hidden_buffer,
             compiled.prefill_seq_lens_buffer,
@@ -247,11 +259,16 @@ class Qwen314BModelRunner(ModelRunner):
             compiled.prefill_block_table_buffer,
             compiled.prefill_slot_mapping_buffer,
             compiled.prefill_logits_buffer,
+            compiled.prefill_sampled_ids_buffer,
+            compiled.prefill_next_hidden_buffer,
             compiled.decode_hidden_buffer,
             compiled.decode_seq_lens_buffer,
             compiled.decode_block_table_buffer,
             compiled.decode_slot_mapping_buffer,
             compiled.decode_logits_buffer,
+            compiled.decode_token_ids_buffer,
+            compiled.decode_sampled_ids_buffer,
+            compiled.decode_next_hidden_buffer,
         )
 
     def _build_static_kernel_args(self) -> _StaticKernelArgs:
@@ -262,6 +279,7 @@ class Qwen314BModelRunner(ModelRunner):
             rope_cos=self._static_device_tensor(compiled.rope_cos),
             rope_sin=self._static_device_tensor(compiled.rope_sin),
             padded_lm_head_weight=self._static_device_tensor(compiled.padded_lm_head_weight),
+            padded_embed_weight=self._static_device_tensor(compiled.padded_embed_weight),
             decode_weights={
                 name: self._static_device_tensor(tensor)
                 for name, tensor in compiled.decode_weights.items()
@@ -294,16 +312,25 @@ class Qwen314BModelRunner(ModelRunner):
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             seq_len = int(batch.seq_lens[batch_idx].item())
             alloc.tokens_used = max(alloc.tokens_used, seq_len)
+        sampled_ids, next_hidden = self._maybe_run_sample_embed(
+            logits_padded,
+            compiled.prefill_sampled_ids_buffer,
+            compiled.prefill_next_hidden_buffer,
+            prefill_inputs.actual_batch,
+            allow=batch.allow_device_greedy_sampling,
+        )
         return PrefillResult(
             last_hidden=None,
             logits=logits_padded[: prefill_inputs.actual_batch, : model.config.vocab_size],
+            sampled_token_ids=sampled_ids,
+            next_hidden_states=next_hidden,
         )
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         """Run the fused all-layer PAGED ``decode_layer.decode_fwd`` and return logits.
 
         ``decode_fwd`` runs all NUM_LAYERS + the LM head in one dispatch over the
-        PAGED KV pool, addressing KV via ``block_table`` + ``slot_mapping`` — the
+        PAGED KV pool, addressing KV via ``block_table`` + ``slot_mapping``, the
         SAME device-resident KV pool prefill writes (``self._kv_caches``), so prompt
         KV is already in place with no bridge. KV is keyed by block_table page id, not by
         kernel row, so a request may occupy any row each step (no stable-slot shim).
@@ -337,11 +364,67 @@ class Qwen314BModelRunner(ModelRunner):
         )
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
+        sampled_ids, next_hidden = self._integrated_sample_result(
+            compiled.decode_sampled_ids_buffer,
+            # decode_fwd's next_hidden output is the embedding for sampled_ids_in
+            # used by this decode step. The newly sampled token is embedded at the
+            # start of the following decode_fwd call, so there is no next-step
+            # hidden row to return here.
+            None,
+            kernel_inputs.actual_batch,
+            allow=batch.allow_device_greedy_sampling,
+        )
         return DecodeResult(
             hidden_states=decode_inputs.hidden.float(),
             logits=kernel_inputs.logits[: kernel_inputs.actual_batch, : model.config.vocab_size].to(
                 decode_inputs.hidden.device
             ),
+            sampled_token_ids=sampled_ids,
+            next_hidden_states=next_hidden,
+        )
+
+    @staticmethod
+    def _integrated_sample_result(
+        sampled_ids_buffer: torch.Tensor,
+        next_hidden_buffer: torch.Tensor | None,
+        actual_batch: int,
+        *,
+        allow: bool,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Read device sampling output and optional precomputed next hidden rows."""
+        if not allow:
+            return None, None
+        next_hidden = (
+            next_hidden_buffer[:actual_batch].clone()
+            if next_hidden_buffer is not None
+            else None
+        )
+        return (
+            sampled_ids_buffer[:actual_batch, :1].clone(),
+            next_hidden,
+        )
+
+    def _maybe_run_sample_embed(
+        self,
+        logits: torch.Tensor,
+        sampled_ids_buffer: torch.Tensor,
+        next_hidden_buffer: torch.Tensor,
+        actual_batch: int,
+        *,
+        allow: bool,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Run device greedy sampling when the request is greedy."""
+        if not allow:
+            return None, None
+        compiled = self._compiled
+        self._run_distributed_program(
+            compiled.greedy_sample,
+            logits,
+            sampled_ids_buffer,
+        )
+        return (
+            sampled_ids_buffer[:actual_batch, :1].clone(),
+            None,
         )
 
     def _prefill_kernel_args(
@@ -372,10 +455,10 @@ class Qwen314BModelRunner(ModelRunner):
             k_cache,
             v_cache,
             weights["decode_wo"],
-            weights["decode_post_rms_weight"],
             weights["decode_w_gate"],
             weights["decode_w_up"],
             weights["decode_w_down"],
+            weights["decode_post_rms_weight"],
             static.final_norm_weight,
             static.padded_lm_head_weight,
             logits,
@@ -413,6 +496,10 @@ class Qwen314BModelRunner(ModelRunner):
             static.final_norm_weight,
             static.padded_lm_head_weight,
             inputs.logits,
+            static.padded_embed_weight,
+            inputs.token_ids,
+            self._compiled.decode_sampled_ids_buffer,
+            self._compiled.decode_next_hidden_buffer,
         )
 
     def _pad_decode_inputs(self, model: RuntimeModel, inputs: _DecodeInputs) -> _DecodeKernelInputs:
@@ -438,8 +525,24 @@ class Qwen314BModelRunner(ModelRunner):
         if actual_batch < kernel_batch:
             hidden[actual_batch:].copy_(inputs.hidden[0:1].expand(kernel_batch - actual_batch, -1))
 
+        token_ids = compiled.decode_token_ids_buffer
+        token_ids.zero_()
+        active_token_ids = inputs.token_ids.reshape(actual_batch, -1)
+        if active_token_ids.shape[1] != 1:
+            raise ValueError(
+                "decode token_ids must contain exactly one token per row, "
+                f"got shape {tuple(inputs.token_ids.shape)}"
+            )
+        width = 1
+        token_ids[:actual_batch, :width].copy_(active_token_ids[:, :width])
+        if actual_batch < kernel_batch:
+            token_ids[actual_batch:, :width].copy_(
+                active_token_ids[0:1, :width].expand(kernel_batch - actual_batch, width)
+            )
+
         return _DecodeKernelInputs(
             actual_batch=actual_batch,
+            token_ids=token_ids,
             hidden=hidden,
             seq_lens=self._copy_replicated_rows(
                 compiled.decode_seq_lens_buffer,
@@ -498,7 +601,12 @@ class Qwen314BModelRunner(ModelRunner):
         if worker is None:
             from pypto.runtime import DistributedWorker  # noqa: PLC0415
 
-            worker = DistributedWorker([self._compiled.prefill.compiled, self._compiled.decode.compiled])
+            worker = DistributedWorker([
+                self._compiled.prefill.compiled,
+                self._compiled.decode.compiled,
+                self._compiled.greedy_sample.compiled,
+                self._compiled.token_embed.compiled,
+            ])
             self._l3_worker = worker
         return worker
 
@@ -524,6 +632,7 @@ class Qwen314BModelRunner(ModelRunner):
             static.rope_cos,
             static.rope_sin,
             static.padded_lm_head_weight,
+            static.padded_embed_weight,
             *static.decode_weights.values(),
         ):
             self._coerce_l3_arg(worker, arg)
@@ -719,6 +828,7 @@ class Qwen314BModelRunner(ModelRunner):
 
         return _DecodeInputs(
             actual_batch=actual_batch,
+            token_ids=batch.token_ids.to(torch.int32).cpu(),
             hidden=hidden,
             seq_lens=seq_lens,
             block_table=block_table,
