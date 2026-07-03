@@ -528,7 +528,12 @@ class Qwen314BModelRunner(ModelRunner):
         token_ids = compiled.decode_token_ids_buffer
         token_ids.zero_()
         active_token_ids = inputs.token_ids.reshape(actual_batch, -1)
-        width = min(active_token_ids.shape[1], token_ids.shape[1])
+        if active_token_ids.shape[1] != 1:
+            raise ValueError(
+                "decode token_ids must contain exactly one token per row, "
+                f"got shape {tuple(inputs.token_ids.shape)}"
+            )
+        width = 1
         token_ids[:actual_batch, :width].copy_(active_token_ids[:, :width])
         if actual_batch < kernel_batch:
             token_ids[actual_batch:, :width].copy_(

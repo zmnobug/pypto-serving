@@ -7,11 +7,10 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-import pytest
-import importlib
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 from simpler.task_interface import DataType
 
@@ -32,7 +31,6 @@ from python.core.types import (
 )
 from python.core.scheduler import Request, ScheduledRequest
 from python.core.serving_worker import WorkerProcess
-from examples.model.qwen3_14b.runner.cpu_executor import CpuModelExecutor
 from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
 from examples.model.qwen3_14b.runner.npu_runner import Qwen314BModelRunner as ModelRunner
 from examples.model.qwen3_14b.runner.npu_runner import _CompiledKernels
@@ -41,6 +39,11 @@ from examples.model.qwen3_14b.runner.npu_runner import _add_run_timing_args
 from examples.model.qwen3_14b.runner.npu_runner import _kernel_trace_name
 from examples.model.qwen3_14b.runner.npu_runner import _run_timing_us
 from python.runtime.worker import WorkerTensor
+
+
+ROOT = Path(__file__).resolve().parents[1]
+QWEN3_DISPATCH = ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "qwen3_l3_dispatch.py"
+QWEN3_KERNEL_DIR = ROOT / "pypto-lib" / "models" / "qwen3" / "14b"
 
 
 class _Tokenizer:
@@ -304,6 +307,24 @@ def test_decode_inputs_use_actual_user_batch_without_padding_lanes():
     assert prepared.block_table.shape == (2,)
     assert prepared.block_table[0].item() == alloc.page_ids[0]
     assert prepared.slot_mapping.tolist() == [manager.slot_mapping_for_request(alloc)]
+
+
+def test_decode_kernel_inputs_reject_multi_token_rows():
+    model = _model(max_batch_size=2)
+    runner = ModelRunner(compiled=_compiled_kernels(model))
+
+    with pytest.raises(ValueError, match="exactly one token per row"):
+        runner._pad_decode_inputs(
+            model,
+            SimpleNamespace(
+                actual_batch=1,
+                token_ids=torch.tensor([[3, 4]], dtype=torch.int32),
+                hidden=torch.ones(1, model.config.hidden_size, dtype=torch.bfloat16),
+                seq_lens=torch.tensor([1], dtype=torch.int32),
+                block_table=torch.zeros(2, dtype=torch.int32),
+                slot_mapping=torch.zeros(1, dtype=torch.int32),
+            ),
+        )
 
 
 def test_engine_generate_batch_uses_batched_executor_results():
@@ -592,10 +613,7 @@ def test_kernel_profile_helpers_emit_kernel_name_and_runtime_timing():
 
 
 def test_decode_host_inlines_embedding_and_sampling_into_decode_fwd():
-    qwen3_l3_dispatch = importlib.import_module(
-        "examples.model.qwen3_14b.runner.qwen3_l3_dispatch"
-    )
-    module_source = Path(qwen3_l3_dispatch.__file__).read_text(encoding="utf-8")
+    module_source = QWEN3_DISPATCH.read_text(encoding="utf-8")
     start = module_source.index("def qwen3_decode_host")
     end = module_source.index("def qwen3_greedy_sample_host")
     source = module_source[start:end]
@@ -604,19 +622,15 @@ def test_decode_host_inlines_embedding_and_sampling_into_decode_fwd():
     assert "token_embed_fwd(" not in source
     assert "greedy_sample_fwd(" not in source
 
-    kernel_dir = Path(qwen3_l3_dispatch.__file__).parents[4] / "pypto-lib" / "models" / "qwen3" / "14b"
-    if not kernel_dir.is_dir():
+    if not QWEN3_KERNEL_DIR.is_dir():
         pytest.skip("pypto-lib submodule is not checked out")
-    decode_source = (kernel_dir / "decode_layer.py").read_text(encoding="utf-8")
+    decode_source = (QWEN3_KERNEL_DIR / "decode_layer.py").read_text(encoding="utf-8")
     assert 'name_hint="token_embed"' in decode_source
     assert 'name_hint="greedy_sample"' in decode_source
 
 
 def test_prefill_host_keeps_sampling_as_standalone_kernel():
-    qwen3_l3_dispatch = importlib.import_module(
-        "examples.model.qwen3_14b.runner.qwen3_l3_dispatch"
-    )
-    module_source = Path(qwen3_l3_dispatch.__file__).read_text(encoding="utf-8")
+    module_source = QWEN3_DISPATCH.read_text(encoding="utf-8")
     start = module_source.index("def qwen3_prefill_host")
     end = module_source.index("def qwen3_decode_host")
     source = module_source[start:end]
@@ -625,10 +639,9 @@ def test_prefill_host_keeps_sampling_as_standalone_kernel():
     assert "greedy_sample_fwd(" not in source
     assert "token_embed_fwd(" not in source
 
-    kernel_dir = Path(qwen3_l3_dispatch.__file__).parents[4] / "pypto-lib" / "models" / "qwen3" / "14b"
-    if not kernel_dir.is_dir():
+    if not QWEN3_KERNEL_DIR.is_dir():
         pytest.skip("pypto-lib submodule is not checked out")
-    prefill_source = (kernel_dir / "prefill_fwd.py").read_text(encoding="utf-8")
+    prefill_source = (QWEN3_KERNEL_DIR / "prefill_fwd.py").read_text(encoding="utf-8")
     assert 'name_hint="greedy_sample"' not in prefill_source
     assert 'name_hint="token_embed"' not in prefill_source
 

@@ -18,6 +18,11 @@ QWEN = ROOT / "pypto-lib" / "models" / "qwen3" / "14b"
 REAL_VOCAB = 151936
 PADDED_VOCAB = 152064
 
+pytestmark = pytest.mark.skipif(
+    not QWEN.is_dir(),
+    reason="pypto-lib submodule is not checked out",
+)
+
 
 def _source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
