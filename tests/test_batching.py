@@ -547,7 +547,7 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         compiled=compiled,
     )
     monkeypatch.setattr(runner, "_shared_l3_worker", lambda: _FakeWorker())
-    monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime: 1)
+    monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime, device_id=0: 1)
     monkeypatch.setattr(runner, "_print_memory_breakdown", lambda *a, **kw: None)
     runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
     monkeypatch.setattr(runner, "_static_device_tensor", lambda tensor: tensor)
