@@ -22,7 +22,9 @@ profile_out/
 .vscode/
 .idea/
 .codex/
-.agents/
+.agents/*
+!.agents/skills/
+!.agents/skills/**
 
 # OS files
 .DS_Store
