@@ -1648,3 +1648,1301 @@ class DeepSeekV4ModelRunner(ModelRunner):
         }
         return name not in runtime_names
 
+    def _ensure_decode_buffers(self, hidden_size: int) -> _DeepSeekV4DecodeSharedBuffers:
+        buffers = self._decode_buffers
+        if buffers is None:
+            self._ensure_shared_host_allocation_before_worker("decode inputs")
+            layout = self._compiled.layout
+            ranks = layout.ranks
+            batch = layout.decode_batch
+            tokens = layout.decode_tokens
+            buffers = _DeepSeekV4DecodeSharedBuffers(
+                x_hc_a=self._shared_empty(
+                    (ranks, tokens, layout.hc_mult, int(hidden_size)),
+                    torch.bfloat16,
+                    name="decode_x_hc",
+                ),
+                x_hc_b=self._shared_empty(
+                    (ranks, tokens, layout.hc_mult, int(hidden_size)),
+                    torch.bfloat16,
+                    name="decode_x_hc_next",
+                ),
+                x_out=self._shared_empty(
+                    (ranks, tokens, int(hidden_size)),
+                    torch.bfloat16,
+                    name="decode_x_out",
+                ),
+                tensors={
+                    "input_ids": self._shared_empty((ranks, tokens), torch.long, name="decode_input_ids"),
+                    "position_ids": self._shared_empty((ranks, tokens), torch.int32, name="decode_position_ids"),
+                    "kv_seq_lens": self._shared_empty((ranks, batch), torch.int32, name="decode_kv_seq_lens"),
+                    "block_table": self._shared_empty(
+                        (ranks, batch, layout.ori_max_blocks),
+                        torch.int32,
+                        name="decode_block_table",
+                    ),
+                    "ori_slot_mapping": self._shared_empty(
+                        (ranks, tokens),
+                        torch.long,
+                        name="decode_ori_slot_mapping",
+                    ),
+                    "cmp_block_table": self._shared_empty(
+                        (ranks, batch, layout.cmp_max_blocks),
+                        torch.int32,
+                        name="decode_cmp_block_table",
+                    ),
+                    "idx_block_table": self._shared_empty(
+                        (ranks, batch, layout.idx_max_blocks),
+                        torch.int32,
+                        name="decode_idx_block_table",
+                    ),
+                    "hca_compress_state_block_table": self._shared_empty(
+                        (ranks, batch, layout.hca_state_max_blocks),
+                        torch.int32,
+                        name="decode_hca_compress_state_block_table",
+                    ),
+                    "csa_compress_state_block_table": self._shared_empty(
+                        (ranks, batch, layout.csa_state_max_blocks),
+                        torch.int32,
+                        name="decode_csa_compress_state_block_table",
+                    ),
+                    "csa_inner_compress_state_block_table": self._shared_empty(
+                        (ranks, batch, layout.csa_inner_state_max_blocks),
+                        torch.int32,
+                        name="decode_csa_inner_compress_state_block_table",
+                    ),
+                    "hca_cmp_slot_mapping": self._shared_empty(
+                        (ranks, tokens),
+                        torch.long,
+                        name="decode_hca_cmp_slot_mapping",
+                    ),
+                    "hca_state_slot_mapping": self._shared_empty(
+                        (ranks, tokens),
+                        torch.long,
+                        name="decode_hca_state_slot_mapping",
+                    ),
+                    "csa_cmp_slot_mapping": self._shared_empty(
+                        (ranks, tokens),
+                        torch.long,
+                        name="decode_csa_cmp_slot_mapping",
+                    ),
+                    "csa_idx_slot_mapping": self._shared_empty(
+                        (ranks, tokens),
+                        torch.long,
+                        name="decode_csa_idx_slot_mapping",
+                    ),
+                    "csa_state_slot_mapping": self._shared_empty(
+                        (ranks, tokens),
+                        torch.long,
+                        name="decode_csa_state_slot_mapping",
+                    ),
+                    "csa_inner_state_slot_mapping": self._shared_empty(
+                        (ranks, tokens),
+                        torch.long,
+                        name="decode_csa_inner_state_slot_mapping",
+                    ),
+                },
+            )
+            self._decode_buffers = buffers
+        return buffers
+
+    def _stage_decode_inputs(self, inputs: DeepSeekV4PreparedDecodeInputs) -> DeepSeekV4PreparedDecodeInputs:
+        buffers = self._ensure_decode_buffers(inputs.x_hc.shape[-1])
+        self._copy_shared(buffers.x_hc_a, inputs.x_hc, name="decode_x_hc")
+        staged_values: dict[str, torch.Tensor] = {}
+        for name in _DECODE_INPUT_TENSOR_FIELDS:
+            dst = buffers.tensors[name]
+            self._copy_shared(dst, getattr(inputs, name), name=f"decode_{name}")
+            staged_values[name] = dst
+        return replace(inputs, x_hc=buffers.x_hc_a, **staged_values)
+
+    def _ensure_prefill_fwd_buffers(self, hidden_size: int) -> _DeepSeekV4PrefillFwdSharedBuffers:
+        """Allocate the layer-stacked shared buffers for the packed prefill dispatch."""
+        buffers = self._prefill_fwd_buffers
+        if buffers is not None:
+            return buffers
+        self._ensure_shared_host_allocation_before_worker("prefill_fwd buffers")
+        layout = self._compiled.layout
+        ranks = layout.ranks
+        seq = layout.prefill_seq
+        hidden = int(hidden_size)
+        fwd = DEEPSEEK_V4_FWD_NUM_LAYERS
+        csa = DEEPSEEK_V4_CSA_NUM_LAYERS
+        hca = DEEPSEEK_V4_HCA_NUM_LAYERS
+        rope_dim = self._compiled.freqs_cos.shape[-1] if self._compiled.freqs_cos is not None else 0
+        max_seq_len = self._compiled.freqs_cos.shape[0] if self._compiled.freqs_cos is not None else 0
+
+        def shared(shape, dtype, name):
+            return self._shared_empty(shape, dtype, name=name)
+
+        tensors: dict[str, torch.Tensor] = {
+            # HCA-group prefill compressor state (x20).
+            "hca_cmp_kv_state": shared(
+                (ranks, hca * layout.prefill_hca_state_max_blocks, layout.c128_state_block_size, DEEPSEEK_V4_HCA_MAIN_OUT_DIM),
+                torch.float32,
+                "prefill_fwd_hca_cmp_kv_state",
+            ),
+            "hca_cmp_score_state": shared(
+                (ranks, hca * layout.prefill_hca_state_max_blocks, layout.c128_state_block_size, DEEPSEEK_V4_HCA_MAIN_OUT_DIM),
+                torch.float32,
+                "prefill_fwd_hca_cmp_score_state",
+            ),
+            "hca_compress_state_block_table": shared(
+                (ranks, layout.prefill_hca_state_max_blocks), torch.int32, "prefill_fwd_hca_state_block_table"
+            ),
+            # CSA-group prefill compressor state (x21).
+            "csa_cmp_kv_state": shared(
+                (ranks, csa * layout.prefill_csa_state_max_blocks, layout.c4_state_block_size, DEEPSEEK_V4_CSA_MAIN_OUT_DIM),
+                torch.float32,
+                "prefill_fwd_csa_cmp_kv_state",
+            ),
+            "csa_cmp_score_state": shared(
+                (ranks, csa * layout.prefill_csa_state_max_blocks, layout.c4_state_block_size, DEEPSEEK_V4_CSA_MAIN_OUT_DIM),
+                torch.float32,
+                "prefill_fwd_csa_cmp_score_state",
+            ),
+            "csa_compress_state_block_table": shared(
+                (ranks, layout.prefill_csa_state_max_blocks), torch.int32, "prefill_fwd_csa_state_block_table"
+            ),
+            "csa_inner_kv_state": shared(
+                (ranks, csa * layout.prefill_csa_inner_state_max_blocks, layout.c4_state_block_size, DEEPSEEK_V4_CSA_INNER_OUT_DIM),
+                torch.float32,
+                "prefill_fwd_csa_inner_kv_state",
+            ),
+            "csa_inner_score_state": shared(
+                (ranks, csa * layout.prefill_csa_inner_state_max_blocks, layout.c4_state_block_size, DEEPSEEK_V4_CSA_INNER_OUT_DIM),
+                torch.float32,
+                "prefill_fwd_csa_inner_score_state",
+            ),
+            "csa_inner_compress_state_block_table": shared(
+                (ranks, layout.prefill_csa_inner_state_max_blocks), torch.int32, "prefill_fwd_csa_inner_state_block_table"
+            ),
+            # Work caches: kv_cache/cmp_kv stack x43, idx_kv_cache stacks x21 (CSA),
+            # all flattened 5-D (the kernel reshapes the fused layer x block axis).
+            "kv_cache": shared(
+                (ranks, fwd * layout.ori_max_blocks, layout.block_size, 1, DEEPSEEK_V4_HEAD_DIM),
+                torch.bfloat16,
+                "prefill_fwd_kv_cache",
+            ),
+            "cmp_kv": shared(
+                (ranks, fwd * layout.prefill_cmp_block_num, layout.block_size, 1, DEEPSEEK_V4_HEAD_DIM),
+                torch.bfloat16,
+                "prefill_fwd_cmp_kv",
+            ),
+            "idx_kv_cache": shared(
+                (ranks, csa * layout.prefill_idx_block_num, layout.block_size, 1, DEEPSEEK_V4_IDX_HEAD_DIM),
+                torch.bfloat16,
+                "prefill_fwd_idx_kv_cache",
+            ),
+            # Shared single per-rank metadata (the kernel passes each whole tensor
+            # to every layer).
+            "ori_block_table": shared((ranks, layout.ori_max_blocks), torch.int32, "prefill_fwd_ori_block_table"),
+            "ori_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_ori_slot_mapping"),
+            "cmp_block_table": shared((ranks, layout.prefill_cmp_max_blocks), torch.int32, "prefill_fwd_cmp_block_table"),
+            "cmp_sparse_indices": shared((ranks, seq, layout.prefill_sparse_topk), torch.int32, "prefill_fwd_cmp_sparse_indices"),
+            "cmp_sparse_lens": shared((ranks, seq), torch.int32, "prefill_fwd_cmp_sparse_lens"),
+            "idx_block_table": shared((ranks, layout.prefill_idx_max_blocks), torch.int32, "prefill_fwd_idx_block_table"),
+            "position_ids": shared((ranks, seq), torch.int32, "prefill_fwd_position_ids"),
+            "hca_cmp_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_hca_cmp_slot_mapping"),
+            "hca_state_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_hca_state_slot_mapping"),
+            "csa_cmp_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_csa_cmp_slot_mapping"),
+            "csa_idx_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_csa_idx_slot_mapping"),
+            "csa_state_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_csa_state_slot_mapping"),
+            "csa_inner_state_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_csa_inner_state_slot_mapping"),
+            "input_ids": shared((ranks, seq), torch.long, "prefill_fwd_input_ids"),
+        }
+        buffers = _DeepSeekV4PrefillFwdSharedBuffers(
+            x_hc=shared((ranks, seq, layout.hc_mult, hidden), torch.bfloat16, "prefill_fwd_x_hc"),
+            freqs_cos=shared((ranks, max_seq_len, rope_dim), torch.bfloat16, "prefill_fwd_freqs_cos"),
+            freqs_sin=shared((ranks, max_seq_len, rope_dim), torch.bfloat16, "prefill_fwd_freqs_sin"),
+            tensors=tensors,
+        )
+        self._prefill_fwd_buffers = buffers
+        return buffers
+
+    def _require_prefill_fwd_buffers(self) -> _DeepSeekV4PrefillFwdSharedBuffers:
+        if self._prefill_fwd_buffers is None:
+            raise RuntimeError("DeepSeekV4 packed prefill shared buffers were not staged")
+        return self._prefill_fwd_buffers
+
+    def _stage_prefill_fwd_inputs(self, inputs: DeepSeekV4PreparedPrefillInputs) -> None:
+        """Copy one prefill chunk's metadata/state into the packed buffers.
+
+        The per-request metadata (slot mappings, block tables, sparse tables,
+        position/input ids), the RoPE tables and the compressor-state block tables
+        are shared single per-rank copies (the kernel slices them per layer
+        internally). The compressor-state and work caches start zeroed and are
+        produced by the kernel.
+        """
+        buffers = self._require_prefill_fwd_buffers()
+
+        # x_hc / output collapse weights.
+        self._copy_shared(buffers.x_hc, inputs.x_hc, name="prefill_fwd_x_hc")
+        self._copy_shared(
+            buffers.freqs_cos,
+            self._static_freqs_cos_table(),
+            name="prefill_fwd_freqs_cos",
+        )
+        self._copy_shared(
+            buffers.freqs_sin,
+            self._static_freqs_sin_table(),
+            name="prefill_fwd_freqs_sin",
+        )
+
+        # Shared single per-rank metadata (the kernel slices it per layer).
+        shared_metadata = {
+            "ori_block_table": inputs.ori_block_table,
+            "ori_slot_mapping": inputs.ori_slot_mapping,
+            "cmp_block_table": inputs.cmp_block_table,
+            "idx_block_table": inputs.idx_block_table,
+            "position_ids": inputs.position_ids,
+            "hca_cmp_slot_mapping": inputs.hca_cmp_slot_mapping,
+            "hca_state_slot_mapping": inputs.hca_state_slot_mapping,
+            "csa_cmp_slot_mapping": inputs.csa_cmp_slot_mapping,
+            "csa_idx_slot_mapping": inputs.csa_idx_slot_mapping,
+            "csa_state_slot_mapping": inputs.csa_state_slot_mapping,
+            "csa_inner_state_slot_mapping": inputs.csa_inner_state_slot_mapping,
+            "input_ids": inputs.input_ids,
+            "hca_compress_state_block_table": inputs.hca_compress_state_block_table,
+            "csa_compress_state_block_table": inputs.csa_compress_state_block_table,
+            "csa_inner_compress_state_block_table": inputs.csa_inner_compress_state_block_table,
+        }
+        for name, tensor in shared_metadata.items():
+            self._copy_shared(buffers.tensors[name], tensor, name=f"prefill_fwd_{name}")
+
+        # Sparse tables are now a single shared copy used by every layer. The kernel
+        # consumes the sliding-window index set (the ratio-0 view), so pass that copy.
+        sparse_indices, sparse_lens = inputs.sparse_inputs_for_ratio(0)
+        self._copy_shared(
+            buffers.tensors["cmp_sparse_indices"],
+            sparse_indices,
+            name="prefill_fwd_cmp_sparse_indices",
+        )
+        self._copy_shared(
+            buffers.tensors["cmp_sparse_lens"],
+            sparse_lens,
+            name="prefill_fwd_cmp_sparse_lens",
+        )
+
+        # Compressor-state and work caches start zeroed; the kernel populates them.
+        for name in (
+            "hca_cmp_kv_state",
+            "hca_cmp_score_state",
+            "csa_cmp_kv_state",
+            "csa_cmp_score_state",
+            "csa_inner_kv_state",
+            "csa_inner_score_state",
+            "kv_cache",
+            "cmp_kv",
+            "idx_kv_cache",
+        ):
+            buffers.tensors[name].zero_()
+
+    def _static_freqs_cos_table(self) -> torch.Tensor:
+        if self._compiled.freqs_cos is None:
+            raise RuntimeError("DeepSeekV4 RoPE cosine table is not initialized")
+        return self._rank_stack(self._compiled.freqs_cos)
+
+    def _static_freqs_sin_table(self) -> torch.Tensor:
+        if self._compiled.freqs_sin is None:
+            raise RuntimeError("DeepSeekV4 RoPE sine table is not initialized")
+        return self._rank_stack(self._compiled.freqs_sin)
+
+    def _snapshot_prefill_fwd_caches(self, slot: int) -> None:
+        """Capture per-layer cache slices from the packed prefill Out caches."""
+        buffers = self._require_prefill_fwd_buffers()
+        csa_order = 0
+        hca_order = 0
+        layout = self._compiled.layout
+        for layer in self._compiled.layer_plan:
+            fwd = int(layer.layer_id)
+            # The flattened 5-D work caches fuse the layer axis with the per-layer
+            # block axis; slice the contiguous per-layer block span back out.
+            snapshot: dict[str, torch.Tensor] = {
+                "kv_cache": self._slice_layer_state(buffers.tensors["kv_cache"], fwd, layout.ori_max_blocks),
+                "cmp_kv": self._slice_layer_slot_state(
+                    buffers.tensors["cmp_kv"],
+                    fwd,
+                    layout.prefill_cmp_block_num,
+                    slot,
+                    layout.prefill_cmp_max_blocks,
+                ),
+            }
+            if layer.compress_ratio == 4:
+                # idx_kv_cache stacks across the CSA layers (x21), so index by csa_order.
+                snapshot["idx_kv_cache"] = self._slice_layer_slot_state(
+                    buffers.tensors["idx_kv_cache"],
+                    csa_order,
+                    layout.prefill_idx_block_num,
+                    slot,
+                    layout.prefill_idx_max_blocks,
+                )
+                snapshot["csa_cmp_kv_state"] = self._slice_layer_state(
+                    buffers.tensors["csa_cmp_kv_state"], csa_order, self._compiled.layout.prefill_csa_state_max_blocks
+                )
+                snapshot["csa_cmp_score_state"] = self._slice_layer_state(
+                    buffers.tensors["csa_cmp_score_state"], csa_order, self._compiled.layout.prefill_csa_state_max_blocks
+                )
+                snapshot["csa_inner_kv_state"] = self._slice_layer_state(
+                    buffers.tensors["csa_inner_kv_state"], csa_order, self._compiled.layout.prefill_csa_inner_state_max_blocks
+                )
+                snapshot["csa_inner_score_state"] = self._slice_layer_state(
+                    buffers.tensors["csa_inner_score_state"], csa_order, self._compiled.layout.prefill_csa_inner_state_max_blocks
+                )
+                csa_order += 1
+            elif layer.compress_ratio == 128:
+                snapshot["hca_cmp_kv_state"] = self._slice_layer_state(
+                    buffers.tensors["hca_cmp_kv_state"], hca_order, self._compiled.layout.prefill_hca_state_max_blocks
+                )
+                snapshot["hca_cmp_score_state"] = self._slice_layer_state(
+                    buffers.tensors["hca_cmp_score_state"], hca_order, self._compiled.layout.prefill_hca_state_max_blocks
+                )
+                hca_order += 1
+            self._prefill_cache_snapshots[layer.layer_id] = DeepSeekV4LayerCacheSnapshot(snapshot)
+
+    @staticmethod
+    def _slice_layer_state(stacked: torch.Tensor, order: int, blocks_per_layer: int) -> torch.Tensor:
+        start = int(order) * int(blocks_per_layer)
+        return stacked[:, start : start + int(blocks_per_layer)].detach().cpu().contiguous().clone()
+
+    @staticmethod
+    def _slice_layer_slot_state(
+        stacked: torch.Tensor,
+        order: int,
+        blocks_per_layer: int,
+        slot: int,
+        blocks_per_slot: int,
+    ) -> torch.Tensor:
+        start = int(order) * int(blocks_per_layer)
+        layer = stacked[:, start : start + int(blocks_per_layer)]
+        slot_slice = DeepSeekV4ModelRunner._slot_block_slice(int(slot), int(blocks_per_slot))
+        return layer[:, slot_slice].detach().cpu().contiguous().clone()
+
+    def _stage_stacked_weights(self, weights: DeepSeekV4StackedLayerWeights) -> DeepSeekV4StackedLayerWeights:
+        """Copy the layer-stacked decode_fwd weights into shared buffers once."""
+        buffers = self._stacked_weight_buffers
+        if buffers is None:
+            self._ensure_shared_host_allocation_before_worker("stacked layer weights")
+            buffers = {
+                name: self._new_shared_like(tensor, name=f"stacked_weight[{name}]")
+                for name, tensor in weights.tensors.items()
+            }
+            self._stacked_weight_buffers = buffers
+
+        missing = sorted(set(weights.tensors) - set(buffers))
+        if missing:
+            raise KeyError(f"DeepSeekV4 shared stacked-weight buffers are missing: {', '.join(missing)}")
+
+        for name, tensor in weights.tensors.items():
+            self._copy_shared(buffers[name], tensor, name=f"stacked_weight[{name}]")
+        return DeepSeekV4StackedLayerWeights(tensors=buffers)
+
+    def _hc_head_tensors(self) -> dict[str, torch.Tensor]:
+        """Return rank-replicated hc_head weights for the decode_fwd output collapse."""
+        buffers = self._hc_head_buffers
+        if buffers is not None:
+            return buffers
+        self._ensure_shared_host_allocation_before_worker("hc_head weights")
+        global_weights = self.load_packed_global_weights()
+        ranks = self._compiled.layout.ranks
+        # The kernel hc_head_fn is [HC_MULT, HC_DIM]; the checkpoint stores it as
+        # [HC_MULT, hidden*HC_MULT] (== [HC_MULT, HC_DIM]). Scale/base are scalars
+        # per HC_MULT row, rank-replicated.
+        hc_head_fn = global_weights.hc_head_fn.to(torch.float32).contiguous().cpu()
+        hc_head_scale = global_weights.hc_head_scale.to(torch.float32).contiguous().cpu()
+        hc_head_base = global_weights.hc_head_base.to(torch.float32).contiguous().cpu()
+        buffers = {
+            "hc_head_fn": self._static_device_tensor(self._rank_stack(hc_head_fn)),
+            "hc_head_scale": self._static_device_tensor(self._rank_stack(hc_head_scale)),
+            "hc_head_base": self._static_device_tensor(self._rank_stack(hc_head_base)),
+        }
+        self._hc_head_buffers = buffers
+        return buffers
+
+    def _require_decode_buffers(self) -> _DeepSeekV4DecodeSharedBuffers:
+        if self._decode_buffers is None:
+            raise RuntimeError("DeepSeekV4 decode shared buffers were not staged")
+        return self._decode_buffers
+
+    def _require_decode_output_buffer(self, hidden_size: int) -> torch.Tensor:
+        return self._ensure_decode_buffers(int(hidden_size)).x_out
+
+    def _require_decode_logits_buffer(self, vocab_size: int) -> torch.Tensor:
+        """Return a legacy shared ``[ranks, decode_tokens, vocab]`` logits buffer."""
+        layout = self._compiled.layout
+        logits_shape = (layout.ranks, layout.decode_tokens, int(vocab_size))
+        if self._decode_logits_buffer is None:
+            self._ensure_shared_host_allocation_before_worker("decode_logits")
+            self._decode_logits_buffer = self._shared_empty(logits_shape, torch.float32, name="decode_logits")
+        return self._decode_logits_buffer
+
+    def _require_prefill_output_buffer(self, hidden_size: int) -> torch.Tensor:
+        """Return the shared ``[ranks, prefill_seq, hidden]`` prefill hidden output."""
+        layout = self._compiled.layout
+        output_shape = (layout.ranks, layout.prefill_seq, int(hidden_size))
+        if self._prefill_output_buffer is None:
+            self._ensure_shared_host_allocation_before_worker("prefill_output")
+            self._prefill_output_buffer = self._shared_empty(output_shape, torch.bfloat16, name="prefill_output")
+        return self._prefill_output_buffer
+
+    def _static_final_norm_weight_tensor(self) -> torch.Tensor:
+        """Return the worker-resident per-rank final RMSNorm weight ``[ranks, D]``.
+
+        Reuses the same ``final_norm_weight`` already loaded for the host-side
+        ``_final_norm`` collapse, rank-replicated and cast to bf16 for the kernel.
+        """
+        if self._static_final_norm_weight is None:
+            global_weights = self.load_packed_global_weights()
+            self._ensure_shared_host_allocation_before_worker("final_norm_w")
+            final_norm_w = global_weights.final_norm_weight.to(torch.bfloat16).contiguous().cpu()
+            self._static_final_norm_weight = self._static_device_tensor(self._rank_stack(final_norm_w))
+        return self._static_final_norm_weight
+
+    def _static_freqs_cos_tensor(self) -> torch.Tensor:
+        if self._static_freqs_cos is None:
+            if self._compiled.freqs_cos is None:
+                raise RuntimeError("DeepSeekV4 RoPE cosine table is not initialized")
+            self._ensure_shared_host_allocation_before_worker("freqs_cos")
+            self._static_freqs_cos = self._static_device_tensor(self._rank_stack(self._compiled.freqs_cos))
+        return self._static_freqs_cos
+
+    def _static_freqs_sin_tensor(self) -> torch.Tensor:
+        if self._static_freqs_sin is None:
+            if self._compiled.freqs_sin is None:
+                raise RuntimeError("DeepSeekV4 RoPE sine table is not initialized")
+            self._ensure_shared_host_allocation_before_worker("freqs_sin")
+            self._static_freqs_sin = self._static_device_tensor(self._rank_stack(self._compiled.freqs_sin))
+        return self._static_freqs_sin
+
+    def _require_prefill_cache_snapshots(self) -> None:
+        missing = [
+            str(layer.layer_id)
+            for layer in self._compiled.layer_plan
+            if layer.layer_id not in self._prefill_cache_snapshots
+        ]
+        if missing:
+            raise RuntimeError(
+                "DeepSeekV4 decode requires prefill cache snapshots before decode; "
+                "missing layers: " + ", ".join(missing)
+            )
+
+    def _seed_decode_work_cache(self, kernel_slots: Sequence[int]) -> None:
+        """Seed uninitialized decode cache slots from every prefill snapshot.
+
+        The packed ``l3_decode_fwd`` kernel reads all 43 layers' KV/compress state
+        in one call, and then mutates those same buffers with generated-token
+        state. Seed each slot from the prefill snapshot once, then preserve the
+        decode-produced state across later decode steps. Each layer's blocks live
+        at a stacked offset on dim 1: FWD layers use the layer id (0..42),
+        CSA-group state uses the CSA order index (0..20), and HCA-group state uses
+        the HCA order index (0..19). Within a layer the slot offset is
+        ``layer_offset * decode_batch + slot``.
+        """
+        slots_to_seed = tuple(
+            int(slot)
+            for slot in kernel_slots
+            if int(slot) not in self._decode_cache_seeded_slots
+        )
+        if not slots_to_seed:
+            return
+
+        cache = self._require_decode_work_cache()
+        layout = self._compiled.layout
+        batch = layout.decode_batch
+
+        csa_order = 0
+        hca_order = 0
+        for layer in self._compiled.layer_plan:
+            snapshot = self._prefill_cache_snapshots.get(layer.layer_id)
+            if snapshot is None:
+                raise RuntimeError(f"DeepSeekV4 decode cache snapshot missing for layer {layer.layer_id}")
+            tensors = snapshot.tensors
+            fwd_offset = int(layer.layer_id)
+            for slot in slots_to_seed:
+                self._copy_snapshot_blocks_to_work(
+                    tensors["kv_cache"],
+                    cache.kv_cache,
+                    fwd_offset * batch + int(slot),
+                    layout.ori_max_blocks,
+                )
+                self._copy_snapshot_blocks_to_work(
+                    tensors["cmp_kv"],
+                    cache.cmp_kv,
+                    fwd_offset * batch + int(slot),
+                    layout.cmp_max_blocks,
+                )
+            if layer.compress_ratio == 4:
+                for slot in slots_to_seed:
+                    self._copy_snapshot_blocks_to_work(
+                        tensors["idx_kv_cache"],
+                        cache.idx_kv_cache,
+                        csa_order * batch + int(slot),
+                        layout.idx_max_blocks,
+                    )
+                    self._copy_split_state_to_work(
+                        tensors["csa_cmp_kv_state"],
+                        tensors["csa_cmp_score_state"],
+                        cache.csa_compress_state,
+                        csa_order * batch + int(slot),
+                        layout.csa_state_max_blocks,
+                        DEEPSEEK_V4_CSA_MAIN_OUT_DIM,
+                    )
+                    self._copy_split_state_to_work(
+                        tensors["csa_inner_kv_state"],
+                        tensors["csa_inner_score_state"],
+                        cache.csa_inner_compress_state,
+                        csa_order * batch + int(slot),
+                        layout.csa_inner_state_max_blocks,
+                        DEEPSEEK_V4_CSA_INNER_OUT_DIM,
+                )
+                csa_order += 1
+            elif layer.compress_ratio == 128:
+                for slot in slots_to_seed:
+                    self._copy_split_state_to_work(
+                        tensors["hca_cmp_kv_state"],
+                        tensors["hca_cmp_score_state"],
+                        cache.hca_compress_state,
+                        hca_order * batch + int(slot),
+                        layout.hca_state_max_blocks,
+                        DEEPSEEK_V4_HCA_MAIN_OUT_DIM,
+                    )
+                hca_order += 1
+
+        if csa_order != DEEPSEEK_V4_CSA_NUM_LAYERS:
+            raise RuntimeError(
+                f"DeepSeekV4 decode expected {DEEPSEEK_V4_CSA_NUM_LAYERS} CSA layers, found {csa_order}"
+            )
+        if hca_order != DEEPSEEK_V4_HCA_NUM_LAYERS:
+            raise RuntimeError(
+                f"DeepSeekV4 decode expected {DEEPSEEK_V4_HCA_NUM_LAYERS} HCA layers, found {hca_order}"
+            )
+        self._decode_cache_seeded_slots.update(slots_to_seed)
+
+    @staticmethod
+    def _slot_block_slice(slot: int, blocks_per_slot: int) -> slice:
+        if slot < 0:
+            raise ValueError("slot must be non-negative")
+        start = int(slot) * int(blocks_per_slot)
+        return slice(start, start + int(blocks_per_slot))
+
+    def _copy_snapshot_blocks_to_work(
+        self,
+        snapshot: torch.Tensor,
+        work: torch.Tensor,
+        slot: int,
+        blocks_per_slot: int,
+    ) -> None:
+        del self
+        slot_slice = DeepSeekV4ModelRunner._slot_block_slice(slot, blocks_per_slot)
+        dst = work[:, slot_slice]
+        dst.zero_()
+        blocks = min(snapshot.shape[1], int(blocks_per_slot))
+        dst[:, :blocks].copy_(snapshot[:, :blocks])
+
+    def _copy_split_state_to_work(
+        self,
+        kv_state: torch.Tensor,
+        score_state: torch.Tensor,
+        work: torch.Tensor,
+        slot: int,
+        blocks_per_slot: int,
+        out_dim: int,
+    ) -> None:
+        del self
+        slot_slice = DeepSeekV4ModelRunner._slot_block_slice(slot, blocks_per_slot)
+        dst = work[:, slot_slice]
+        dst.zero_()
+        blocks = min(kv_state.shape[1], score_state.shape[1], int(blocks_per_slot))
+        dst[:, :blocks, ..., :out_dim].copy_(kv_state[:, :blocks])
+        dst[:, :blocks, ..., out_dim : 2 * out_dim].copy_(score_state[:, :blocks])
+
+    def _logits_for_hidden(
+        self,
+        x_hc: torch.Tensor,
+        *,
+        active_rows: Sequence[int],
+        label: str = "unknown",
+    ) -> torch.Tensor:
+        global_weights = self.load_packed_global_weights()
+        if x_hc.ndim == 3:
+            # Decode output is already collapsed and final-normalized by
+            # ``l3_decode_fwd``; host LM-head consumes it directly.
+            hidden = x_hc
+        else:
+            hidden = self._final_hidden(x_hc)
+        rows = tuple(int(row) for row in active_rows)
+        if not rows:
+            raise ValueError("DeepSeekV4 LM-head requires at least one active row")
+        if min(rows) < 0 or max(rows) >= hidden.shape[1]:
+            raise ValueError(
+                f"DeepSeekV4 LM-head active rows {rows} exceed hidden rows={hidden.shape[1]}"
+            )
+        row_list = list(rows)
+        if self._debug_tensor_stats_enabled():
+            print(f"DSV4_DEBUG lm_head.label={label} active_rows={rows}", flush=True)
+            if x_hc.ndim == 4:
+                self._debug_tensor_stats("lm_head.x_hc.active", x_hc[:, row_list, :, :])
+            self._debug_tensor_stats("lm_head.hidden.active", hidden[:, row_list, :])
+
+        layout = global_weights.lm_head_layout
+        if global_weights.lm_head_weight.shape[0] != layout.ranks:
+            raise ValueError(
+                "DeepSeekV4 packed LM-head rank count mismatch: "
+                f"weight ranks={global_weights.lm_head_weight.shape[0]} layout ranks={layout.ranks}"
+            )
+        if global_weights.lm_head_weight.shape[1] < layout.vocab_per_rank:
+            raise ValueError(
+                "DeepSeekV4 packed LM-head shard is smaller than the real vocab shard: "
+                f"shape={tuple(global_weights.lm_head_weight.shape)} vocab_per_rank={layout.vocab_per_rank}"
+            )
+
+        selected = hidden[0, row_list, :].detach().cpu().to(torch.float32).contiguous()
+        logits_parts = []
+        for rank in range(layout.ranks):
+            shard = global_weights.lm_head_weight[rank, : layout.vocab_per_rank, :]
+            shard = shard.detach().cpu().to(torch.float32).contiguous()
+            logits_parts.append(torch.matmul(selected, shard.t()))
+        logits = torch.cat(logits_parts, dim=-1)
+        if logits.shape[-1] != layout.vocab_size:
+            logits = logits[:, : layout.vocab_size].contiguous()
+        else:
+            logits = logits.contiguous()
+        self._debug_tensor_stats("lm_head.logits.returned", logits)
+        return logits
+
+    @staticmethod
+    def _debug_tensor_stats_enabled() -> bool:
+        return os.getenv("PYPTO_DSV4_LOGIT_DEBUG") == "1"
+
+    @staticmethod
+    def _debug_tensor_stats(name: str, tensor: torch.Tensor, *, per_rank: bool = False) -> None:
+        if not DeepSeekV4ModelRunner._debug_tensor_stats_enabled():
+            return
+        data = tensor.detach().cpu().to(torch.float32)
+        finite = torch.isfinite(data)
+        finite_count = int(finite.sum().item())
+        total = data.numel()
+        nan_count = int(torch.isnan(data).sum().item())
+        pos_inf_count = int(torch.isposinf(data).sum().item())
+        neg_inf_count = int(torch.isneginf(data).sum().item())
+        if finite_count:
+            finite_values = data[finite]
+            min_value = float(finite_values.min().item())
+            max_value = float(finite_values.max().item())
+            absmax_value = float(finite_values.abs().max().item())
+        else:
+            min_value = float("nan")
+            max_value = float("nan")
+            absmax_value = float("nan")
+        print(
+            "DSV4_DEBUG "
+            f"{name} shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"finite={finite_count}/{total} nan={nan_count} "
+            f"+inf={pos_inf_count} -inf={neg_inf_count} "
+            f"min={min_value:.6g} max={max_value:.6g} absmax={absmax_value:.6g}",
+            flush=True,
+        )
+        if per_rank and data.ndim >= 1:
+            rank_view = data.reshape(data.shape[0], -1)
+            rank_finite = torch.isfinite(rank_view)
+            rank_counts = (rank_view.shape[1] - rank_finite.sum(dim=1)).tolist()
+            print(f"DSV4_DEBUG {name} nonfinite_by_rank={rank_counts}", flush=True)
+
+    @staticmethod
+    def _tensor_is_finite(tensor: torch.Tensor) -> bool:
+        return bool(torch.isfinite(tensor.detach().cpu().to(torch.float32)).all().item())
+
+    def _final_hidden(self, x_hc: torch.Tensor) -> torch.Tensor:
+        """Collapse a ``[ranks, T, HC_MULT, D]`` HC stack and apply the final norm."""
+        weights = self.load_packed_global_weights()
+        x_hc = x_hc.to(torch.bfloat16).cpu()
+        x_float = x_hc.float()
+        flat = x_float.flatten(2)
+        rms = torch.sqrt(flat.double().square().mean(dim=-1, keepdim=True) + DEEPSEEK_V4_RMS_NORM_EPS)
+        normed_flat = flat / rms.to(torch.float32)
+        mixes = torch.matmul(normed_flat, weights.hc_head_fn.t())
+        pre = torch.sigmoid(mixes * weights.hc_head_scale + weights.hc_head_base) + DEEPSEEK_V4_HC_EPS
+        collapsed = torch.sum(pre.unsqueeze(-1).double() * x_float.double(), dim=2)
+        return self._final_norm(collapsed)
+
+    def _final_norm(self, collapsed: torch.Tensor) -> torch.Tensor:
+        """Apply the final RMS norm to an already-collapsed ``[ranks, T, D]`` hidden.
+
+        The packed ``l3_decode_fwd`` kernel collapses HC_MULT in-kernel via
+        ``hc_head`` and returns the collapsed (pre-final-norm) hidden, so decode
+        only needs the model's final RMS norm before the LM head.
+        """
+        collapsed = collapsed.cpu().double()
+        weights = self.load_packed_global_weights()
+        norm_inv = torch.rsqrt(collapsed.square().mean(dim=-1, keepdim=True) + DEEPSEEK_V4_RMS_NORM_EPS)
+        normed = collapsed * norm_inv * weights.final_norm_weight.double()
+        return normed.to(torch.float32).to(torch.bfloat16).contiguous()
+
+    def _scope_stats_run_config(self) -> Any:
+        """Optional per-dispatch RunConfig that captures device scope stats.
+
+        Enabled with ``PYPTO_DSV4_SCOPE_STATS=1`` to dump per-scope
+        heap / task_window / tensormap peaks under ``<dir>/dfx_outputs/``.
+        """
+        if os.getenv("PYPTO_DSV4_SCOPE_STATS") != "1":
+            return None
+        from pypto.runtime import RunConfig  # noqa: PLC0415
+
+        out_dir = os.getenv("PYPTO_DSV4_SCOPE_STATS_DIR", "/data/liuxu/pypto-serving/dsv4_scope_stats")
+        return RunConfig(
+            platform=self._compiled.platform,
+            device_id=self._compiled.device_id,
+            enable_scope_stats=True,
+            save_kernels=True,
+            save_kernels_dir=out_dir,
+        )
+
+    def _run_l3(self, callable_spec: DeepSeekV4L3Callable, *args: Any) -> Any:
+        if self._l3_worker is None:
+            self._assert_l3_args_shared_before_worker(callable_spec, args)
+        worker = self._shared_l3_worker()
+        run_config = self._scope_stats_run_config()
+        uploaded: list[DeviceTensor] = []
+        try:
+            l3_args = tuple(self._coerce_l3_arg(worker, arg, uploaded) for arg in args)
+            if run_config is not None:
+                return worker.run(callable_spec.compiled, *l3_args, config=run_config)
+            return worker.run(callable_spec.compiled, *l3_args)
+        finally:
+            for tensor in uploaded:
+                worker.free_tensor(tensor)
+
+    @staticmethod
+    def _share_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+        if not tensor.is_shared():
+            tensor = tensor.share_memory_()
+        return tensor
+
+    @staticmethod
+    def _shared_empty(shape: Sequence[int], dtype: torch.dtype, *, name: str) -> torch.Tensor:
+        del name
+        return torch.empty(tuple(int(dim) for dim in shape), dtype=dtype).share_memory_()
+
+    @staticmethod
+    def _new_shared_like(tensor: torch.Tensor, *, name: str) -> torch.Tensor:
+        if tensor.device.type != "cpu":
+            raise ValueError(f"{name} must be a CPU tensor")
+        return torch.empty_like(tensor.contiguous(), memory_format=torch.contiguous_format).share_memory_()
+
+    @staticmethod
+    def _copy_shared(dst: torch.Tensor, src: torch.Tensor, *, name: str) -> None:
+        if src.device.type != "cpu":
+            src = src.cpu()
+        if not src.is_contiguous():
+            src = src.contiguous()
+        if tuple(dst.shape) != tuple(src.shape) or dst.dtype != src.dtype:
+            raise ValueError(
+                f"{name} shared buffer shape/dtype mismatch: "
+                f"buffer shape={tuple(dst.shape)} dtype={dst.dtype}, "
+                f"source shape={tuple(src.shape)} dtype={src.dtype}"
+            )
+        dst.copy_(src)
+
+    @staticmethod
+    def _int32_scalar(value: int) -> int:
+        return int(value)
+
+    def _ensure_shared_host_allocation_before_worker(self, name: str) -> None:
+        if self._l3_worker is not None:
+            raise RuntimeError(
+                f"DeepSeekV4 shared host buffer '{name}' must be allocated before the L3 worker starts"
+            )
+
+    def _assert_l3_args_shared_before_worker(
+        self,
+        callable_spec: DeepSeekV4L3Callable,
+        args: Sequence[Any],
+    ) -> None:
+        for index, arg in enumerate(args):
+            self._assert_l3_arg_shared(arg, name=f"{callable_spec.name}[{index}]")
+
+    def _assert_l3_arg_shared(self, arg: Any, *, name: str) -> None:
+        if isinstance(arg, (_StaticDeviceTensor, _TransientDeviceTensor)):
+            self._assert_l3_arg_shared(arg.tensor, name=f"{name}.tensor")
+            return
+        if isinstance(arg, torch.Tensor) and arg.device.type == "cpu" and not arg.is_shared():
+            raise TypeError(
+                "DeepSeekV4 L3 dispatch requires shared-memory CPU tensors allocated before "
+                f"the L3 worker starts; got {name} shape={tuple(arg.shape)} dtype={arg.dtype}"
+            )
+        if isinstance(arg, Sequence) and not isinstance(arg, (str, bytes, bytearray)):
+            for index, item in enumerate(arg):
+                self._assert_l3_arg_shared(item, name=f"{name}[{index}]")
+            return
+        if isinstance(arg, dict):
+            for key, item in arg.items():
+                self._assert_l3_arg_shared(item, name=f"{name}[{key!r}]")
+
+    def _coerce_l3_arg(self, worker: Any, arg: Any, uploaded: list[DeviceTensor]) -> Any:
+        if isinstance(arg, _StaticDeviceTensor):
+            self._assert_l3_arg_shared(arg, name="static")
+            return arg.tensor
+        if isinstance(arg, _TransientDeviceTensor):
+            tensor = arg.tensor
+            self._assert_l3_arg_shared(arg, name="transient")
+            dev = worker.alloc_tensor(tensor.shape, tensor.dtype, init=tensor)
+            uploaded.append(dev)
+            return dev
+        if isinstance(arg, torch.Tensor) and arg.device.type == "cpu" and not arg.is_shared():
+            raise TypeError(
+                "DeepSeekV4 L3 dispatch requires shared-memory CPU tensors allocated before "
+                f"the worker starts; got non-shared tensor shape={tuple(arg.shape)} dtype={arg.dtype}"
+            )
+        return arg
+
+    def _shared_l3_worker(self) -> Any:
+        worker = self._l3_worker
+        if worker is None:
+            self._assert_l3_shared_buffers_preallocated()
+            compiled_callables = self._compiled.l3_callables()
+            if not compiled_callables:
+                raise RuntimeError("DeepSeekV4 L3 callables are not compiled")
+            from pypto.runtime import DistributedWorker  # noqa: PLC0415
+
+            worker = DistributedWorker([callable_spec.compiled for callable_spec in compiled_callables])
+            self._l3_worker = worker
+        return worker
+
+    def _ensure_decode_work_cache(self) -> DeepSeekV4LayerCache:
+        cache = self._decode_work_cache
+        if cache is not None:
+            return cache
+        self._ensure_shared_host_allocation_before_worker("decode work cache")
+        layout = self._compiled.layout
+        fwd_layers = DEEPSEEK_V4_FWD_NUM_LAYERS
+        csa_layers = DEEPSEEK_V4_CSA_NUM_LAYERS
+        hca_layers = DEEPSEEK_V4_HCA_NUM_LAYERS
+        cache = DeepSeekV4LayerCache(
+            kv_cache=self._shared_empty(
+                (
+                    layout.ranks,
+                    fwd_layers * layout.decode_batch * layout.ori_max_blocks,
+                    layout.block_size,
+                    1,
+                    DEEPSEEK_V4_HEAD_DIM,
+                ),
+                torch.bfloat16,
+                name="decode_work_kv_cache",
+            ),
+            cmp_kv=self._shared_empty(
+                (
+                    layout.ranks,
+                    fwd_layers * layout.decode_batch * layout.cmp_max_blocks,
+                    layout.block_size,
+                    1,
+                    DEEPSEEK_V4_HEAD_DIM,
+                ),
+                torch.bfloat16,
+                name="decode_work_cmp_kv",
+            ),
+            idx_kv_cache=self._shared_empty(
+                (
+                    layout.ranks,
+                    csa_layers * layout.decode_batch * layout.idx_max_blocks,
+                    layout.block_size,
+                    1,
+                    DEEPSEEK_V4_IDX_HEAD_DIM,
+                ),
+                torch.bfloat16,
+                name="decode_work_idx_kv_cache",
+            ),
+            hca_compress_state=self._shared_empty(
+                (
+                    layout.ranks,
+                    hca_layers * layout.decode_batch * layout.hca_state_max_blocks,
+                    layout.c128_state_block_size,
+                    DEEPSEEK_V4_HCA_STATE_DIM,
+                ),
+                torch.float32,
+                name="decode_work_hca_compress_state",
+            ),
+            csa_compress_state=self._shared_empty(
+                (
+                    layout.ranks,
+                    csa_layers * layout.decode_batch * layout.csa_state_max_blocks,
+                    layout.c4_state_block_size,
+                    DEEPSEEK_V4_CSA_STATE_DIM,
+                ),
+                torch.float32,
+                name="decode_work_csa_compress_state",
+            ),
+            csa_inner_compress_state=self._shared_empty(
+                (
+                    layout.ranks,
+                    csa_layers * layout.decode_batch * layout.csa_inner_state_max_blocks,
+                    layout.c4_state_block_size,
+                    DEEPSEEK_V4_CSA_INNER_STATE_DIM,
+                ),
+                torch.float32,
+                name="decode_work_csa_inner_compress_state",
+            ),
+        )
+        self._decode_work_cache = cache
+        return cache
+
+    def _require_decode_work_cache(self) -> DeepSeekV4LayerCache:
+        if self._decode_work_cache is None:
+            raise RuntimeError("DeepSeekV4 decode work cache was not allocated before the L3 worker started")
+        return self._decode_work_cache
+
+    @staticmethod
+    def _static_device_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.device.type != "cpu":
+            raise ValueError("worker-resident tensor must be on CPU")
+        if not tensor.is_contiguous():
+            raise ValueError("worker-resident tensor must be contiguous")
+        return DeepSeekV4ModelRunner._share_cpu_tensor(tensor)
+
+    def _reset_l3_worker(self) -> None:
+        worker = self._l3_worker
+        if worker is None:
+            return
+        try:
+            for tensor in self._l3_static_tensors.values():
+                worker.free_tensor(tensor)
+            worker.close()
+        finally:
+            self._l3_worker = None
+            self._l3_static_tensors.clear()
+
+    def close(self) -> None:
+        worker = self._l3_worker
+        try:
+            if worker is not None:
+                for tensor in self._l3_static_tensors.values():
+                    worker.free_tensor(tensor)
+                worker.close()
+        finally:
+            self._l3_worker = None
+            self._decode_work_cache = None
+            self._decode_cache_seeded_slots.clear()
+            self._prefill_cache_snapshots.clear()
+            self._l3_static_tensors.clear()
+
+    def _require_input_builder(self) -> DeepSeekV4InputBuilder:
+        if self.input_builder is None:
+            raise RuntimeError("DeepSeekV4 input builder is not initialized")
+        return self.input_builder
+
+    def _rank_stack(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.unsqueeze(0).expand(self._compiled.layout.ranks, *tensor.shape).contiguous()
+
+    def _prefill_kernel_tokens(self, actual_tokens: int) -> int:
+        # The packed prefill kernel currently uses its static 128-row contract.
+        if actual_tokens <= 0:
+            raise ValueError("actual_tokens must be positive")
+        return self._compiled.layout.prefill_seq
+
+    @staticmethod
+    def _prefill_kernel_positions(
+        positions: Sequence[int],
+        *,
+        kernel_tokens: int,
+        max_seq_len: int,
+    ) -> list[int]:
+        if len(positions) <= 0:
+            raise ValueError("positions must not be empty")
+        if kernel_tokens < len(positions):
+            raise ValueError("kernel_tokens must cover all active positions")
+        start = int(positions[0])
+        kernel_positions = list(range(start, start + kernel_tokens))
+        if kernel_positions[-1] >= max_seq_len:
+            raise ValueError(
+                f"prefill static kernel position {kernel_positions[-1]} exceeds max_seq_len={max_seq_len}"
+            )
+        return kernel_positions
+
+    def _prefill_kernel_slots(self, slot: int, *, actual_tokens: int, kernel_tokens: int) -> list[int]:
+        if actual_tokens <= 0:
+            raise ValueError("actual_tokens must be positive")
+        if kernel_tokens < actual_tokens:
+            raise ValueError("kernel_tokens must cover all active tokens")
+        slot = int(slot)
+        scratch_slot = slot
+        if kernel_tokens > actual_tokens and self._compiled.layout.decode_batch > 1:
+            scratch_slot = (slot + self._compiled.layout.decode_batch - 1) % self._compiled.layout.decode_batch
+        return [slot] * actual_tokens + [scratch_slot] * (kernel_tokens - actual_tokens)
+
+    def _prefill_sliding_window_slot_mapping(
+        self,
+        slots: Sequence[int],
+        positions: Sequence[int],
+    ) -> torch.Tensor:
+        layout = self._compiled.layout
+        if len(slots) != len(positions):
+            raise ValueError("prefill slots and positions must have the same length")
+        mapping = torch.empty((len(positions),), dtype=torch.long)
+        capacity = layout.ori_max_blocks * layout.block_size
+        for row, (slot, position) in enumerate(zip(slots, positions, strict=True)):
+            mapping[row] = int(slot) * capacity + (int(position) % layout.block_size)
+        return mapping
+
+    def _prefill_compressed_slot_mapping(
+        self,
+        slots: Sequence[int],
+        positions: Sequence[int],
+        *,
+        max_blocks: int,
+        compress_ratio: int,
+    ) -> torch.Tensor:
+        if len(slots) != len(positions):
+            raise ValueError("prefill slots and positions must have the same length")
+        if compress_ratio <= 0:
+            raise ValueError("compress_ratio must be positive")
+        capacity = int(max_blocks) * self._compiled.layout.block_size
+        mapping = torch.full((len(positions),), -1, dtype=torch.long)
+        for row, (slot, position) in enumerate(zip(slots, positions, strict=True)):
+            position = int(position)
+            if (position + 1) % compress_ratio != 0:
+                continue
+            logical = position // compress_ratio
+            if logical >= capacity:
+                raise ValueError(
+                    f"position {position} maps to compressed row {logical}, but capacity is {capacity}"
+                )
+            mapping[row] = int(slot) * capacity + logical
+        return mapping
+
+    def _prefill_state_slot_mapping(
+        self,
+        slots: Sequence[int],
+        positions: Sequence[int],
+        *,
+        max_blocks: int,
+        state_block_size: int,
+    ) -> torch.Tensor:
+        if len(slots) != len(positions):
+            raise ValueError("prefill slots and positions must have the same length")
+        capacity = int(max_blocks) * int(state_block_size)
+        mapping = torch.empty((len(positions),), dtype=torch.long)
+        for row, (slot, position) in enumerate(zip(slots, positions, strict=True)):
+            position = int(position)
+            if position >= capacity:
+                raise ValueError(
+                    f"position {position} exceeds compressor-state capacity {capacity} "
+                    f"(max_blocks={max_blocks}, state_block_size={state_block_size})"
+                )
+            mapping[row] = int(slot) * capacity + position
+        return mapping
+
+    @staticmethod
+    def _padded_rows(values: torch.Tensor, length: int) -> torch.Tensor:
+        if values.ndim != 2:
+            raise ValueError(f"values must be rank-2, got shape={tuple(values.shape)}")
+        if values.shape[0] <= 0:
+            raise ValueError("values must not be empty")
+        if values.shape[0] > length:
+            raise ValueError(f"values rows {values.shape[0]} exceed padded length {length}")
+        out = torch.empty((length, values.shape[1]), dtype=values.dtype, device=values.device)
+        out[: values.shape[0]].copy_(values)
+        if values.shape[0] < length:
+            pad_rows = torch.arange(values.shape[0], length, device=values.device) % values.shape[0]
+            out[values.shape[0] :].copy_(values.index_select(0, pad_rows))
+        return out
+
+    @staticmethod
+    def _padded_vector(values: torch.Tensor, length: int, *, dtype: torch.dtype) -> torch.Tensor:
+        if values.numel() <= 0:
+            raise ValueError("values must not be empty")
+        if values.numel() > length:
+            raise ValueError(f"values length {values.numel()} exceeds padded length {length}")
+        out = torch.empty((length,), dtype=dtype)
+        out[: values.numel()] = values.to(dtype=dtype)
+        if values.numel() < length:
+            pad_rows = torch.arange(values.numel(), length) % values.numel()
+            out[values.numel() :] = values.to(dtype=dtype).index_select(0, pad_rows)
+        return out
+
+    @staticmethod
+    def _prefill_position_ids(positions: Sequence[int], length: int) -> torch.Tensor:
+        if len(positions) <= 0:
+            raise ValueError("positions must not be empty")
+        if len(positions) > length:
+            raise ValueError(f"positions length {len(positions)} exceeds padded length {length}")
+        out = torch.arange(length, dtype=torch.int32)
+        out[: len(positions)] = torch.tensor(tuple(int(pos) for pos in positions), dtype=torch.int32)
+        return out
+
+    @staticmethod
+    def _pad_prefill_mapping(mapping: torch.Tensor, length: int) -> torch.Tensor:
+        if mapping.ndim != 1:
+            raise ValueError(f"prefill mapping must be rank-1, got shape={tuple(mapping.shape)}")
+        if mapping.numel() > length:
+            raise ValueError(f"prefill mapping length {mapping.numel()} exceeds padded length {length}")
+        out = torch.full((length,), -1, dtype=mapping.dtype)
+        out[: mapping.numel()].copy_(mapping.to(dtype=mapping.dtype))
+        return out
+
+    @staticmethod
+    def _prefill_actual_tokens(batch: PrefillBatch) -> int:
+        if batch.positions is not None:
+            valid = batch.positions[0].detach().cpu()
+            valid = valid[valid >= 0]
+            if valid.numel() <= 0:
+                raise ValueError("prefill positions must include at least one token")
+            return int(valid.numel())
+        seq_len = int(batch.seq_lens[0].item())
+        if seq_len <= 0:
+            raise ValueError("prefill seq_len must be positive")
+        return seq_len
+
+    @staticmethod
+    def _prefill_positions(batch: PrefillBatch, actual_tokens: int) -> list[int]:
+        if batch.positions is None:
+            positions = list(range(actual_tokens))
+        else:
+            raw = batch.positions[0, :actual_tokens].detach().cpu().to(torch.long)
+            positions = [int(pos) for pos in raw.tolist()]
+        if any(pos < 0 for pos in positions):
+            raise ValueError("prefill positions must be non-negative")
+        expected = list(range(positions[0], positions[0] + actual_tokens))
+        if positions != expected:
+            raise ValueError(
+                "prefill positions must form one contiguous chunk: "
+                f"positions={positions[:8]}{'...' if len(positions) > 8 else ''}"
+            )
+        return positions
+
+    def _prefill_sparse_by_ratio(
+        self,
+        positions: Sequence[int],
+        actual_tokens: int,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        return {
+            ratio: self._prefill_sparse_indices(positions, actual_tokens, compress_ratio=ratio)
+            for ratio in (0, 4, 128)
+        }
+
+    def _prefill_sparse_indices(
+        self,
+        positions: Sequence[int],
+        actual_tokens: int,
+        *,
+        compress_ratio: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        layout = self._compiled.layout
+        indices = torch.full(
+            (layout.prefill_seq, layout.prefill_sparse_topk),
+            -1,
+            dtype=torch.int32,
+        )
+        lens = torch.zeros((layout.prefill_seq,), dtype=torch.int32)
+        current = {int(pos): row for row, pos in enumerate(positions[:actual_tokens])}
+        for row in range(actual_tokens):
+            abs_pos = int(positions[row])
+            window_valid = min(layout.block_size, abs_pos + 1)
+            key_start_abs = abs_pos + 1 - window_valid
+            cursor = 0
+            for key_abs in range(key_start_abs, abs_pos + 1):
+                overlay_row = current.get(key_abs)
+                if overlay_row is not None and overlay_row <= row:
+                    indices[row, cursor] = layout.block_size + overlay_row
+                else:
+                    indices[row, cursor] = key_abs % layout.block_size
+                cursor += 1
+            if compress_ratio > 0:
+                compressed_visible = min(
+                    (abs_pos + 1) // compress_ratio,
+                    layout.cmp_max_blocks * layout.block_size,
+                    layout.prefill_sparse_topk - layout.block_size,
+                )
+                for cmp_slot in range(compressed_visible):
+                    if cursor >= layout.prefill_sparse_topk:
+                        break
+                    indices[row, cursor] = layout.block_size + layout.prefill_seq + cmp_slot
+                    cursor += 1
+            lens[row] = cursor
+        return indices, lens
+
+    def _decode_positions(self, batch: DecodeBatch, actual_batch: int) -> tuple[tuple[int, ...], ...]:
+        decode_seq = self._compiled.layout.decode_seq
+        positions = []
+        for row in range(actual_batch):
+            seq_len = int(batch.seq_lens[row].item())
+            if seq_len < decode_seq:
+                raise ValueError(
+                    f"decode seq_lens must be >= decode_seq ({decode_seq}), got {seq_len}"
+                )
+            # MTP feeds ``decode_seq`` real trailing tokens ending at the last real
+            # position ``seq_len-1`` (so positions are ``seq_len-decode_seq .. seq_len-1``).
+            first_position = seq_len - decode_seq
+            positions.append(tuple(first_position + offset for offset in range(decode_seq)))
+        return tuple(positions)
+
+    def _decode_token_rows(
+        self,
+        token_ids: torch.Tensor,
+        actual_batch: int,
+        *,
+        vocab_size: int,
+        prev_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        layout = self._compiled.layout
+        if token_ids.ndim == 1:
+            active = token_ids[:actual_batch].reshape(actual_batch, 1)
+        else:
+            active = token_ids[:actual_batch, :1]
+        prev_active = None
+        if prev_token_ids is not None:
+            prev_active = prev_token_ids[:actual_batch].reshape(actual_batch, 1)
+        if vocab_size <= 0:
+            raise ValueError("vocab_size must be positive")
+        rows = torch.empty(layout.decode_tokens, dtype=torch.long).reshape(
+            layout.decode_batch,
+            layout.decode_seq,
+        )
+        if prev_active is not None:
+            rows.copy_(prev_active[0, 0].expand(layout.decode_batch, layout.decode_seq))
+            rows[:, layout.decode_seq - 1].copy_(active[0, 0])
+        else:
+            rows.copy_(active[0, 0].expand(layout.decode_batch, layout.decode_seq))
+        for row in range(actual_batch):
+            if prev_active is not None:
+                # Earlier slots use prev token; final slot uses last token.
+                rows[row].copy_(prev_active[row, 0].expand(layout.decode_seq))
+                rows[row, layout.decode_seq - 1].copy_(active[row, 0])
+            else:
+                rows[row].copy_(active[row, 0].expand(layout.decode_seq))
+        return rows.reshape(layout.decode_tokens)
+
+    def _decode_kernel_slots(self, active_slots: Sequence[int]) -> tuple[int, ...]:
+        """Route padded fixed decode rows into scratch cache slots."""
+        layout = self._compiled.layout
+        slots = [int(slot) for slot in active_slots]
+        if not slots:
+            raise ValueError("decode must include at least one active slot")
+        if len(set(slots)) != len(slots):
+            raise ValueError(f"decode slots must be unique, got {slots}")
+        if len(slots) > layout.decode_batch:
+            raise ValueError(f"decode slots exceed kernel batch {layout.decode_batch}: {slots}")
+        active_set = set(slots)
+        for scratch_slot in range(layout.decode_batch):
+            if len(slots) >= layout.decode_batch:
+                break
+            if scratch_slot not in active_set:
+                slots.append(scratch_slot)
+        if len(slots) != layout.decode_batch:
+            raise RuntimeError(
+                f"DeepSeekV4 decode needs {layout.decode_batch} kernel slots, built {len(slots)}"
+            )
+        return tuple(slots)
+
+    def _decode_kv_seq_lens(self, seq_lens: torch.Tensor, actual_batch: int) -> torch.Tensor:
+        layout = self._compiled.layout
+        # The last written KV position is ``seq_len-1``, so the valid KV history
+        # is exactly ``seq_len`` entries. (yangyaodong's "seq_len+1" was relative
+        # to a seq_len = prompt length, which does not count the prefill token;
+        # our seq_len already does.)
+        active = seq_lens[:actual_batch].detach().cpu().to(torch.int32)
+        return DeepSeekV4CacheManager.replicate_first_row(
+            active.reshape(actual_batch, 1),
+            actual_rows=actual_batch,
+            kernel_rows=layout.decode_batch,
+        ).reshape(layout.decode_batch)
