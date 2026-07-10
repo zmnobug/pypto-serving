@@ -553,3 +553,307 @@ class DeepSeekV4CacheManager:
         return out
 
 
+class DeepSeekV4InputBuilder:
+    """Build fixed-shape host inputs for DeepSeekV4 HC-stack kernels."""
+
+    def __init__(self, *, layout: DeepSeekV4CacheLayout, hidden_size: int) -> None:
+        self.layout = layout
+        self.hidden_size = int(hidden_size)
+
+    def prefill_x_hc(self, embeddings: torch.Tensor, *, actual_tokens: int) -> torch.Tensor:
+        """Build ``[ranks, 128, hc_mult, hidden]`` prefill HC input."""
+        if embeddings.ndim != 2:
+            raise ValueError(f"prefill embeddings must be rank-2, got shape={tuple(embeddings.shape)}")
+        return self._x_hc_from_rows(
+            embeddings,
+            actual_tokens=actual_tokens,
+            token_rows=self.layout.prefill_seq,
+        )
+
+    def decode_x_hc(
+        self,
+        embeddings: torch.Tensor,
+        *,
+        actual_batch: int,
+        prev_embeddings: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Build ``[ranks, 128, hc_mult, hidden]`` decode HC input.
+
+        Current DeepSeekV4 decode kernels use a fixed ``decode_tokens`` contract
+        with ``decode_seq`` token slots per request. If ``decode_seq`` is greater
+        than one and ``prev_embeddings`` is provided, earlier slots carry the
+        previous token and the final slot carries the last token. Padding rows
+        still replicate row 0 / their own embedding to keep the fixed rows valid.
+        """
+        if embeddings.ndim != 2:
+            raise ValueError(f"decode embeddings must be rank-2, got shape={tuple(embeddings.shape)}")
+        if actual_batch <= 0:
+            raise ValueError("actual_batch must be positive")
+        if actual_batch > self.layout.decode_batch:
+            raise ValueError(
+                f"actual_batch={actual_batch} exceeds decode batch capacity {self.layout.decode_batch}"
+            )
+        if embeddings.shape[0] < actual_batch:
+            raise ValueError("decode embeddings has fewer rows than actual_batch")
+        if prev_embeddings is not None and prev_embeddings.shape[0] < actual_batch:
+            raise ValueError("decode prev_embeddings has fewer rows than actual_batch")
+        rows = torch.zeros(
+            (self.layout.decode_tokens, self.hidden_size),
+            dtype=embeddings.dtype,
+            device=embeddings.device,
+        )
+        decode_seq = self.layout.decode_seq
+        # When the caller supplies a full per-row embedding tensor (one row per
+        # decode-batch slot), use each row's own embedding so the MoE gate routes
+        # the 128 tokens across many experts. Otherwise replicate slot 0 into the
+        # padding rows as before.
+        per_row = embeddings.shape[0] >= self.layout.decode_batch
+        for row in range(self.layout.decode_batch):
+            source_row = row if per_row else (row if row < actual_batch else 0)
+            start = row * decode_seq
+            if prev_embeddings is not None and row < actual_batch:
+                # Fill every slot with prev, then overwrite the final slot with
+                # the last token.
+                rows[start : start + decode_seq].copy_(
+                    prev_embeddings[row : row + 1].expand(decode_seq, self.hidden_size)
+                )
+                rows[start + decode_seq - 1].copy_(embeddings[row])
+            else:
+                rows[start : start + decode_seq].copy_(
+                    embeddings[source_row : source_row + 1].expand(decode_seq, self.hidden_size)
+                )
+        return self._expand_hc_and_ranks(rows)
+
+    def _x_hc_from_rows(
+        self,
+        embeddings: torch.Tensor,
+        *,
+        actual_tokens: int,
+        token_rows: int,
+    ) -> torch.Tensor:
+        if actual_tokens <= 0:
+            raise ValueError("actual_tokens must be positive")
+        if actual_tokens > token_rows:
+            raise ValueError(f"actual_tokens={actual_tokens} exceeds token row capacity {token_rows}")
+        if embeddings.shape[0] < actual_tokens:
+            raise ValueError("embeddings has fewer rows than actual_tokens")
+        if int(embeddings.shape[1]) != self.hidden_size:
+            raise ValueError(f"embedding hidden size must be {self.hidden_size}, got {int(embeddings.shape[1])}")
+        rows = torch.zeros((token_rows, self.hidden_size), dtype=embeddings.dtype, device=embeddings.device)
+        rows[:actual_tokens].copy_(embeddings[:actual_tokens])
+        return self._expand_hc_and_ranks(rows)
+
+    def _expand_hc_and_ranks(self, rows: torch.Tensor) -> torch.Tensor:
+        return (
+            rows.unsqueeze(1)
+            .expand(rows.shape[0], self.layout.hc_mult, self.hidden_size)
+            .unsqueeze(0)
+            .expand(self.layout.ranks, rows.shape[0], self.layout.hc_mult, self.hidden_size)
+            .contiguous()
+        )
+
+
+@dataclass
+class DeepSeekV4L3Callable:
+    """Compiled HOST-dispatched DeepSeekV4 program."""
+
+    compiled: object
+    name: str
+
+
+@dataclass
+class _StaticDeviceTensor:
+    """CPU tensor marker uploaded to the shared worker once."""
+
+    tensor: torch.Tensor
+
+
+@dataclass
+class _TransientDeviceTensor:
+    """CPU tensor marker uploaded for one layer dispatch and then freed."""
+
+    tensor: torch.Tensor
+
+
+@dataclass
+class DeepSeekV4LayerCache:
+    """Shared decode work-cache tensors for one DeepSeekV4 layer dispatch."""
+
+    kv_cache: torch.Tensor
+    cmp_kv: torch.Tensor
+    idx_kv_cache: torch.Tensor
+    hca_compress_state: torch.Tensor
+    csa_compress_state: torch.Tensor
+    csa_inner_compress_state: torch.Tensor
+
+
+@dataclass
+class DeepSeekV4LayerCacheSnapshot:
+    """Compact parent-side cache snapshot captured after prefill for one layer."""
+
+    tensors: dict[str, torch.Tensor]
+
+
+@dataclass
+class DeepSeekV4CompiledKernels:
+    """Compiled-kernel placeholder and immutable DeepSeekV4 runtime metadata."""
+
+    layout: DeepSeekV4CacheLayout
+    model_dir: str
+    weight_map: dict[str, str]
+    weight_store: DeepSeekV4WeightStore
+    compress_ratios: tuple[int, ...]
+    layer_plan: tuple["DeepSeekV4LayerPlan", ...]
+    kernel_dir: str
+    prefill: DeepSeekV4L3Callable | None = None
+    decode: DeepSeekV4L3Callable | None = None
+    freqs_cos: torch.Tensor | None = None
+    freqs_sin: torch.Tensor | None = None
+    platform: str = "a2a3"
+    device_id: int = 0
+    n_routed_experts: int = 256
+    num_hash_layers: int = 3
+
+    def l3_callables(self) -> tuple[DeepSeekV4L3Callable, ...]:
+        """Return every compiled L3 program that the shared worker may run."""
+        callables: list[DeepSeekV4L3Callable] = []
+        if self.prefill is not None:
+            callables.append(self.prefill)
+        if self.decode is not None:
+            callables.append(self.decode)
+        return tuple(callables)
+
+
+@dataclass(frozen=True)
+class DeepSeekV4PreparedPrefillInputs:
+    """Fixed-shape host tensors derived from one serving prefill chunk."""
+
+    request_id: str
+    slot: int
+    actual_tokens: int
+    x_hc: torch.Tensor
+    input_ids: torch.Tensor
+    position_ids: torch.Tensor
+    ori_block_table: torch.Tensor
+    ori_slot_mapping: torch.Tensor
+    cmp_block_table: torch.Tensor
+    idx_block_table: torch.Tensor
+    hca_compress_state_block_table: torch.Tensor
+    csa_compress_state_block_table: torch.Tensor
+    csa_inner_compress_state_block_table: torch.Tensor
+    hca_cmp_slot_mapping: torch.Tensor
+    hca_state_slot_mapping: torch.Tensor
+    csa_cmp_slot_mapping: torch.Tensor
+    csa_idx_slot_mapping: torch.Tensor
+    csa_state_slot_mapping: torch.Tensor
+    csa_inner_state_slot_mapping: torch.Tensor
+    cmp_sparse_indices_by_ratio: dict[int, torch.Tensor]
+    cmp_sparse_lens_by_ratio: dict[int, torch.Tensor]
+
+    def sparse_inputs_for_ratio(self, compress_ratio: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return prefill sparse-attention inputs for one layer compression ratio."""
+        ratio = int(compress_ratio)
+        return self.cmp_sparse_indices_by_ratio[ratio], self.cmp_sparse_lens_by_ratio[ratio]
+
+
+@dataclass(frozen=True)
+class DeepSeekV4PreparedDecodeInputs:
+    """Fixed-shape host tensors derived from one decode scheduler batch."""
+
+    request_ids: tuple[str, ...]
+    slots: tuple[int, ...]
+    kernel_slots: tuple[int, ...]
+    actual_batch: int
+    x_hc: torch.Tensor
+    input_ids: torch.Tensor
+    position_ids: torch.Tensor
+    kv_seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    ori_slot_mapping: torch.Tensor
+    cmp_block_table: torch.Tensor
+    idx_block_table: torch.Tensor
+    hca_compress_state_block_table: torch.Tensor
+    csa_compress_state_block_table: torch.Tensor
+    csa_inner_compress_state_block_table: torch.Tensor
+    hca_cmp_slot_mapping: torch.Tensor
+    hca_state_slot_mapping: torch.Tensor
+    csa_cmp_slot_mapping: torch.Tensor
+    csa_idx_slot_mapping: torch.Tensor
+    csa_state_slot_mapping: torch.Tensor
+    csa_inner_state_slot_mapping: torch.Tensor
+
+
+@dataclass
+class _DeepSeekV4DecodeSharedBuffers:
+    """Reusable decode shared-memory buffers inherited by the L3 chip workers."""
+
+    x_hc_a: torch.Tensor
+    x_hc_b: torch.Tensor
+    x_out: torch.Tensor
+    tensors: dict[str, torch.Tensor]
+
+
+@dataclass
+class _DeepSeekV4PrefillFwdSharedBuffers:
+    """Reusable packed-prefill shared buffers inherited by the L3 chip workers.
+
+    For the single ``l3_prefill_fwd`` dispatch the work caches are flattened 5-D
+    (kv_cache/cmp_kv stack across all 43 hidden layers, idx_kv_cache across the 21
+    compress_ratio==4 layers) and the compress-state kv/score caches stack across
+    the CSA (x21) and HCA (x20) groups. The per-step metadata, RoPE tables and
+    compress-state block tables are shared single per-rank copies (the kernel
+    slices them per layer). ``tensors`` is keyed by ``_PREFILL_FWD_TENSOR_ORDER``
+    name (excluding the stacked weights, which live in ``_stacked_weight_buffers``,
+    and ``freqs_*``/``x_hc`` which are tracked explicitly). The final normalized
+    hidden output is held separately in ``_prefill_output_buffer``.
+    """
+
+    x_hc: torch.Tensor
+    freqs_cos: torch.Tensor
+    freqs_sin: torch.Tensor
+    tensors: dict[str, torch.Tensor]
+
+
+@dataclass(frozen=True)
+class DeepSeekV4LayerPlan:
+    """Per-layer execution metadata for DeepSeekV4 serving."""
+
+    layer_id: int
+    compress_ratio: int
+    attention_kind: str
+    include_tid2eid: bool
+    include_gate_bias: bool
+
+
+def deepseek_v4_attention_kind(compress_ratio: int) -> str:
+    """Return the DeepSeekV4 attention family for a compression ratio."""
+    if compress_ratio == 0:
+        return "swa"
+    if compress_ratio == 128:
+        return "hca"
+    if compress_ratio == 4:
+        return "csa"
+    raise ValueError(f"unsupported DeepSeekV4 attention compress ratio: {compress_ratio}")
+
+
+def build_deepseek_v4_layer_plan(
+    *,
+    compress_ratios: Sequence[int],
+    num_hidden_layers: int,
+    num_hash_layers: int,
+) -> tuple[DeepSeekV4LayerPlan, ...]:
+    """Build the per-layer serving plan from config metadata."""
+    if len(compress_ratios) < num_hidden_layers:
+        raise ValueError("compress_ratios must include at least one entry per hidden layer")
+    return tuple(
+        DeepSeekV4LayerPlan(
+            layer_id=layer_id,
+            compress_ratio=int(compress_ratios[layer_id]),
+            attention_kind=deepseek_v4_attention_kind(int(compress_ratios[layer_id])),
+            include_tid2eid=layer_id < num_hash_layers,
+            include_gate_bias=layer_id >= num_hash_layers,
+        )
+        for layer_id in range(num_hidden_layers)
+    )
+
+
