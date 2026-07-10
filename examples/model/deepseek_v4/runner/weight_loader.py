@@ -1,0 +1,385 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import ContextManager, Protocol
+
+import torch
+
+
+class _SafeTensorReader(Protocol):
+    """Minimal safetensors reader protocol used by the lazy weight store."""
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        """Return one tensor by name."""
+        raise NotImplementedError
+
+
+class _SafeOpenFn(Protocol):
+    """Callable shape for injectable safetensors openers."""
+
+    def __call__(self, path: Path, device: str) -> ContextManager[_SafeTensorReader]:
+        """Open one safetensors shard."""
+        raise NotImplementedError
+
+
+_GLOBAL_WEIGHT_NAMES = (
+    "embed.weight",
+    "norm.weight",
+    "head.weight",
+    "hc_head_fn",
+    "hc_head_scale",
+    "hc_head_base",
+)
+_LM_HEAD_VOCAB_CHUNK = 512
+_LAYER_COMMON_SUFFIXES = (
+    "attn.attn_sink",
+    "attn.kv_norm.weight",
+    "attn.q_norm.weight",
+    "attn.wkv.weight",
+    "attn.wo_a.weight",
+    "attn.wo_b.weight",
+    "attn.wo_b.scale",
+    "attn.wq_a.weight",
+    "attn.wq_b.weight",
+    "attn.wq_b.scale",
+    "attn_norm.weight",
+    "ffn.gate.weight",
+    "ffn.shared_experts.w1.weight",
+    "ffn.shared_experts.w1.scale",
+    "ffn.shared_experts.w2.weight",
+    "ffn.shared_experts.w2.scale",
+    "ffn.shared_experts.w3.weight",
+    "ffn.shared_experts.w3.scale",
+    "ffn_norm.weight",
+    "hc_attn_base",
+    "hc_attn_fn",
+    "hc_attn_scale",
+    "hc_ffn_base",
+    "hc_ffn_fn",
+    "hc_ffn_scale",
+)
+_LAYER_COMPRESSOR_SUFFIXES = (
+    "attn.compressor.ape",
+    "attn.compressor.norm.weight",
+    "attn.compressor.wgate.weight",
+    "attn.compressor.wkv.weight",
+)
+_LAYER_INDEXER_SUFFIXES = (
+    "attn.indexer.compressor.ape",
+    "attn.indexer.compressor.norm.weight",
+    "attn.indexer.compressor.wgate.weight",
+    "attn.indexer.compressor.wkv.weight",
+    "attn.indexer.weights_proj.weight",
+    "attn.indexer.wq_b.weight",
+    "attn.indexer.wq_b.scale",
+)
+_EXPERT_SUFFIXES = ("w1.weight", "w1.scale", "w2.weight", "w2.scale", "w3.weight", "w3.scale")
+_DEEPSEEK_V4_O_GROUPS = 8
+_DEEPSEEK_V4_HADAMARD_IDX_DIM = 128
+_DEEPSEEK_V4_HCA_COMPRESS_RATIO = 128
+_DEEPSEEK_V4_CSA_COMPRESS_RATIO = 4
+_DEEPSEEK_V4_HCA_MAIN_OUT_DIM = 512
+_DEEPSEEK_V4_CSA_MAIN_OUT_DIM = 1024
+_DEEPSEEK_V4_CSA_INNER_OUT_DIM = 256
+_DEEPSEEK_V4_HIDDEN_SIZE = 4096
+_DEEPSEEK_V4_Q_LORA = 1024
+_DEEPSEEK_V4_HEAD_DIM = 512
+_DEEPSEEK_V4_ATTENTION_OUT = 64 * 512
+_DEEPSEEK_V4_N_ROUTED_EXPERTS = 256
+_DEEPSEEK_V4_TOPK = 6
+_DEEPSEEK_V4_VOCAB_SIZE = 129280
+
+
+def _default_safe_open(path: Path, device: str) -> ContextManager[_SafeTensorReader]:
+    """Open a safetensors shard without loading unrelated tensors."""
+    try:
+        from safetensors import safe_open
+    except ImportError as exc:
+        raise RuntimeError("safetensors is required to read DeepSeekV4 W8A8 weights.") from exc
+
+    return safe_open(str(path), framework="pt", device=device)
+
+
+def deepseek_v4_global_weight_names() -> tuple[str, ...]:
+    """Return global DeepSeekV4 tensor names needed outside the layer stack."""
+    return _GLOBAL_WEIGHT_NAMES
+
+
+@dataclass(frozen=True)
+class DeepSeekV4LmHeadLayout:
+    """8-way tensor-parallel LM-head shard layout."""
+
+    ranks: int
+    vocab_size: int
+    hidden_size: int
+    vocab_per_rank: int
+    padded_vocab_per_rank: int
+
+
+@dataclass(frozen=True)
+class DeepSeekV4GlobalWeights:
+    """Global DeepSeekV4 weights packed for serving kernels."""
+
+    embed_weight: torch.Tensor
+    final_norm_weight: torch.Tensor
+    lm_head_weight: torch.Tensor
+    lm_head_layout: DeepSeekV4LmHeadLayout
+    hc_head_fn: torch.Tensor
+    hc_head_scale: torch.Tensor
+    hc_head_base: torch.Tensor
+
+
+@dataclass(frozen=True)
+class DeepSeekV4PackedLayerWeights:
+    """One DeepSeekV4 layer's tensors packed in pypto-lib host argument names."""
+
+    layer_id: int
+    tensors: Mapping[str, torch.Tensor]
+
+    def args(self, names: Sequence[str]) -> tuple[torch.Tensor, ...]:
+        """Return tensors in a kernel host order."""
+        missing = [name for name in names if name not in self.tensors]
+        if missing:
+            raise KeyError(f"Packed DeepSeekV4 layer is missing tensors: {', '.join(missing)}")
+        return tuple(self.tensors[name] for name in names)
+
+
+# Layer-stacking groups for the packed all-layer ``l3_decode_fwd`` kernel. These
+# mirror the name groups in pypto-lib decode_fwd.py, but only cover *loaded*
+# weights -- the per-layer work-cache/state tensors (kv_cache, cmp_kv,
+# idx_kv_cache, *_compress_state) are owned by the runner work cache and are not
+# emitted by the weight loader.
+DEEPSEEK_V4_CSA_STACKED_WEIGHT_NAMES = (
+    "csa_cmp_wkv",
+    "csa_cmp_wgate",
+    "csa_cmp_ape",
+    "csa_cmp_norm_w",
+    "csa_idx_wq_b",
+    "csa_idx_wq_b_scale",
+    "csa_weights_proj",
+    "csa_hadamard_idx",
+    "csa_inner_wkv",
+    "csa_inner_wgate",
+    "csa_inner_ape",
+    "csa_inner_norm_w",
+)
+DEEPSEEK_V4_HCA_STACKED_WEIGHT_NAMES = (
+    "hca_cmp_wkv",
+    "hca_cmp_wgate",
+    "hca_cmp_ape",
+    "hca_cmp_norm_w",
+)
+_DEEPSEEK_V4_CSA_COMPRESS_RATIO_VALUE = 4
+_DEEPSEEK_V4_HCA_COMPRESS_RATIO_VALUE = 128
+
+
+@dataclass(frozen=True)
+class DeepSeekV4StackedLayerWeights:
+    """All hidden-layer weights stacked on the layer axis for ``l3_decode_fwd``.
+
+    Each tensor fuses its layer axis into dim 1: ``[ranks, layer_count*d1, ...]``.
+    FWD weights stack across all 43 hidden layers; CSA-group weights stack across
+    the 21 compress_ratio==4 layers in order; HCA-group weights stack across the
+    20 compress_ratio==128 layers in order.
+    """
+
+    tensors: Mapping[str, torch.Tensor]
+
+    def args(self, names: Sequence[str]) -> tuple[torch.Tensor, ...]:
+        """Return stacked tensors in a kernel host order."""
+        missing = [name for name in names if name not in self.tensors]
+        if missing:
+            raise KeyError(f"Stacked DeepSeekV4 weights are missing tensors: {', '.join(missing)}")
+        return tuple(self.tensors[name] for name in names)
+
+
+def deepseek_v4_lm_head_layout(
+    *,
+    vocab_size: int,
+    hidden_size: int,
+    ranks: int,
+    vocab_chunk: int = _LM_HEAD_VOCAB_CHUNK,
+) -> DeepSeekV4LmHeadLayout:
+    """Return the LM-head shard shape expected by ``lm_head.py``."""
+    if ranks <= 0:
+        raise ValueError("ranks must be positive")
+    if vocab_chunk <= 0:
+        raise ValueError("vocab_chunk must be positive")
+    if vocab_size % ranks != 0:
+        raise ValueError(f"vocab_size={vocab_size} must divide evenly across ranks={ranks}")
+    vocab_per_rank = vocab_size // ranks
+    padded_vocab_per_rank = ((vocab_per_rank + vocab_chunk - 1) // vocab_chunk) * vocab_chunk
+    return DeepSeekV4LmHeadLayout(
+        ranks=ranks,
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        vocab_per_rank=vocab_per_rank,
+        padded_vocab_per_rank=padded_vocab_per_rank,
+    )
+
+
+def pack_deepseek_v4_lm_head_weight(
+    weight: torch.Tensor,
+    *,
+    ranks: int,
+    vocab_chunk: int = _LM_HEAD_VOCAB_CHUNK,
+) -> tuple[torch.Tensor, DeepSeekV4LmHeadLayout]:
+    """Pack flat ``head.weight`` into contiguous TP vocab shards."""
+    if weight.ndim != 2:
+        raise ValueError(f"lm_head weight must be rank-2, got shape={tuple(weight.shape)}")
+    vocab_size, hidden_size = (int(dim) for dim in weight.shape)
+    layout = deepseek_v4_lm_head_layout(
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        ranks=ranks,
+        vocab_chunk=vocab_chunk,
+    )
+    packed = torch.zeros(
+        (layout.ranks, layout.padded_vocab_per_rank, layout.hidden_size),
+        dtype=weight.dtype,
+        device=weight.device,
+    )
+    for rank in range(layout.ranks):
+        start = rank * layout.vocab_per_rank
+        end = start + layout.vocab_per_rank
+        packed[rank, : layout.vocab_per_rank].copy_(weight[start:end])
+    return packed.contiguous(), layout
+
+
+def _attention_suffixes_for_compress_ratio(compress_ratio: int) -> tuple[str, ...]:
+    """Return attention parameter suffixes required by one layer attention mode."""
+    if compress_ratio == 0:
+        return ()
+    if compress_ratio == 128:
+        return _LAYER_COMPRESSOR_SUFFIXES
+    if compress_ratio == 4:
+        return (*_LAYER_COMPRESSOR_SUFFIXES, *_LAYER_INDEXER_SUFFIXES)
+    raise ValueError(f"unsupported DeepSeekV4 attention compress ratio: {compress_ratio}")
+
+
+def deepseek_v4_layer_core_weight_names(
+    layer_id: int,
+    *,
+    compress_ratio: int = 0,
+    include_tid2eid: bool = False,
+    include_gate_bias: bool = False,
+) -> tuple[str, ...]:
+    """Return non-routed-expert tensor names for one DeepSeekV4 layer."""
+    prefix = f"layers.{int(layer_id)}"
+    suffixes = [*_LAYER_COMMON_SUFFIXES, *_attention_suffixes_for_compress_ratio(compress_ratio)]
+    if include_tid2eid:
+        suffixes.append("ffn.gate.tid2eid")
+    if include_gate_bias:
+        suffixes.append("ffn.gate.bias")
+    return tuple(f"{prefix}.{suffix}" for suffix in suffixes)
+
+
+def deepseek_v4_routed_expert_weight_names(layer_id: int, expert_ids: Iterable[int]) -> tuple[str, ...]:
+    """Return routed expert tensor names for one DeepSeekV4 layer."""
+    names: list[str] = []
+    for expert_id in expert_ids:
+        prefix = f"layers.{int(layer_id)}.ffn.experts.{int(expert_id)}"
+        names.extend(f"{prefix}.{suffix}" for suffix in _EXPERT_SUFFIXES)
+    return tuple(names)
+
+
+def deepseek_v4_local_expert_ids(*, rank: int, ranks: int, n_routed_experts: int) -> tuple[int, ...]:
+    """Return the contiguous routed-expert ids owned by one EP rank."""
+    if ranks <= 0:
+        raise ValueError("ranks must be positive")
+    if not 0 <= rank < ranks:
+        raise ValueError(f"rank must be in [0, {ranks - 1}], got {rank}")
+    if n_routed_experts <= 0:
+        raise ValueError("n_routed_experts must be positive")
+    if n_routed_experts % ranks != 0:
+        raise ValueError(f"n_routed_experts={n_routed_experts} must divide evenly across ranks={ranks}")
+    local_count = n_routed_experts // ranks
+    start = rank * local_count
+    return tuple(range(start, start + local_count))
+
+
+def deepseek_v4_hadamard_idx(dim: int = _DEEPSEEK_V4_HADAMARD_IDX_DIM) -> torch.Tensor:
+    """Return the normalized Hadamard matrix used by the CSA indexer."""
+    if dim <= 0 or dim & (dim - 1) != 0:
+        raise ValueError("Hadamard dimension must be a positive power of two")
+    h = torch.ones((1, 1), dtype=torch.bfloat16)
+    while h.shape[0] < dim:
+        h = torch.cat(
+            [torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)],
+            dim=0,
+        )
+    return (h * (dim**-0.5)).contiguous()
+
+
+def deepseek_v4_layer_weight_names(
+    layer_id: int,
+    *,
+    n_routed_experts: int,
+    compress_ratio: int = 0,
+    include_tid2eid: bool = False,
+    include_gate_bias: bool = False,
+    expert_ids: Iterable[int] | None = None,
+) -> tuple[str, ...]:
+    """Return all tensor names needed to execute one DeepSeekV4 layer."""
+    if n_routed_experts <= 0:
+        raise ValueError("n_routed_experts must be positive")
+    expert_ids = range(n_routed_experts) if expert_ids is None else tuple(expert_ids)
+    return (
+        *deepseek_v4_layer_core_weight_names(
+            layer_id,
+            compress_ratio=compress_ratio,
+            include_tid2eid=include_tid2eid,
+            include_gate_bias=include_gate_bias,
+        ),
+        *deepseek_v4_routed_expert_weight_names(layer_id, expert_ids),
+    )
+
+
+def deepseek_v4_startup_weight_names(
+    num_hidden_layers: int,
+    *,
+    n_routed_experts: int,
+    compress_ratios: Sequence[int] | None = None,
+    num_hash_layers: int = 3,
+) -> tuple[str, ...]:
+    """Return tensor names used for metadata-only checkpoint contract validation.
+
+    Startup checks every layer's core tensors plus the first and last routed
+    expert in each layer. Full expert materialization remains an explicit
+    per-layer load so serving startup does not read shard payloads.
+    """
+    if num_hidden_layers <= 0:
+        raise ValueError("num_hidden_layers must be positive")
+    if n_routed_experts <= 0:
+        raise ValueError("n_routed_experts must be positive")
+    if compress_ratios is None:
+        compress_ratios = (0,) * num_hidden_layers
+    if len(compress_ratios) < num_hidden_layers:
+        raise ValueError("compress_ratios must include at least one entry per hidden layer")
+
+    edge_experts = tuple(dict.fromkeys((0, n_routed_experts - 1)))
+    names = list(_GLOBAL_WEIGHT_NAMES)
+    for layer_id in range(num_hidden_layers):
+        names.extend(
+            deepseek_v4_layer_core_weight_names(
+                layer_id,
+                compress_ratio=int(compress_ratios[layer_id]),
+                include_tid2eid=layer_id < num_hash_layers,
+                include_gate_bias=layer_id >= num_hash_layers,
+            )
+        )
+        names.extend(deepseek_v4_routed_expert_weight_names(layer_id, edge_experts))
+    return tuple(dict.fromkeys(names))
+
+
