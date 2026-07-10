@@ -99,7 +99,6 @@ class _CompiledKernels:
     prefill_logits_buffer: torch.Tensor
     prefill_sampled_ids_buffer: torch.Tensor
     prefill_next_hidden_buffer: torch.Tensor
-    decode_hidden_buffer: torch.Tensor
     decode_seq_lens_buffer: torch.Tensor
     decode_block_table_buffer: torch.Tensor
     decode_slot_mapping_buffer: torch.Tensor
@@ -140,7 +139,6 @@ class _DecodeKernelInputs:
 
     actual_batch: int
     token_ids: torch.Tensor
-    hidden: torch.Tensor
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
@@ -446,7 +444,6 @@ class Qwen314BModelRunner(ModelRunner):
         logger.info(f"[warmup] prefill done ({time.perf_counter() - t0:.2f} s)")
 
         # -- decode (full fixed batch, minimal seq) -------------------------
-        compiled.decode_hidden_buffer.zero_()
         compiled.decode_token_ids_buffer.zero_()
         compiled.decode_seq_lens_buffer.zero_()
         compiled.decode_block_table_buffer.fill_(0)     # all reads from page 0
@@ -458,7 +455,6 @@ class Qwen314BModelRunner(ModelRunner):
         decode_kernel_inputs = _DecodeKernelInputs(
             actual_batch=batch,
             token_ids=compiled.decode_token_ids_buffer,
-            hidden=compiled.decode_hidden_buffer,
             seq_lens=compiled.decode_seq_lens_buffer,
             block_table=compiled.decode_block_table_buffer,
             slot_mapping=compiled.decode_slot_mapping_buffer,
@@ -546,7 +542,6 @@ class Qwen314BModelRunner(ModelRunner):
             compiled.prefill_logits_buffer,
             compiled.prefill_sampled_ids_buffer,
             compiled.prefill_next_hidden_buffer,
-            compiled.decode_hidden_buffer,
             compiled.decode_seq_lens_buffer,
             compiled.decode_block_table_buffer,
             compiled.decode_slot_mapping_buffer,
@@ -759,7 +754,6 @@ class Qwen314BModelRunner(ModelRunner):
         static = self._require_static_args()
         weights = static.decode_weights
         return (
-            inputs.hidden,
             weights["decode_input_rms_weight"],
             weights["decode_wq"],
             weights["decode_wk"],
@@ -805,11 +799,6 @@ class Qwen314BModelRunner(ModelRunner):
                 f"{compiled.decode_logits_buffer.shape[0]}"
             )
 
-        hidden = compiled.decode_hidden_buffer
-        hidden[:actual_batch].copy_(inputs.hidden)
-        if actual_batch < kernel_batch:
-            hidden[actual_batch:].copy_(inputs.hidden[0:1].expand(kernel_batch - actual_batch, -1))
-
         token_ids = compiled.decode_token_ids_buffer
         token_ids.zero_()
         active_token_ids = inputs.token_ids.reshape(actual_batch, -1)
@@ -828,7 +817,6 @@ class Qwen314BModelRunner(ModelRunner):
         return _DecodeKernelInputs(
             actual_batch=actual_batch,
             token_ids=token_ids,
-            hidden=hidden,
             seq_lens=self._copy_replicated_rows(
                 compiled.decode_seq_lens_buffer,
                 inputs.seq_lens,
