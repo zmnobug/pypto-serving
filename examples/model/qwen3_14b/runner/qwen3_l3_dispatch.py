@@ -77,7 +77,6 @@ def qwen3_prefill_host(
 
 @pl.jit.host
 def qwen3_decode_host(
-    hidden_states: pl.Tensor,
     input_rms_weight: pl.Tensor,
     wq: pl.Tensor,
     wk: pl.Tensor,
@@ -105,7 +104,6 @@ def qwen3_decode_host(
     next_hidden: pl.Out[pl.Tensor],
 ) -> tuple[pl.Tensor, pl.Tensor, pl.Tensor]:
     logits, sampled_ids, next_hidden = decode_fwd(
-        hidden_states,
         input_rms_weight,
         wq,
         wk,

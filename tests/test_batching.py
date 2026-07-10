@@ -178,7 +178,6 @@ def _compiled_kernels(
         prefill_logits_buffer=torch.empty(kernel_batch, model.config.vocab_size),
         prefill_sampled_ids_buffer=torch.empty(kernel_batch, 1, dtype=torch.int32),
         prefill_next_hidden_buffer=torch.empty(kernel_batch, hidden_size, dtype=torch.bfloat16),
-        decode_hidden_buffer=torch.zeros(kernel_batch, hidden_size, dtype=torch.bfloat16),
         decode_seq_lens_buffer=torch.zeros(kernel_batch, dtype=torch.int32),
         decode_block_table_buffer=torch.zeros(kernel_batch * max_blocks, dtype=torch.int32),
         decode_slot_mapping_buffer=torch.zeros(kernel_batch, dtype=torch.int32),

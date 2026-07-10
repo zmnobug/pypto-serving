@@ -361,10 +361,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             (kernel_batch, padded_vocab),
             dtype=torch.float32,
         ).share_memory_()
-        decode_hidden_buffer = torch.empty(
-            (kernel_batch, model.config.hidden_size),
-            dtype=torch.bfloat16,
-        ).share_memory_()
         decode_seq_lens_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
         decode_block_table_buffer = torch.empty(
             (kernel_batch * max_blocks_per_seq,),
@@ -408,7 +404,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             prefill_logits_buffer=prefill_logits_buffer,
             prefill_sampled_ids_buffer=prefill_sampled_ids_buffer,
             prefill_next_hidden_buffer=prefill_next_hidden_buffer,
-            decode_hidden_buffer=decode_hidden_buffer,
             decode_seq_lens_buffer=decode_seq_lens_buffer,
             decode_block_table_buffer=decode_block_table_buffer,
             decode_slot_mapping_buffer=decode_slot_mapping_buffer,
@@ -487,9 +482,9 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
     ) -> _L3Callable:
         """Compile the fused all-layer PAGED decode HOST wrapper into a distributed program.
 
-        Signature (22 args; PAGED KV via block_table + slot_mapping, same pool as
+        Signature (21 args; PAGED KV via block_table + slot_mapping, same pool as
         prefill):
-          hidden_states, input_rms_weight, wq, wk, wv, q_norm_weight,
+          input_rms_weight, wq, wk, wv, q_norm_weight,
           k_norm_weight, seq_lens, block_table, slot_mapping, rope_cos, rope_sin,
           k_cache, v_cache, wo, w_gate, w_up, w_down, post_rms_weight,
           final_norm_weight, lm_head_weight, out.
@@ -505,7 +500,6 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         runtime_cache_blocks = (max_seq + page_size - 1) // page_size
         cache_rows = num_layers * batch * runtime_cache_blocks * num_kv_heads * page_size
         dummy_args = [
-            torch.empty((batch, hidden_size), dtype=torch.bfloat16),                          # hidden_states
             torch.empty((num_layers, hidden_size), dtype=torch.float32),                      # input_rms_weight
             torch.empty((num_layers * hidden_size, hidden_size), dtype=torch.bfloat16),        # wq
             torch.empty((num_layers * hidden_size, kv_hidden), dtype=torch.bfloat16),          # wk
