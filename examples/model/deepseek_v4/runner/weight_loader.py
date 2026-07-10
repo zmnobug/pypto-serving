@@ -383,3 +383,234 @@ def deepseek_v4_startup_weight_names(
     return tuple(dict.fromkeys(names))
 
 
+class DeepSeekV4WeightStore:
+    """Lazy name-based safetensors access for DeepSeekV4 W8A8 checkpoints."""
+
+    def __init__(
+        self,
+        *,
+        model_dir: str | Path,
+        weight_map: Mapping[str, str],
+        device: str = "cpu",
+        safe_open_fn: _SafeOpenFn | None = None,
+    ) -> None:
+        """Create a store from the Hugging Face safetensors index."""
+        self.model_dir = Path(model_dir)
+        self.weight_map = dict(weight_map)
+        self.device = device
+        self._safe_open_fn = _default_safe_open if safe_open_fn is None else safe_open_fn
+
+    def __contains__(self, name: object) -> bool:
+        """Return whether the checkpoint index exposes ``name``."""
+        return isinstance(name, str) and name in self.weight_map
+
+    def filename_for(self, name: str) -> str:
+        """Return the safetensors shard filename for ``name``."""
+        try:
+            return self.weight_map[name]
+        except KeyError as exc:
+            raise KeyError(f"Missing DeepSeekV4 weight tensor in index: {name}") from exc
+
+    def path_for(self, name: str) -> Path:
+        """Return the shard path containing ``name``."""
+        return self.model_dir / self.filename_for(name)
+
+    def require(self, names: Iterable[str]) -> None:
+        """Validate that all tensor names are present in the checkpoint index."""
+        missing = [name for name in names if name not in self.weight_map]
+        if missing:
+            preview = ", ".join(missing[:8])
+            suffix = "" if len(missing) <= 8 else f", ... ({len(missing)} total)"
+            raise KeyError(f"DeepSeekV4 W8A8 checkpoint is missing required tensors: {preview}{suffix}")
+
+    def validate_startup_contract(
+        self,
+        *,
+        num_hidden_layers: int,
+        n_routed_experts: int,
+        compress_ratios: Sequence[int] | None = None,
+        num_hash_layers: int = 3,
+    ) -> None:
+        """Validate the startup-visible checkpoint contract without opening shards."""
+        self.require(
+            deepseek_v4_startup_weight_names(
+                num_hidden_layers,
+                n_routed_experts=n_routed_experts,
+                compress_ratios=compress_ratios,
+                num_hash_layers=num_hash_layers,
+            )
+        )
+
+    def load_tensor(self, name: str) -> torch.Tensor:
+        """Load one tensor by name, leaving all unrelated shard tensors untouched."""
+        return self.load_many([name])[name]
+
+    def load_many(self, names: Sequence[str]) -> dict[str, torch.Tensor]:
+        """Load a set of named tensors grouped by shard file."""
+        unique_names = tuple(dict.fromkeys(names))
+        self.require(unique_names)
+
+        groups: dict[str, list[str]] = {}
+        for name in unique_names:
+            groups.setdefault(self.filename_for(name), []).append(name)
+
+        loaded: dict[str, torch.Tensor] = {}
+        for filename, shard_names in groups.items():
+            path = self.model_dir / filename
+            if not path.exists():
+                raise FileNotFoundError(f"Missing safetensors shard for DeepSeekV4 weight load: {path}")
+            with self._safe_open_fn(path, self.device) as reader:
+                for name in shard_names:
+                    loaded[name] = reader.get_tensor(name)
+
+        return {name: loaded[name] for name in unique_names}
+
+    def load_global_weights(self) -> dict[str, torch.Tensor]:
+        """Load embedding, final norm, and LM head tensors."""
+        return self.load_many(deepseek_v4_global_weight_names())
+
+    def load_packed_global_weights(self, *, ranks: int) -> DeepSeekV4GlobalWeights:
+        """Load and pack global tensors for the DeepSeekV4 serving kernels."""
+        weights = self.load_global_weights()
+        packed_lm_head, layout = pack_deepseek_v4_lm_head_weight(weights["head.weight"], ranks=ranks)
+        if weights["embed.weight"].ndim != 2:
+            raise ValueError(f"embed.weight must be rank-2, got shape={tuple(weights['embed.weight'].shape)}")
+        if weights["norm.weight"].ndim != 1:
+            raise ValueError(f"norm.weight must be rank-1, got shape={tuple(weights['norm.weight'].shape)}")
+        if tuple(weights["embed.weight"].shape) != (layout.vocab_size, layout.hidden_size):
+            raise ValueError(
+                "embed.weight shape must match head.weight shape, "
+                f"got embed={tuple(weights['embed.weight'].shape)}, head={tuple(weights['head.weight'].shape)}"
+            )
+        if int(weights["norm.weight"].shape[0]) != layout.hidden_size:
+            raise ValueError(
+                f"norm.weight hidden size must be {layout.hidden_size}, "
+                f"got {int(weights['norm.weight'].shape[0])}"
+            )
+        if tuple(weights["hc_head_fn"].shape) != (4, layout.hidden_size * 4):
+            raise ValueError(f"hc_head_fn has unsupported shape {tuple(weights['hc_head_fn'].shape)}")
+        if tuple(weights["hc_head_scale"].shape) != (1,):
+            raise ValueError(f"hc_head_scale has unsupported shape {tuple(weights['hc_head_scale'].shape)}")
+        if tuple(weights["hc_head_base"].shape) != (4,):
+            raise ValueError(f"hc_head_base has unsupported shape {tuple(weights['hc_head_base'].shape)}")
+        return DeepSeekV4GlobalWeights(
+            embed_weight=weights["embed.weight"],
+            final_norm_weight=weights["norm.weight"],
+            lm_head_weight=packed_lm_head,
+            lm_head_layout=layout,
+            hc_head_fn=weights["hc_head_fn"].to(torch.float32).contiguous().cpu(),
+            hc_head_scale=weights["hc_head_scale"].to(torch.float32).contiguous().cpu(),
+            hc_head_base=weights["hc_head_base"].to(torch.float32).contiguous().cpu(),
+        )
+
+    def load_layer_weights(
+        self,
+        layer_id: int,
+        *,
+        n_routed_experts: int,
+        compress_ratio: int = 0,
+        include_tid2eid: bool = False,
+        include_gate_bias: bool = False,
+        expert_ids: Iterable[int] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Load all tensors needed for one DeepSeekV4 layer."""
+        return self.load_many(
+            deepseek_v4_layer_weight_names(
+                layer_id,
+                n_routed_experts=n_routed_experts,
+                compress_ratio=compress_ratio,
+                include_tid2eid=include_tid2eid,
+                include_gate_bias=include_gate_bias,
+                expert_ids=expert_ids,
+            )
+        )
+
+    def load_rank_layer_weights(
+        self,
+        layer_id: int,
+        *,
+        rank: int,
+        ranks: int,
+        n_routed_experts: int,
+        compress_ratio: int = 0,
+        include_tid2eid: bool = False,
+        include_gate_bias: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Load common layer tensors plus the routed experts owned by one rank."""
+        local_experts = deepseek_v4_local_expert_ids(
+            rank=rank,
+            ranks=ranks,
+            n_routed_experts=n_routed_experts,
+        )
+        return self.load_layer_weights(
+            layer_id,
+            n_routed_experts=n_routed_experts,
+            compress_ratio=compress_ratio,
+            include_tid2eid=include_tid2eid,
+            include_gate_bias=include_gate_bias,
+            expert_ids=local_experts,
+        )
+
+    def load_packed_layer_weights(
+        self,
+        layer_id: int,
+        *,
+        ranks: int,
+        n_routed_experts: int,
+        compress_ratio: int = 0,
+        include_tid2eid: bool = False,
+        include_gate_bias: bool = False,
+    ) -> DeepSeekV4PackedLayerWeights:
+        """Load and pack one layer into the tensor names expected by pypto-lib kernels."""
+        all_experts = range(n_routed_experts)
+        raw = self.load_layer_weights(
+            layer_id,
+            n_routed_experts=n_routed_experts,
+            compress_ratio=compress_ratio,
+            include_tid2eid=include_tid2eid,
+            include_gate_bias=include_gate_bias,
+            expert_ids=all_experts,
+        )
+        return pack_deepseek_v4_layer_weights(
+            layer_id,
+            raw,
+            ranks=ranks,
+            n_routed_experts=n_routed_experts,
+            compress_ratio=compress_ratio,
+            include_tid2eid=include_tid2eid,
+            include_gate_bias=include_gate_bias,
+        )
+
+    def load_stacked_layer_weights(
+        self,
+        *,
+        ranks: int,
+        n_routed_experts: int,
+        compress_ratios: Sequence[int],
+        num_hash_layers: int,
+    ) -> DeepSeekV4StackedLayerWeights:
+        """Load every hidden layer once and stack weights on the layer axis.
+
+        FWD weights are concatenated across all hidden layers in order; CSA-group
+        weights across the compress_ratio==4 layers in order; HCA-group weights
+        across the compress_ratio==128 layers in order. Each per-layer tensor is
+        ``[ranks, d1, ...]`` and stacking concatenates on dim 1.
+        """
+        num_hidden_layers = len(compress_ratios)
+        if num_hidden_layers <= 0:
+            raise ValueError("compress_ratios must include at least one entry per hidden layer")
+        per_layer: list[DeepSeekV4PackedLayerWeights] = []
+        for layer_id in range(num_hidden_layers):
+            per_layer.append(
+                self.load_packed_layer_weights(
+                    layer_id,
+                    ranks=ranks,
+                    n_routed_experts=n_routed_experts,
+                    compress_ratio=int(compress_ratios[layer_id]),
+                    include_tid2eid=layer_id < num_hash_layers,
+                    include_gate_bias=layer_id >= num_hash_layers,
+                )
+            )
+        return stack_deepseek_v4_layer_weights(per_layer, compress_ratios=compress_ratios)
+
+
