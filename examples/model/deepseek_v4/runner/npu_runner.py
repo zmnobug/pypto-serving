@@ -857,3 +857,794 @@ def build_deepseek_v4_layer_plan(
     )
 
 
+class DeepSeekV4ModelRunner(ModelRunner):
+    """Runner boundary for DeepSeekV4 W8A8 kernels and model-specific caches."""
+
+    def __init__(self, *, compiled: DeepSeekV4CompiledKernels) -> None:
+        super().__init__()
+        self._compiled = compiled
+        self.cache_manager = DeepSeekV4CacheManager(layout=compiled.layout)
+        self.input_builder: DeepSeekV4InputBuilder | None = None
+        self._l3_worker: Any | None = None
+        self._l3_static_tensors: dict[tuple[int, tuple[int, ...], torch.dtype], DeviceTensor] = {}
+        self._decode_work_cache: DeepSeekV4LayerCache | None = None
+        self._decode_cache_seeded_slots: set[int] = set()
+        self._prefill_cache_snapshots: dict[int, DeepSeekV4LayerCacheSnapshot] = {}
+        self._global_weights: DeepSeekV4GlobalWeights | None = None
+        self._static_final_norm_weight: torch.Tensor | None = None
+        self._static_freqs_cos: torch.Tensor | None = None
+        self._static_freqs_sin: torch.Tensor | None = None
+        self._prefill_fwd_buffers: _DeepSeekV4PrefillFwdSharedBuffers | None = None
+        self._decode_buffers: _DeepSeekV4DecodeSharedBuffers | None = None
+        self._stacked_weight_buffers: dict[str, torch.Tensor] | None = None
+        self._hc_head_buffers: dict[str, torch.Tensor] | None = None
+        self._decode_logits_buffer: torch.Tensor | None = None
+        self._prefill_output_buffer: torch.Tensor | None = None
+
+    def init_kv_cache(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> int:
+        """Initialize runner state and return scheduler-only KV block capacity.
+
+        DeepSeekV4 owns its NPU cache tensors and fixed slot mapping internally,
+        so no generic KV tensors are allocated here. The scheduler still needs a
+        positive block pool for host-side request budgeting and preemption.
+        """
+        self.input_builder = DeepSeekV4InputBuilder(
+            layout=self._compiled.layout,
+            hidden_size=config.hidden_size,
+        )
+        self._decode_cache_seeded_slots.clear()
+        if runtime.total_kv_pages is not None:
+            return int(runtime.total_kv_pages)
+        max_blocks_per_seq = math.ceil(runtime.max_seq_len / runtime.page_size)
+        return int(runtime.max_batch_size * max_blocks_per_seq)
+
+    def release_finished_requests(self, request_ids: Iterable[str]) -> None:
+        """Release runner-owned cache slots for finished requests."""
+        request_ids = tuple(request_ids)
+        self.cache_manager.release(request_ids)
+        if request_ids:
+            self._prefill_cache_snapshots.clear()
+            self._decode_cache_seeded_slots.clear()
+
+    def load_packed_global_weights(self) -> DeepSeekV4GlobalWeights:
+        """Load global tensors and pack the LM head for host-side projection."""
+        if self._global_weights is None:
+            self._global_weights = self._compiled.weight_store.load_packed_global_weights(
+                ranks=self._compiled.layout.ranks
+            )
+        return self._global_weights
+
+    def load_stacked_layer_weights(self) -> DeepSeekV4StackedLayerWeights:
+        """Load and stack all hidden-layer weights for the packed decode_fwd kernel."""
+        compress_ratios = tuple(int(layer.compress_ratio) for layer in self._compiled.layer_plan)
+        return self._compiled.weight_store.load_stacked_layer_weights(
+            ranks=self._compiled.layout.ranks,
+            n_routed_experts=self._compiled.n_routed_experts,
+            compress_ratios=compress_ratios,
+            num_hash_layers=self._compiled.num_hash_layers,
+        )
+
+    def prepare_prefill_inputs(self, model: RuntimeModel, batch: PrefillBatch) -> DeepSeekV4PreparedPrefillInputs:
+        """Build DeepSeekV4 prefill host inputs for the current scheduler chunk."""
+        builder = self._require_input_builder()
+        layout = self._compiled.layout
+        if len(batch.request_ids) != layout.prefill_batch:
+            raise ValueError(
+                f"DeepSeekV4 prefill kernels support exactly {layout.prefill_batch} request per dispatch, "
+                f"got {len(batch.request_ids)}"
+            )
+        request_id = batch.request_ids[0]
+        slot = self.cache_manager.allocate(request_id)
+        if slot is None:
+            raise RuntimeError("DeepSeekV4 cache slots exhausted")
+
+        actual_tokens = self._prefill_actual_tokens(batch)
+        positions = self._prefill_positions(batch, actual_tokens)
+        if positions[-1] >= model.runtime.max_seq_len:
+            raise ValueError(
+                f"prefill position {positions[-1]} exceeds max_seq_len={model.runtime.max_seq_len}"
+            )
+        embeddings = batch.input_embeddings[0, :actual_tokens].to(torch.bfloat16).cpu()
+        token_ids = batch.token_ids[0, :actual_tokens].detach().cpu().to(torch.long)
+        kernel_tokens = self._prefill_kernel_tokens(actual_tokens)
+        kernel_positions = self._prefill_kernel_positions(
+            positions,
+            kernel_tokens=kernel_tokens,
+            max_seq_len=model.runtime.max_seq_len,
+        )
+        kernel_slots = self._prefill_kernel_slots(
+            slot,
+            actual_tokens=actual_tokens,
+            kernel_tokens=kernel_tokens,
+        )
+        kernel_embeddings = self._padded_rows(embeddings, kernel_tokens)
+        kernel_token_ids = self._padded_vector(token_ids, kernel_tokens, dtype=torch.long)
+        sparse_by_ratio = self._prefill_sparse_by_ratio(kernel_positions, kernel_tokens)
+
+        return DeepSeekV4PreparedPrefillInputs(
+            request_id=request_id,
+            slot=slot,
+            actual_tokens=actual_tokens,
+            x_hc=builder.prefill_x_hc(kernel_embeddings, actual_tokens=kernel_tokens),
+            input_ids=self._rank_stack(self._padded_vector(kernel_token_ids, layout.prefill_seq, dtype=torch.long)),
+            position_ids=self._rank_stack(self._prefill_position_ids(kernel_positions, layout.prefill_seq)),
+            ori_block_table=self._rank_stack(
+                self.cache_manager.block_table([slot], max_blocks=layout.ori_max_blocks)[0]
+            ),
+            ori_slot_mapping=self._rank_stack(
+                self._pad_prefill_mapping(
+                    self._prefill_sliding_window_slot_mapping(kernel_slots, kernel_positions),
+                    layout.prefill_seq,
+                )
+            ),
+            cmp_block_table=self._rank_stack(
+                self.cache_manager.block_table([slot], max_blocks=layout.prefill_cmp_max_blocks)[0]
+            ),
+            idx_block_table=self._rank_stack(
+                self.cache_manager.block_table([slot], max_blocks=layout.prefill_idx_max_blocks)[0]
+            ),
+            hca_compress_state_block_table=self._rank_stack(
+                self.cache_manager.block_table([slot], max_blocks=layout.prefill_hca_state_max_blocks)[0]
+            ),
+            csa_compress_state_block_table=self._rank_stack(
+                self.cache_manager.block_table([slot], max_blocks=layout.prefill_csa_state_max_blocks)[0]
+            ),
+            csa_inner_compress_state_block_table=self._rank_stack(
+                self.cache_manager.block_table([slot], max_blocks=layout.prefill_csa_inner_state_max_blocks)[0]
+            ),
+            hca_cmp_slot_mapping=self._rank_stack(
+                self._pad_prefill_mapping(
+                    self._prefill_compressed_slot_mapping(
+                        kernel_slots,
+                        kernel_positions,
+                        max_blocks=layout.prefill_cmp_max_blocks,
+                        compress_ratio=128,
+                    ),
+                    layout.prefill_seq,
+                )
+            ),
+            hca_state_slot_mapping=self._rank_stack(
+                self._pad_prefill_mapping(
+                    self._prefill_state_slot_mapping(
+                        kernel_slots,
+                        kernel_positions,
+                        max_blocks=layout.prefill_hca_state_max_blocks,
+                        state_block_size=layout.c128_state_block_size,
+                    ),
+                    layout.prefill_seq,
+                )
+            ),
+            csa_cmp_slot_mapping=self._rank_stack(
+                self._pad_prefill_mapping(
+                    self._prefill_compressed_slot_mapping(
+                        kernel_slots,
+                        kernel_positions,
+                        max_blocks=layout.prefill_cmp_max_blocks,
+                        compress_ratio=4,
+                    ),
+                    layout.prefill_seq,
+                )
+            ),
+            csa_idx_slot_mapping=self._rank_stack(
+                self._pad_prefill_mapping(
+                    self._prefill_compressed_slot_mapping(
+                        kernel_slots,
+                        kernel_positions,
+                        max_blocks=layout.prefill_idx_max_blocks,
+                        compress_ratio=4,
+                    ),
+                    layout.prefill_seq,
+                )
+            ),
+            csa_state_slot_mapping=self._rank_stack(
+                self._pad_prefill_mapping(
+                    self._prefill_state_slot_mapping(
+                        kernel_slots,
+                        kernel_positions,
+                        max_blocks=layout.prefill_csa_state_max_blocks,
+                        state_block_size=layout.c4_state_block_size,
+                    ),
+                    layout.prefill_seq,
+                )
+            ),
+            csa_inner_state_slot_mapping=self._rank_stack(
+                self._pad_prefill_mapping(
+                    self._prefill_state_slot_mapping(
+                        kernel_slots,
+                        kernel_positions,
+                        max_blocks=layout.prefill_csa_inner_state_max_blocks,
+                        state_block_size=layout.c4_state_block_size,
+                    ),
+                    layout.prefill_seq,
+                )
+            ),
+            cmp_sparse_indices_by_ratio={
+                ratio: self._rank_stack(indices)
+                for ratio, (indices, _) in sparse_by_ratio.items()
+            },
+            cmp_sparse_lens_by_ratio={
+                ratio: self._rank_stack(lens)
+                for ratio, (_, lens) in sparse_by_ratio.items()
+            },
+        )
+
+    def prepare_decode_inputs(self, model: RuntimeModel, batch: DecodeBatch) -> DeepSeekV4PreparedDecodeInputs:
+        """Build DeepSeekV4 decode host inputs for the current scheduler batch."""
+        builder = self._require_input_builder()
+        layout = self._compiled.layout
+        actual_batch = len(batch.request_ids)
+        if actual_batch <= 0:
+            raise ValueError("decode batch must contain at least one request")
+        if actual_batch > layout.decode_batch:
+            raise ValueError(f"decode batch {actual_batch} exceeds kernel batch {layout.decode_batch}")
+        slots = self.cache_manager.slots_for_request_ids(batch.request_ids)
+        positions = self._decode_positions(batch, actual_batch)
+        max_position = max(max(row) for row in positions)
+        if max_position >= model.runtime.max_seq_len:
+            raise ValueError(f"decode position {max_position} exceeds max_seq_len={model.runtime.max_seq_len}")
+
+        prev_token_ids = (
+            batch.prev_token_ids.detach().cpu().to(torch.long)
+            if batch.prev_token_ids is not None
+            else None
+        )
+        token_ids = self._decode_token_rows(
+            batch.token_ids.detach().cpu().to(torch.long),
+            actual_batch,
+            vocab_size=model.config.vocab_size,
+            prev_token_ids=prev_token_ids,
+        )
+        decode_embeds = batch.hidden_states.to(torch.bfloat16).cpu()
+        prev_embeds = (
+            batch.prev_hidden_states.to(torch.bfloat16).cpu()
+            if batch.prev_hidden_states is not None
+            else None
+        )
+        if os.environ.get("PYPTO_DSV4_DIVERSE_DECODE_PAD") == "1" and actual_batch < layout.decode_batch:
+            decode_embeds = self._diverse_decode_pad_embeddings(model, decode_embeds, actual_batch)
+        x_hc = builder.decode_x_hc(decode_embeds, actual_batch=actual_batch, prev_embeddings=prev_embeds)
+        decode_slots = self._decode_kernel_slots(slots)
+        decode_positions = (*positions, *((positions[0],) * (layout.decode_batch - actual_batch)))
+        ori_slot_mapping = self.cache_manager.sliding_window_slot_mapping(
+            decode_slots,
+            decode_positions,
+            kernel_rows=layout.decode_batch,
+        )
+        hca_cmp_slot_mapping = self.cache_manager.compressed_slot_mapping(
+            decode_slots,
+            decode_positions,
+            max_blocks=layout.cmp_max_blocks,
+            compress_ratio=128,
+            kernel_rows=layout.decode_batch,
+        )
+        hca_state_slot_mapping = self.cache_manager.state_slot_mapping(
+            decode_slots,
+            decode_positions,
+            max_blocks=layout.hca_state_max_blocks,
+            state_block_size=layout.c128_state_block_size,
+            kernel_rows=layout.decode_batch,
+        )
+        csa_cmp_slot_mapping = self.cache_manager.compressed_slot_mapping(
+            decode_slots,
+            decode_positions,
+            max_blocks=layout.cmp_max_blocks,
+            compress_ratio=4,
+            kernel_rows=layout.decode_batch,
+        )
+        csa_idx_slot_mapping = self.cache_manager.compressed_slot_mapping(
+            decode_slots,
+            decode_positions,
+            max_blocks=layout.idx_max_blocks,
+            compress_ratio=4,
+            kernel_rows=layout.decode_batch,
+        )
+        csa_state_slot_mapping = self.cache_manager.state_slot_mapping(
+            decode_slots,
+            decode_positions,
+            max_blocks=layout.csa_state_max_blocks,
+            state_block_size=layout.c4_state_block_size,
+            kernel_rows=layout.decode_batch,
+        )
+        csa_inner_state_slot_mapping = self.cache_manager.state_slot_mapping(
+            decode_slots,
+            decode_positions,
+            max_blocks=layout.csa_inner_state_max_blocks,
+            state_block_size=layout.c4_state_block_size,
+            kernel_rows=layout.decode_batch,
+        )
+
+        return DeepSeekV4PreparedDecodeInputs(
+            request_ids=tuple(batch.request_ids),
+            slots=tuple(slots),
+            kernel_slots=decode_slots,
+            actual_batch=actual_batch,
+            x_hc=x_hc,
+            input_ids=self._rank_stack(token_ids),
+            position_ids=self._rank_stack(torch.tensor(decode_positions, dtype=torch.int32).reshape(-1)),
+            kv_seq_lens=self._rank_stack(self._decode_kv_seq_lens(batch.seq_lens, actual_batch)),
+            block_table=self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows(
+                    decode_slots,
+                    max_blocks=layout.ori_max_blocks,
+                    kernel_rows=layout.decode_batch,
+                )
+            ),
+            ori_slot_mapping=self._rank_stack(ori_slot_mapping.reshape(-1)),
+            cmp_block_table=self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows(
+                    decode_slots,
+                    max_blocks=layout.cmp_max_blocks,
+                    kernel_rows=layout.decode_batch,
+                )
+            ),
+            idx_block_table=self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows(
+                    decode_slots,
+                    max_blocks=layout.idx_max_blocks,
+                    kernel_rows=layout.decode_batch,
+                )
+            ),
+            hca_compress_state_block_table=self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows(
+                    decode_slots,
+                    max_blocks=layout.hca_state_max_blocks,
+                    kernel_rows=layout.decode_batch,
+                )
+            ),
+            csa_compress_state_block_table=self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows(
+                    decode_slots,
+                    max_blocks=layout.csa_state_max_blocks,
+                    kernel_rows=layout.decode_batch,
+                )
+            ),
+            csa_inner_compress_state_block_table=self._rank_stack(
+                self.cache_manager.block_table_for_kernel_rows(
+                    decode_slots,
+                    max_blocks=layout.csa_inner_state_max_blocks,
+                    kernel_rows=layout.decode_batch,
+                )
+            ),
+            hca_cmp_slot_mapping=self._rank_stack(hca_cmp_slot_mapping.reshape(-1)),
+            hca_state_slot_mapping=self._rank_stack(hca_state_slot_mapping.reshape(-1)),
+            csa_cmp_slot_mapping=self._rank_stack(csa_cmp_slot_mapping.reshape(-1)),
+            csa_idx_slot_mapping=self._rank_stack(csa_idx_slot_mapping.reshape(-1)),
+            csa_state_slot_mapping=self._rank_stack(csa_state_slot_mapping.reshape(-1)),
+            csa_inner_state_slot_mapping=self._rank_stack(csa_inner_state_slot_mapping.reshape(-1)),
+        )
+
+    def _diverse_decode_pad_embeddings(
+        self, model, active_embeds: torch.Tensor, actual_batch: int
+    ) -> torch.Tensor:
+        """Diagnostic: build a full [decode_batch, hidden] embedding tensor whose
+        padding rows carry distinct real token embeddings, so the decode MoE gate
+        routes the 128 tokens across many experts instead of all padding rows
+        mirroring slot 0. Active rows keep their real embeddings."""
+        layout = self._compiled.layout
+        embed = getattr(self, "_diverse_embed_cache", None)
+        if embed is None:
+            embed = self._compiled.weight_store.load_tensor("embed.weight").contiguous()
+            self._diverse_embed_cache = embed
+        vocab = int(model.config.vocab_size)
+        hidden = int(embed.shape[1])
+        full = torch.zeros((layout.decode_batch, hidden), dtype=active_embeds.dtype)
+        full[:actual_batch].copy_(active_embeds[:actual_batch].to(full.dtype))
+        # Distinct, spread-out, non-special token ids for the padding rows.
+        pad_ids = [
+            max(100, (1000 + row * 2659) % vocab)
+            for row in range(actual_batch, layout.decode_batch)
+        ]
+        pad_embed = embed.index_select(0, torch.tensor(pad_ids, dtype=torch.long)).to(full.dtype)
+        full[actual_batch:].copy_(pad_embed)
+        return full
+
+    def _alloc_kv_cache_tensor(self, shape: tuple[int, ...], dtype: torch.dtype) -> DeviceTensor:
+        raise NotImplementedError("DeepSeekV4 uses model-specific cache pools, not generic KV tensors")
+
+    def _free_kv_cache_tensor(self, tensor: DeviceTensor) -> None:
+        return None
+
+    def run_prefill(self, model, batch: PrefillBatch) -> PrefillResult:
+        """Run all DeepSeekV4 hidden layers for one prefill chunk in a single packed call."""
+        if self._compiled.prefill is None:
+            raise RuntimeError("DeepSeekV4 kernels were not compiled for this runner")
+        self._ensure_l3_shared_buffers(model)
+        inputs = self.prepare_prefill_inputs(model, batch)
+        if inputs.slot != 0:
+            raise RuntimeError(
+                "DeepSeekV4 prefill currently supports the first active serving slot only. "
+                "Run with one concurrent request until pypto-lib exposes a 64-slot prefill kernel."
+            )
+        self._stage_prefill_fwd_inputs(inputs)
+        hidden_buffer = self._require_prefill_output_buffer(model.config.hidden_size)
+        hidden_buffer.zero_()
+        args = self._prefill_fwd_args(hidden_buffer)
+        self._debug_prefill_dispatch(inputs, args)
+        if os.environ.get("PYPTO_DSV4_SKIP_PREFILL_KERNEL") == "1":
+            # Diagnostic: skip the prefill kernel dispatch to isolate the decode
+            # deadlock from prefill device/ring state. All host-side prep above
+            # ran; we only skip the device kernel. Snapshot the (un-run) packed
+            # caches so decode can proceed, and force the first token to " a"
+            # (id 260) so decode runs on a realistic input.
+            self._snapshot_prefill_fwd_caches(inputs.slot)
+            forced = torch.zeros((1, int(model.config.vocab_size)), dtype=torch.float32)
+            forced[0, 260] = 1.0e4
+            return PrefillResult(last_hidden=None, logits=forced)
+        try:
+            self._run_l3(
+                self._require_prefill_callable(),
+                *args,
+                self._int32_scalar(self._prefill_kernel_tokens(inputs.actual_tokens)),
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "DeepSeekV4 packed prefill dispatch failed "
+                f"(tokens={inputs.actual_tokens}, slot={inputs.slot})"
+            ) from exc
+        self._snapshot_prefill_fwd_caches(inputs.slot)
+        self._decode_cache_seeded_slots.clear()
+
+        active_hidden = hidden_buffer[:, : inputs.actual_tokens, :]
+        self._debug_tensor_stats("prefill.output.hidden.active", active_hidden, per_rank=True)
+        if self._debug_tensor_stats_enabled() and not self._tensor_is_finite(active_hidden):
+            raise RuntimeError("DeepSeekV4 packed prefill produced non-finite active hidden rows")
+
+        # Sample the last real prompt row (``actual_tokens - 1``) from host-side
+        # LM-head logits, mirroring the decode path.
+        last_row = inputs.actual_tokens - 1
+        logits = self._logits_for_hidden(hidden_buffer, active_rows=(last_row,), label="prefill").float()
+        return PrefillResult(last_hidden=None, logits=logits)
+
+    def run_decode(self, model, batch: DecodeBatch) -> DecodeResult:
+        """Run all DeepSeekV4 hidden layers for one decode batch in a single packed call."""
+        if self._compiled.decode is None:
+            raise RuntimeError("DeepSeekV4 kernels were not compiled for this runner")
+        self._ensure_l3_shared_buffers(model)
+        inputs = self._stage_decode_inputs(self.prepare_decode_inputs(model, batch))
+        if inputs.actual_batch != 1 or inputs.slots != (0,):
+            raise RuntimeError(
+                "DeepSeekV4 decode currently supports the first active serving slot only. "
+                "Run with one concurrent request until the compact cache handoff supports multiple slots."
+            )
+        self._require_prefill_cache_snapshots()
+        self._seed_decode_work_cache(inputs.kernel_slots)
+        decode_buffers = self._require_decode_buffers()
+        x_hc = decode_buffers.x_hc_a
+        active_decode_tokens = inputs.actual_batch * self._compiled.layout.decode_seq
+        self._debug_tensor_stats("decode.input.initial.active", x_hc[:, :active_decode_tokens, :, :])
+
+        hidden_buffer = self._require_decode_output_buffer(model.config.hidden_size)
+        hidden_buffer.zero_()
+        # ``num_tokens`` is the real active token count. PR 677 restores the
+        # gate norm/quant scopes for this num_tokens-aware path; the fixed padding
+        # rows remain valid metadata for attention but must not be routed by MoE.
+        num_tokens = active_decode_tokens
+        args = self._decode_fwd_args(inputs, x_hc, hidden_buffer)
+        self._debug_decode_dispatch(inputs, args)
+        try:
+            self._run_l3(
+                self._require_decode_callable(),
+                *args,
+                self._int32_scalar(num_tokens),
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "DeepSeekV4 packed decode dispatch failed "
+                f"(actual_batch={inputs.actual_batch}, slots={inputs.slots})"
+            ) from exc
+        active_hidden = hidden_buffer[:, :active_decode_tokens, :]
+        self._debug_tensor_stats("decode.output.hidden.active", active_hidden, per_rank=True)
+        if self._debug_tensor_stats_enabled() and not self._tensor_is_finite(active_hidden):
+            raise RuntimeError("DeepSeekV4 packed decode produced non-finite active hidden rows")
+
+        # Sample the final MTP slot (position seq_len-1), which predicts the next
+        # token: row r's sampled slot is ``r * decode_seq + (decode_seq - 1)``.
+        decode_seq = self._compiled.layout.decode_seq
+        active_rows = tuple(row * decode_seq + (decode_seq - 1) for row in range(inputs.actual_batch))
+        logits = self._logits_for_hidden(hidden_buffer, active_rows=active_rows, label="decode").float()
+        return DecodeResult(hidden_states=None, logits=logits)
+
+    def _require_prefill_callable(self) -> DeepSeekV4L3Callable:
+        if self._compiled.prefill is None:
+            raise RuntimeError("DeepSeekV4 prefill kernel is not compiled")
+        return self._compiled.prefill
+
+    def _require_decode_callable(self) -> DeepSeekV4L3Callable:
+        if self._compiled.decode is None:
+            raise RuntimeError("DeepSeekV4 decode kernel is not compiled")
+        return self._compiled.decode
+
+    def _ensure_l3_shared_buffers(self, model: RuntimeModel) -> None:
+        """Allocate every CPU tensor visible to the L3 worker before it forks.
+
+        ``DistributedWorker`` creates per-chip children on first use. Any CPU
+        tensor argument those children access must already live in shared memory
+        at that point, so this method stages all packed prefill/decode input and
+        output buffers before the first ``_run_l3`` call.
+        """
+        self.load_packed_global_weights()
+        self._static_freqs_cos_tensor()
+        self._static_freqs_sin_tensor()
+        self._ensure_decode_buffers(model.config.hidden_size)
+        self._ensure_decode_work_cache()
+        self._require_prefill_output_buffer(model.config.hidden_size)
+        self._static_final_norm_weight_tensor()
+        if self._stacked_weight_buffers is None:
+            self._stage_stacked_weights(self.load_stacked_layer_weights())
+        self._hc_head_tensors()
+        self._ensure_prefill_fwd_buffers(model.config.hidden_size)
+        self._assert_l3_shared_buffers_preallocated()
+
+    def _assert_l3_shared_buffers_preallocated(self) -> None:
+        missing = self._missing_l3_shared_buffers()
+        if missing:
+            raise RuntimeError(
+                "DeepSeekV4 L3 worker cannot start before all shared host buffers are preallocated; "
+                "missing: " + ", ".join(missing)
+            )
+
+    def _missing_l3_shared_buffers(self) -> list[str]:
+        missing: list[str] = []
+        expected = {
+            "final_norm_w": self._static_final_norm_weight,
+            "freqs_cos": self._static_freqs_cos,
+            "freqs_sin": self._static_freqs_sin,
+            "prefill_fwd_buffers": self._prefill_fwd_buffers,
+            "decode_buffers": self._decode_buffers,
+            "decode_work_cache": self._decode_work_cache,
+            "stacked_weight_buffers": self._stacked_weight_buffers,
+            "hc_head_buffers": self._hc_head_buffers,
+            "prefill_output": self._prefill_output_buffer,
+        }
+        for name, value in expected.items():
+            if value is None:
+                missing.append(name)
+        if self._stacked_weight_buffers is not None and not self._stacked_weight_buffers:
+            missing.append("stacked_weight_buffers")
+        if self._hc_head_buffers is not None and not self._hc_head_buffers:
+            missing.append("hc_head_buffers")
+        return missing
+
+    def _prefill_fwd_args(self, x_out: torch.Tensor) -> tuple[Any, ...]:
+        """Build the single packed ``l3_prefill_fwd`` argument tuple.
+
+        The kernel runs final RMSNorm and emits normalized hidden rows. LM-head is
+        computed on the host from the selected rows.
+        """
+        buffers = self._require_prefill_fwd_buffers()
+        stacked = self._require_stacked_weights()
+        hc_head = self._hc_head_tensors()
+        values = dict(stacked.tensors)
+        values.update(
+            {
+                "x_hc": buffers.x_hc,
+                "freqs_cos": buffers.freqs_cos,
+                "freqs_sin": buffers.freqs_sin,
+                "hc_head_fn": hc_head["hc_head_fn"],
+                "hc_head_scale": hc_head["hc_head_scale"],
+                "hc_head_base": hc_head["hc_head_base"],
+                "final_norm_w": self._static_final_norm_weight_tensor(),
+                "x_out": x_out,
+            }
+        )
+        values.update(buffers.tensors)
+        return self._ordered_layer_args(values, _PREFILL_FWD_TENSOR_ORDER)
+
+    def _decode_fwd_args(
+        self,
+        inputs: DeepSeekV4PreparedDecodeInputs,
+        x_hc: torch.Tensor,
+        x_out: torch.Tensor,
+    ) -> tuple[Any, ...]:
+        """Build the single packed ``l3_decode_fwd`` argument tuple."""
+        cache = self._require_decode_work_cache()
+        stacked = self._require_stacked_weights()
+        hc_head = self._hc_head_tensors()
+        values = dict(stacked.tensors)
+        values.update(
+            {
+                "x_hc": x_hc,
+                "freqs_cos": self._static_freqs_cos_tensor(),
+                "freqs_sin": self._static_freqs_sin_tensor(),
+                "kv_cache": cache.kv_cache,
+                "block_table": inputs.block_table,
+                "ori_slot_mapping": inputs.ori_slot_mapping,
+                "hca_cmp_slot_mapping": inputs.hca_cmp_slot_mapping,
+                "hca_state_slot_mapping": inputs.hca_state_slot_mapping,
+                "csa_cmp_slot_mapping": inputs.csa_cmp_slot_mapping,
+                "csa_idx_slot_mapping": inputs.csa_idx_slot_mapping,
+                "csa_state_slot_mapping": inputs.csa_state_slot_mapping,
+                "csa_inner_state_slot_mapping": inputs.csa_inner_state_slot_mapping,
+                "position_ids": inputs.position_ids,
+                "kv_seq_lens": inputs.kv_seq_lens,
+                "hca_compress_state": cache.hca_compress_state,
+                "hca_compress_state_block_table": inputs.hca_compress_state_block_table,
+                "csa_compress_state": cache.csa_compress_state,
+                "csa_compress_state_block_table": inputs.csa_compress_state_block_table,
+                "csa_inner_compress_state": cache.csa_inner_compress_state,
+                "csa_inner_compress_state_block_table": inputs.csa_inner_compress_state_block_table,
+                "cmp_kv": cache.cmp_kv,
+                "cmp_block_table": inputs.cmp_block_table,
+                "idx_kv_cache": cache.idx_kv_cache,
+                "idx_block_table": inputs.idx_block_table,
+                "input_ids": inputs.input_ids,
+                "hc_head_fn": hc_head["hc_head_fn"],
+                "hc_head_scale": hc_head["hc_head_scale"],
+                "hc_head_base": hc_head["hc_head_base"],
+                "final_norm_w": self._static_final_norm_weight_tensor(),
+                "x_out": x_out,
+            }
+        )
+        return self._ordered_layer_args(values, _DECODE_FWD_TENSOR_ORDER)
+
+    def _require_stacked_weights(self) -> DeepSeekV4StackedLayerWeights:
+        if self._stacked_weight_buffers is None:
+            raise RuntimeError("DeepSeekV4 stacked decode weights were not staged")
+        return DeepSeekV4StackedLayerWeights(tensors=self._stacked_weight_buffers)
+
+    def _ordered_layer_args(self, values: dict[str, Any], names: Sequence[str]) -> tuple[Any, ...]:
+        missing = [name for name in names if name not in values]
+        if missing:
+            raise KeyError(f"DeepSeekV4 layer dispatch is missing tensors: {', '.join(missing)}")
+        return tuple(values[name] for name in names)
+
+    def _debug_prefill_dispatch(
+        self,
+        inputs: DeepSeekV4PreparedPrefillInputs,
+        args: Sequence[Any],
+    ) -> None:
+        if os.getenv("PYPTO_DSV4_DEBUG") != "1":
+            return
+        named_args = dict(zip(_PREFILL_FWD_TENSOR_ORDER, args, strict=True))
+        interesting = (
+            "x_hc",
+            "kv_cache",
+            "cmp_kv",
+            "idx_kv_cache",
+            "ori_block_table",
+            "cmp_block_table",
+            "idx_block_table",
+            "cmp_sparse_indices",
+            "cmp_sparse_lens",
+            "input_ids",
+            "x_out",
+        )
+        tensor_names = [
+            name
+            for name, tensor in named_args.items()
+            if isinstance(tensor, torch.Tensor) and tensor.device.type == "cpu"
+        ]
+        non_shared = [name for name in tensor_names if not named_args[name].is_shared()]
+        parts = []
+        for name in interesting:
+            tensor = named_args[name]
+            if isinstance(tensor, torch.Tensor):
+                parts.append(f"{name}={tuple(tensor.shape)}/{tensor.dtype}/shared={tensor.is_shared()}")
+            elif isinstance(tensor, DeviceTensor):
+                parts.append(f"{name}=DeviceTensor")
+            else:
+                parts.append(f"{name}={type(tensor).__name__}")
+        print(
+            "DeepSeekV4 packed prefill dispatch "
+            f"tokens={inputs.actual_tokens} slot={inputs.slot} "
+            f"worker_started={self._l3_worker is not None} "
+            f"cpu_tensor_args={len(tensor_names)} non_shared={non_shared} "
+            + " ".join(parts),
+            flush=True,
+        )
+        if os.getenv("PYPTO_DSV4_DEBUG_ARGS") == "1":
+            for name in _PREFILL_FWD_TENSOR_ORDER:
+                tensor = named_args[name]
+                if isinstance(tensor, torch.Tensor):
+                    print(
+                        "DeepSeekV4 prefill arg "
+                        f"{name}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                        f"device={tensor.device} shared={tensor.is_shared()}",
+                        flush=True,
+                    )
+
+    def _debug_decode_dispatch(
+        self,
+        inputs: DeepSeekV4PreparedDecodeInputs,
+        args: Sequence[Any],
+    ) -> None:
+        if os.getenv("PYPTO_DSV4_DEBUG") != "1":
+            return
+        named_args = dict(zip(_DECODE_FWD_TENSOR_ORDER, args, strict=True))
+        interesting = (
+            "x_hc",
+            "kv_cache",
+            "block_table",
+            "ori_slot_mapping",
+            "cmp_kv",
+            "cmp_block_table",
+            "idx_kv_cache",
+            "idx_block_table",
+            "hca_compress_state",
+            "hca_state_slot_mapping",
+            "csa_compress_state",
+            "csa_state_slot_mapping",
+            "csa_inner_compress_state",
+            "csa_inner_state_slot_mapping",
+            "position_ids",
+            "kv_seq_lens",
+            "input_ids",
+            "x_out",
+        )
+        tensor_names = [
+            name
+            for name, tensor in named_args.items()
+            if isinstance(tensor, torch.Tensor) and tensor.device.type == "cpu"
+        ]
+        non_shared = [name for name in tensor_names if not named_args[name].is_shared()]
+        parts = []
+        for name in interesting:
+            tensor = named_args[name]
+            if isinstance(tensor, torch.Tensor):
+                parts.append(f"{name}={tuple(tensor.shape)}/{tensor.dtype}/shared={tensor.is_shared()}")
+            elif isinstance(tensor, DeviceTensor):
+                parts.append(f"{name}=DeviceTensor")
+            else:
+                parts.append(f"{name}={type(tensor).__name__}")
+        print(
+            "DeepSeekV4 packed decode dispatch "
+            f"actual_batch={inputs.actual_batch} active_tokens={inputs.actual_batch * self._compiled.layout.decode_seq} "
+            f"slots={inputs.slots} "
+            f"worker_started={self._l3_worker is not None} "
+            f"cpu_tensor_args={len(tensor_names)} non_shared={non_shared} "
+            + " ".join(parts),
+            flush=True,
+        )
+        if os.getenv("PYPTO_DSV4_DEBUG_ARGS") == "1":
+            for name in _DECODE_FWD_TENSOR_ORDER:
+                tensor = named_args[name]
+                if isinstance(tensor, torch.Tensor):
+                    print(
+                        "DeepSeekV4 decode arg "
+                        f"{name}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                        f"device={tensor.device} shared={tensor.is_shared()}",
+                        flush=True,
+                    )
+                    self._debug_tensor_stats(f"dispatch.fwd.{name}", tensor)
+
+    @staticmethod
+    def _is_layer_weight_name(name: str) -> bool:
+        runtime_names = {
+            "x_hc",
+            "freqs_cos",
+            "freqs_sin",
+            "hca_cmp_kv_state",
+            "hca_cmp_score_state",
+            "hca_compress_state_block_table",
+            "csa_cmp_kv_state",
+            "csa_cmp_score_state",
+            "csa_compress_state_block_table",
+            "csa_inner_kv_state",
+            "csa_inner_score_state",
+            "csa_inner_compress_state_block_table",
+            "kv_cache",
+            "ori_block_table",
+            "block_table",
+            "ori_slot_mapping",
+            "cmp_kv",
+            "cmp_block_table",
+            "cmp_sparse_indices",
+            "cmp_sparse_lens",
+            "idx_kv_cache",
+            "idx_block_table",
+            "position_ids",
+            "hca_cmp_slot_mapping",
+            "hca_state_slot_mapping",
+            "csa_cmp_slot_mapping",
+            "csa_idx_slot_mapping",
+            "csa_state_slot_mapping",
+            "csa_inner_state_slot_mapping",
+            "hca_compress_state",
+            "csa_compress_state",
+            "csa_inner_compress_state",
+            "kv_seq_lens",
+            "input_ids",
+            "x_next",
+        }
+        return name not in runtime_names
+
