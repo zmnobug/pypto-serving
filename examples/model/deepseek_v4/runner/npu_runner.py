@@ -41,7 +41,18 @@ DEEPSEEK_V4_DECODE_SEQ = 1
 DEEPSEEK_V4_DECODE_TOKENS = DEEPSEEK_V4_DECODE_BATCH * DEEPSEEK_V4_DECODE_SEQ
 DEEPSEEK_V4_PREFILL_BATCH = 1
 DEEPSEEK_V4_PREFILL_SEQ = 128
-DEEPSEEK_V4_ORI_MAX_BLOCKS = 1
+# Prefill keeps the full logical ori-KV table; decode uses a compact physical
+# sliding-window ring addressed through an absolute logical block table.
+DEEPSEEK_V4_PREFILL_ORI_MAX_BLOCKS = 128
+# Decode ori-KV is now a sliding-window physical ring sized to cover the window
+# plus the current decode chunk: KV_ORI_MAX_BLOCKS = ceil((sliding_window +
+# DECODE_SEQ) / BLOCK_SIZE) = ceil((128 + 1) / 128) = 2. Its block table keeps
+# vLLM-style absolute logical block columns (ceil(max_position_embeddings /
+# BLOCK_SIZE) = ceil(16384 / 128) = 128) so long-context metadata addresses the
+# current window without allocating full-context KV pages.
+DEEPSEEK_V4_DECODE_ORI_MAX_BLOCKS = 2
+DEEPSEEK_V4_ORI_TABLE_MAX_BLOCKS = 128
+DEEPSEEK_V4_SLIDING_WINDOW = 128
 DEEPSEEK_V4_CMP_MAX_BLOCKS = 32
 DEEPSEEK_V4_IDX_MAX_BLOCKS = 64
 DEEPSEEK_V4_HCA_STATE_MAX_BLOCKS = 64
@@ -54,8 +65,6 @@ DEEPSEEK_V4_PREFILL_IDX_MAX_BLOCKS = DEEPSEEK_V4_IDX_MAX_BLOCKS
 DEEPSEEK_V4_PREFILL_HCA_STATE_MAX_BLOCKS = 2048
 DEEPSEEK_V4_PREFILL_CSA_STATE_MAX_BLOCKS = 4096
 DEEPSEEK_V4_PREFILL_CSA_INNER_STATE_MAX_BLOCKS = 4096
-DEEPSEEK_V4_INDEX_TOPK = 512
-DEEPSEEK_V4_PREFILL_SPARSE_TOPK = DEEPSEEK_V4_BLOCK_SIZE + DEEPSEEK_V4_INDEX_TOPK
 DEEPSEEK_V4_HEAD_DIM = 512
 DEEPSEEK_V4_IDX_HEAD_DIM = 128
 DEEPSEEK_V4_HCA_MAIN_OUT_DIM = 512
@@ -122,6 +131,7 @@ _PREFILL_FWD_TENSOR_ORDER = (
     "csa_inner_kv_state",
     "csa_inner_score_state",
     "idx_kv_cache",
+    "idx_kv_scale",
     "hca_compress_state_block_table",
     "csa_compress_state_block_table",
     "csa_inner_compress_state_block_table",
@@ -139,8 +149,6 @@ _PREFILL_FWD_TENSOR_ORDER = (
     "csa_idx_slot_mapping",
     "csa_state_slot_mapping",
     "csa_inner_state_slot_mapping",
-    "cmp_sparse_indices",
-    "cmp_sparse_lens",
     "hc_ffn_fn",
     "hc_ffn_scale",
     "hc_ffn_base",
@@ -209,6 +217,7 @@ _DECODE_FWD_TENSOR_ORDER = (
     "csa_inner_compress_state",
     "cmp_kv",
     "idx_kv_cache",
+    "idx_kv_scale",
     "hc_ffn_fn",
     "hc_ffn_scale",
     "hc_ffn_base",
@@ -232,6 +241,11 @@ _DECODE_FWD_TENSOR_ORDER = (
     "freqs_sin",
     "block_table",
     "ori_slot_mapping",
+    "window_swa_indices",
+    "window_swa_lens",
+    "swa_slot_mapping",
+    "swa_indices",
+    "swa_lens",
     "hca_cmp_slot_mapping",
     "hca_state_slot_mapping",
     "csa_cmp_slot_mapping",
@@ -259,6 +273,11 @@ _DECODE_INPUT_TENSOR_FIELDS = (
     "kv_seq_lens",
     "block_table",
     "ori_slot_mapping",
+    "window_swa_indices",
+    "window_swa_lens",
+    "swa_slot_mapping",
+    "swa_indices",
+    "swa_lens",
     "cmp_block_table",
     "idx_block_table",
     "hca_compress_state_block_table",
@@ -285,7 +304,10 @@ class DeepSeekV4CacheLayout:
     decode_tokens: int = DEEPSEEK_V4_DECODE_TOKENS
     prefill_batch: int = DEEPSEEK_V4_PREFILL_BATCH
     prefill_seq: int = DEEPSEEK_V4_PREFILL_SEQ
-    ori_max_blocks: int = DEEPSEEK_V4_ORI_MAX_BLOCKS
+    prefill_ori_max_blocks: int = DEEPSEEK_V4_PREFILL_ORI_MAX_BLOCKS
+    decode_ori_max_blocks: int = DEEPSEEK_V4_DECODE_ORI_MAX_BLOCKS
+    ori_table_max_blocks: int = DEEPSEEK_V4_ORI_TABLE_MAX_BLOCKS
+    sliding_window: int = DEEPSEEK_V4_SLIDING_WINDOW
     cmp_max_blocks: int = DEEPSEEK_V4_CMP_MAX_BLOCKS
     idx_max_blocks: int = DEEPSEEK_V4_IDX_MAX_BLOCKS
     hca_state_max_blocks: int = DEEPSEEK_V4_HCA_STATE_MAX_BLOCKS
@@ -298,7 +320,6 @@ class DeepSeekV4CacheLayout:
     prefill_hca_state_max_blocks: int = DEEPSEEK_V4_PREFILL_HCA_STATE_MAX_BLOCKS
     prefill_csa_state_max_blocks: int = DEEPSEEK_V4_PREFILL_CSA_STATE_MAX_BLOCKS
     prefill_csa_inner_state_max_blocks: int = DEEPSEEK_V4_PREFILL_CSA_INNER_STATE_MAX_BLOCKS
-    prefill_sparse_topk: int = DEEPSEEK_V4_PREFILL_SPARSE_TOPK
 
     @property
     def prefill_cmp_block_num(self) -> int:
@@ -461,11 +482,115 @@ class DeepSeekV4CacheManager:
         rows = self._replicated_slots_and_positions(slots, positions, kernel_rows=kernel_rows)
         mapping = torch.full((kernel_rows, max((len(row) for _, row in rows), default=0)), -1, dtype=torch.int64)
         for row_idx, (slot, row_positions) in enumerate(rows):
-            base = int(slot) * self.layout.ori_max_blocks * self.layout.block_size
+            base = int(slot) * self.layout.decode_ori_max_blocks * self.layout.block_size
             for col, position in enumerate(row_positions):
                 window_slot = int(position) % self.layout.block_size
                 mapping[row_idx, col] = base + window_slot
         return mapping
+
+    def paged_ori_block_table(
+        self,
+        slots: Sequence[int],
+        *,
+        kernel_rows: int,
+    ) -> torch.Tensor:
+        """Build the decode ori-KV block table (vLLM-style absolute logical columns).
+
+        Each row owns a small physical sliding-window ring of
+        ``decode_ori_max_blocks`` pages at physical base ``slot * ring``; the
+        ``ori_table_max_blocks`` absolute logical columns wrap into that ring via
+        ``physical = slot * ring + (logical % ring)``. This mirrors pypto-lib's
+        ``decode_metadata.block_table`` but keys the physical base off the serving
+        cache slot (rows already indirect kernel row -> slot).
+        """
+        ring = int(self.layout.decode_ori_max_blocks)
+        table_cols = int(self.layout.ori_table_max_blocks)
+        padded = self._padded_decode_slots(slots, kernel_rows=kernel_rows)
+        logical_mod = torch.arange(table_cols, dtype=torch.int32) % ring
+        table = torch.empty((kernel_rows, table_cols), dtype=torch.int32)
+        for row_idx, slot in enumerate(padded):
+            table[row_idx].copy_(int(slot) * ring + logical_mod)
+        return table
+
+    def _padded_decode_slots(self, slots: Sequence[int], *, kernel_rows: int) -> list[int]:
+        padded = [int(slot) for slot in slots]
+        if not padded:
+            raise ValueError("decode must include at least one slot")
+        if len(padded) > kernel_rows:
+            raise ValueError("active rows exceed kernel_rows")
+        padded.extend(padded[0] for _ in range(kernel_rows - len(padded)))
+        return padded
+
+    def paged_decode_slot_mapping(
+        self,
+        slots: Sequence[int],
+        positions: Sequence[Sequence[int]],
+        *,
+        kernel_rows: int,
+    ) -> torch.Tensor:
+        """Absolute paged write position for the decode SWA ori-KV ring.
+
+        ``physical = block_table[row, pos // block_size] * block_size + pos % block_size``.
+        """
+        ring = int(self.layout.decode_ori_max_blocks)
+        block_size = int(self.layout.block_size)
+        rows = self._replicated_slots_and_positions(slots, positions, kernel_rows=kernel_rows)
+        mapping = torch.full((kernel_rows, max((len(row) for _, row in rows), default=0)), -1, dtype=torch.int64)
+        for row_idx, (slot, row_positions) in enumerate(rows):
+            for col, position in enumerate(row_positions):
+                position = int(position)
+                logical_blk = position // block_size
+                phys_blk = int(slot) * ring + (logical_blk % ring)
+                mapping[row_idx, col] = phys_blk * block_size + (position % block_size)
+        return mapping
+
+    def swa_window_indices_and_lens(
+        self,
+        slots: Sequence[int],
+        positions: Sequence[Sequence[int]],
+        *,
+        kernel_rows: int,
+        exclude_current: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Lower each decode SWA window to physical KV-cache row indices.
+
+        Mirrors pypto-lib ``decode_metadata.swa_indices_and_lens`` (and, when
+        ``exclude_current`` is set, ``history_window_swa_indices_and_lens``): each
+        visible absolute position in ``[max(0, pos - window + 1), pos]`` is
+        translated through the same paged ring block table as the write path.
+        Rows are packed oldest-to-newest; invalid tail columns are ``-1`` and the
+        returned lens give the valid prefix length. When ``exclude_current`` is
+        set the positions in the current decode chunk are dropped (HCA/CSA attend
+        those through their raw-index overlay instead).
+        """
+        window = int(self.layout.sliding_window)
+        ring = int(self.layout.decode_ori_max_blocks)
+        block_size = int(self.layout.block_size)
+        rows = self._replicated_slots_and_positions(slots, positions, kernel_rows=kernel_rows)
+        # One window row per decode token (T = kernel_rows x decode_seq), packed
+        # row-major to match ``ori_slot_mapping.reshape(-1)`` token ordering.
+        per_row = max((len(row) for _, row in rows), default=0)
+        total = kernel_rows * per_row
+        indices = torch.full((total, window), -1, dtype=torch.int32)
+        lens = torch.zeros((total,), dtype=torch.int32)
+        for row_idx, (slot, row_positions) in enumerate(rows):
+            # HCA/CSA exclude only the current decode-chunk positions from the
+            # historical window; the SWA layer includes the full window.
+            overlay = {int(p) for p in row_positions} if exclude_current else set()
+            for s, position in enumerate(row_positions):
+                token = row_idx * per_row + s
+                abs_pos = int(position)
+                start = max(0, abs_pos - window + 1)
+                out_k = 0
+                for pos in range(start, abs_pos + 1):
+                    if pos in overlay:
+                        continue
+                    logical_blk = pos // block_size
+                    phys_blk = int(slot) * ring + (logical_blk % ring)
+                    indices[token, out_k] = phys_blk * block_size + (pos % block_size)
+                    out_k += 1
+                lens[token] = out_k
+        return indices, lens
 
     def compressed_slot_mapping(
         self,
@@ -565,7 +690,7 @@ class DeepSeekV4InputBuilder:
         if embeddings.ndim != 2:
             raise ValueError(f"prefill embeddings must be rank-2, got shape={tuple(embeddings.shape)}")
         return self._x_hc_from_rows(
-            embeddings,
+            embeddings.to(torch.float32),
             actual_tokens=actual_tokens,
             token_rows=self.layout.prefill_seq,
         )
@@ -597,6 +722,9 @@ class DeepSeekV4InputBuilder:
             raise ValueError("decode embeddings has fewer rows than actual_batch")
         if prev_embeddings is not None and prev_embeddings.shape[0] < actual_batch:
             raise ValueError("decode prev_embeddings has fewer rows than actual_batch")
+        embeddings = embeddings.to(torch.float32)
+        if prev_embeddings is not None:
+            prev_embeddings = prev_embeddings.to(torch.float32)
         rows = torch.zeros(
             (self.layout.decode_tokens, self.hidden_size),
             dtype=embeddings.dtype,
@@ -682,6 +810,7 @@ class DeepSeekV4LayerCache:
     kv_cache: torch.Tensor
     cmp_kv: torch.Tensor
     idx_kv_cache: torch.Tensor
+    idx_kv_scale: torch.Tensor
     hca_compress_state: torch.Tensor
     csa_compress_state: torch.Tensor
     csa_inner_compress_state: torch.Tensor
@@ -692,6 +821,7 @@ class DeepSeekV4LayerCacheSnapshot:
     """Compact parent-side cache snapshot captured after prefill for one layer."""
 
     tensors: dict[str, torch.Tensor]
+    kv_seq_len: int | None = None
 
 
 @dataclass
@@ -747,13 +877,6 @@ class DeepSeekV4PreparedPrefillInputs:
     csa_idx_slot_mapping: torch.Tensor
     csa_state_slot_mapping: torch.Tensor
     csa_inner_state_slot_mapping: torch.Tensor
-    cmp_sparse_indices_by_ratio: dict[int, torch.Tensor]
-    cmp_sparse_lens_by_ratio: dict[int, torch.Tensor]
-
-    def sparse_inputs_for_ratio(self, compress_ratio: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return prefill sparse-attention inputs for one layer compression ratio."""
-        ratio = int(compress_ratio)
-        return self.cmp_sparse_indices_by_ratio[ratio], self.cmp_sparse_lens_by_ratio[ratio]
 
 
 @dataclass(frozen=True)
@@ -770,6 +893,11 @@ class DeepSeekV4PreparedDecodeInputs:
     kv_seq_lens: torch.Tensor
     block_table: torch.Tensor
     ori_slot_mapping: torch.Tensor
+    window_swa_indices: torch.Tensor
+    window_swa_lens: torch.Tensor
+    swa_slot_mapping: torch.Tensor
+    swa_indices: torch.Tensor
+    swa_lens: torch.Tensor
     cmp_block_table: torch.Tensor
     idx_block_table: torch.Tensor
     hca_compress_state_block_table: torch.Tensor
@@ -944,7 +1072,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             raise ValueError(
                 f"prefill position {positions[-1]} exceeds max_seq_len={model.runtime.max_seq_len}"
             )
-        embeddings = batch.input_embeddings[0, :actual_tokens].to(torch.bfloat16).cpu()
+        embeddings = batch.input_embeddings[0, :actual_tokens].to(torch.float32).cpu()
         token_ids = batch.token_ids[0, :actual_tokens].detach().cpu().to(torch.long)
         kernel_tokens = self._prefill_kernel_tokens(actual_tokens)
         kernel_positions = self._prefill_kernel_positions(
@@ -959,8 +1087,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         )
         kernel_embeddings = self._padded_rows(embeddings, kernel_tokens)
         kernel_token_ids = self._padded_vector(token_ids, kernel_tokens, dtype=torch.long)
-        sparse_by_ratio = self._prefill_sparse_by_ratio(kernel_positions, kernel_tokens)
-
         return DeepSeekV4PreparedPrefillInputs(
             request_id=request_id,
             slot=slot,
@@ -969,11 +1095,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
             input_ids=self._rank_stack(self._padded_vector(kernel_token_ids, layout.prefill_seq, dtype=torch.long)),
             position_ids=self._rank_stack(self._prefill_position_ids(kernel_positions, layout.prefill_seq)),
             ori_block_table=self._rank_stack(
-                self.cache_manager.block_table([slot], max_blocks=layout.ori_max_blocks)[0]
+                torch.arange(layout.prefill_ori_max_blocks, dtype=torch.int32)
             ),
             ori_slot_mapping=self._rank_stack(
                 self._pad_prefill_mapping(
-                    self._prefill_sliding_window_slot_mapping(kernel_slots, kernel_positions),
+                    self._prefill_ori_slot_mapping(kernel_positions),
                     layout.prefill_seq,
                 )
             ),
@@ -1006,7 +1132,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             hca_state_slot_mapping=self._rank_stack(
                 self._pad_prefill_mapping(
                     self._prefill_state_slot_mapping(
-                        kernel_slots,
                         kernel_positions,
                         max_blocks=layout.prefill_hca_state_max_blocks,
                         state_block_size=layout.c128_state_block_size,
@@ -1039,7 +1164,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             csa_state_slot_mapping=self._rank_stack(
                 self._pad_prefill_mapping(
                     self._prefill_state_slot_mapping(
-                        kernel_slots,
                         kernel_positions,
                         max_blocks=layout.prefill_csa_state_max_blocks,
                         state_block_size=layout.c4_state_block_size,
@@ -1050,7 +1174,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             csa_inner_state_slot_mapping=self._rank_stack(
                 self._pad_prefill_mapping(
                     self._prefill_state_slot_mapping(
-                        kernel_slots,
                         kernel_positions,
                         max_blocks=layout.prefill_csa_inner_state_max_blocks,
                         state_block_size=layout.c4_state_block_size,
@@ -1058,14 +1181,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     layout.prefill_seq,
                 )
             ),
-            cmp_sparse_indices_by_ratio={
-                ratio: self._rank_stack(indices)
-                for ratio, (indices, _) in sparse_by_ratio.items()
-            },
-            cmp_sparse_lens_by_ratio={
-                ratio: self._rank_stack(lens)
-                for ratio, (_, lens) in sparse_by_ratio.items()
-            },
         )
 
     def prepare_decode_inputs(self, model: RuntimeModel, batch: DecodeBatch) -> DeepSeekV4PreparedDecodeInputs:
@@ -1094,9 +1209,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
             vocab_size=model.config.vocab_size,
             prev_token_ids=prev_token_ids,
         )
-        decode_embeds = batch.hidden_states.to(torch.bfloat16).cpu()
+        decode_embeds = batch.hidden_states.to(torch.float32).cpu()
         prev_embeds = (
-            batch.prev_hidden_states.to(torch.bfloat16).cpu()
+            batch.prev_hidden_states.to(torch.float32).cpu()
             if batch.prev_hidden_states is not None
             else None
         )
@@ -1109,6 +1224,25 @@ class DeepSeekV4ModelRunner(ModelRunner):
             decode_slots,
             decode_positions,
             kernel_rows=layout.decode_batch,
+        )
+        # SWA layer: paged write position + full visible window (incl. current).
+        swa_slot_mapping = self.cache_manager.paged_decode_slot_mapping(
+            decode_slots,
+            decode_positions,
+            kernel_rows=layout.decode_batch,
+        )
+        swa_indices, swa_lens = self.cache_manager.swa_window_indices_and_lens(
+            decode_slots,
+            decode_positions,
+            kernel_rows=layout.decode_batch,
+        )
+        # HCA/CSA history window: excludes the current decode-chunk positions,
+        # which those layers attend through their raw-index overlay instead.
+        window_swa_indices, window_swa_lens = self.cache_manager.swa_window_indices_and_lens(
+            decode_slots,
+            decode_positions,
+            kernel_rows=layout.decode_batch,
+            exclude_current=True,
         )
         hca_cmp_slot_mapping = self.cache_manager.compressed_slot_mapping(
             decode_slots,
@@ -1163,13 +1297,17 @@ class DeepSeekV4ModelRunner(ModelRunner):
             position_ids=self._rank_stack(torch.tensor(decode_positions, dtype=torch.int32).reshape(-1)),
             kv_seq_lens=self._rank_stack(self._decode_kv_seq_lens(batch.seq_lens, actual_batch)),
             block_table=self._rank_stack(
-                self.cache_manager.block_table_for_kernel_rows(
+                self.cache_manager.paged_ori_block_table(
                     decode_slots,
-                    max_blocks=layout.ori_max_blocks,
                     kernel_rows=layout.decode_batch,
                 )
             ),
             ori_slot_mapping=self._rank_stack(ori_slot_mapping.reshape(-1)),
+            window_swa_indices=self._rank_stack(window_swa_indices),
+            window_swa_lens=self._rank_stack(window_swa_lens),
+            swa_slot_mapping=self._rank_stack(swa_slot_mapping.reshape(-1)),
+            swa_indices=self._rank_stack(swa_indices),
+            swa_lens=self._rank_stack(swa_lens),
             cmp_block_table=self._rank_stack(
                 self.cache_manager.block_table_for_kernel_rows(
                     decode_slots,
@@ -1260,13 +1398,14 @@ class DeepSeekV4ModelRunner(ModelRunner):
         hidden_buffer.zero_()
         args = self._prefill_fwd_args(hidden_buffer)
         self._debug_prefill_dispatch(inputs, args)
+        kv_seq_len = int(inputs.position_ids[0, inputs.actual_tokens - 1].item()) + 1
         if os.environ.get("PYPTO_DSV4_SKIP_PREFILL_KERNEL") == "1":
             # Diagnostic: skip the prefill kernel dispatch to isolate the decode
             # deadlock from prefill device/ring state. All host-side prep above
             # ran; we only skip the device kernel. Snapshot the (un-run) packed
             # caches so decode can proceed, and force the first token to " a"
             # (id 260) so decode runs on a realistic input.
-            self._snapshot_prefill_fwd_caches(inputs.slot)
+            self._snapshot_prefill_fwd_caches(inputs.slot, kv_seq_len)
             forced = torch.zeros((1, int(model.config.vocab_size)), dtype=torch.float32)
             forced[0, 260] = 1.0e4
             return PrefillResult(last_hidden=None, logits=forced)
@@ -1281,7 +1420,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "DeepSeekV4 packed prefill dispatch failed "
                 f"(tokens={inputs.actual_tokens}, slot={inputs.slot})"
             ) from exc
-        self._snapshot_prefill_fwd_caches(inputs.slot)
+        self._snapshot_prefill_fwd_caches(inputs.slot, kv_seq_len)
         self._decode_cache_seeded_slots.clear()
 
         active_hidden = hidden_buffer[:, : inputs.actual_tokens, :]
@@ -1449,6 +1588,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "kv_cache": cache.kv_cache,
                 "block_table": inputs.block_table,
                 "ori_slot_mapping": inputs.ori_slot_mapping,
+                "window_swa_indices": inputs.window_swa_indices,
+                "window_swa_lens": inputs.window_swa_lens,
+                "swa_slot_mapping": inputs.swa_slot_mapping,
+                "swa_indices": inputs.swa_indices,
+                "swa_lens": inputs.swa_lens,
                 "hca_cmp_slot_mapping": inputs.hca_cmp_slot_mapping,
                 "hca_state_slot_mapping": inputs.hca_state_slot_mapping,
                 "csa_cmp_slot_mapping": inputs.csa_cmp_slot_mapping,
@@ -1466,6 +1610,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "cmp_kv": cache.cmp_kv,
                 "cmp_block_table": inputs.cmp_block_table,
                 "idx_kv_cache": cache.idx_kv_cache,
+                "idx_kv_scale": cache.idx_kv_scale,
                 "idx_block_table": inputs.idx_block_table,
                 "input_ids": inputs.input_ids,
                 "hc_head_fn": hc_head["hc_head_fn"],
@@ -1504,8 +1649,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "ori_block_table",
             "cmp_block_table",
             "idx_block_table",
-            "cmp_sparse_indices",
-            "cmp_sparse_lens",
             "input_ids",
             "x_out",
         )
@@ -1628,11 +1771,15 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "ori_slot_mapping",
             "cmp_kv",
             "cmp_block_table",
-            "cmp_sparse_indices",
-            "cmp_sparse_lens",
             "idx_kv_cache",
+            "idx_kv_scale",
             "idx_block_table",
             "position_ids",
+            "window_swa_indices",
+            "window_swa_lens",
+            "swa_slot_mapping",
+            "swa_indices",
+            "swa_lens",
             "hca_cmp_slot_mapping",
             "hca_state_slot_mapping",
             "csa_cmp_slot_mapping",
@@ -1659,12 +1806,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
             buffers = _DeepSeekV4DecodeSharedBuffers(
                 x_hc_a=self._shared_empty(
                     (ranks, tokens, layout.hc_mult, int(hidden_size)),
-                    torch.bfloat16,
+                    torch.float32,
                     name="decode_x_hc",
                 ),
                 x_hc_b=self._shared_empty(
                     (ranks, tokens, layout.hc_mult, int(hidden_size)),
-                    torch.bfloat16,
+                    torch.float32,
                     name="decode_x_hc_next",
                 ),
                 x_out=self._shared_empty(
@@ -1677,7 +1824,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     "position_ids": self._shared_empty((ranks, tokens), torch.int32, name="decode_position_ids"),
                     "kv_seq_lens": self._shared_empty((ranks, batch), torch.int32, name="decode_kv_seq_lens"),
                     "block_table": self._shared_empty(
-                        (ranks, batch, layout.ori_max_blocks),
+                        (ranks, batch, layout.ori_table_max_blocks),
                         torch.int32,
                         name="decode_block_table",
                     ),
@@ -1685,6 +1832,31 @@ class DeepSeekV4ModelRunner(ModelRunner):
                         (ranks, tokens),
                         torch.long,
                         name="decode_ori_slot_mapping",
+                    ),
+                    "window_swa_indices": self._shared_empty(
+                        (ranks, tokens, layout.sliding_window),
+                        torch.int32,
+                        name="decode_window_swa_indices",
+                    ),
+                    "window_swa_lens": self._shared_empty(
+                        (ranks, tokens),
+                        torch.int32,
+                        name="decode_window_swa_lens",
+                    ),
+                    "swa_slot_mapping": self._shared_empty(
+                        (ranks, tokens),
+                        torch.long,
+                        name="decode_swa_slot_mapping",
+                    ),
+                    "swa_indices": self._shared_empty(
+                        (ranks, tokens, layout.sliding_window),
+                        torch.int32,
+                        name="decode_swa_indices",
+                    ),
+                    "swa_lens": self._shared_empty(
+                        (ranks, tokens),
+                        torch.int32,
+                        name="decode_swa_lens",
                     ),
                     "cmp_block_table": self._shared_empty(
                         (ranks, batch, layout.cmp_max_blocks),
@@ -1820,7 +1992,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             # Work caches: kv_cache/cmp_kv stack x43, idx_kv_cache stacks x21 (CSA),
             # all flattened 5-D (the kernel reshapes the fused layer x block axis).
             "kv_cache": shared(
-                (ranks, fwd * layout.ori_max_blocks, layout.block_size, 1, DEEPSEEK_V4_HEAD_DIM),
+                (ranks, fwd * layout.prefill_ori_max_blocks, layout.block_size, 1, DEEPSEEK_V4_HEAD_DIM),
                 torch.bfloat16,
                 "prefill_fwd_kv_cache",
             ),
@@ -1831,16 +2003,23 @@ class DeepSeekV4ModelRunner(ModelRunner):
             ),
             "idx_kv_cache": shared(
                 (ranks, csa * layout.prefill_idx_block_num, layout.block_size, 1, DEEPSEEK_V4_IDX_HEAD_DIM),
-                torch.bfloat16,
+                torch.int8,
                 "prefill_fwd_idx_kv_cache",
+            ),
+            # Per-token quant scale paired with the INT8 idx_kv_cache (ratio-4
+            # indexer cache is now quant-on-write; scale is FP32, last dim 1).
+            "idx_kv_scale": shared(
+                (ranks, csa * layout.prefill_idx_block_num, layout.block_size, 1, 1),
+                torch.float32,
+                "prefill_fwd_idx_kv_scale",
             ),
             # Shared single per-rank metadata (the kernel passes each whole tensor
             # to every layer).
-            "ori_block_table": shared((ranks, layout.ori_max_blocks), torch.int32, "prefill_fwd_ori_block_table"),
+            "ori_block_table": shared(
+                (ranks, layout.prefill_ori_max_blocks), torch.int32, "prefill_fwd_ori_block_table"
+            ),
             "ori_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_ori_slot_mapping"),
             "cmp_block_table": shared((ranks, layout.prefill_cmp_max_blocks), torch.int32, "prefill_fwd_cmp_block_table"),
-            "cmp_sparse_indices": shared((ranks, seq, layout.prefill_sparse_topk), torch.int32, "prefill_fwd_cmp_sparse_indices"),
-            "cmp_sparse_lens": shared((ranks, seq), torch.int32, "prefill_fwd_cmp_sparse_lens"),
             "idx_block_table": shared((ranks, layout.prefill_idx_max_blocks), torch.int32, "prefill_fwd_idx_block_table"),
             "position_ids": shared((ranks, seq), torch.int32, "prefill_fwd_position_ids"),
             "hca_cmp_slot_mapping": shared((ranks, seq), torch.long, "prefill_fwd_hca_cmp_slot_mapping"),
@@ -1852,7 +2031,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "input_ids": shared((ranks, seq), torch.long, "prefill_fwd_input_ids"),
         }
         buffers = _DeepSeekV4PrefillFwdSharedBuffers(
-            x_hc=shared((ranks, seq, layout.hc_mult, hidden), torch.bfloat16, "prefill_fwd_x_hc"),
+            x_hc=shared((ranks, seq, layout.hc_mult, hidden), torch.float32, "prefill_fwd_x_hc"),
             freqs_cos=shared((ranks, max_seq_len, rope_dim), torch.bfloat16, "prefill_fwd_freqs_cos"),
             freqs_sin=shared((ranks, max_seq_len, rope_dim), torch.bfloat16, "prefill_fwd_freqs_sin"),
             tensors=tensors,
@@ -1868,8 +2047,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
     def _stage_prefill_fwd_inputs(self, inputs: DeepSeekV4PreparedPrefillInputs) -> None:
         """Copy one prefill chunk's metadata/state into the packed buffers.
 
-        The per-request metadata (slot mappings, block tables, sparse tables,
-        position/input ids), the RoPE tables and the compressor-state block tables
+        The per-request metadata (slot mappings, block tables, position/input
+        ids), the RoPE tables and the compressor-state block tables
         are shared single per-rank copies (the kernel slices them per layer
         internally). The compressor-state and work caches start zeroed and are
         produced by the kernel.
@@ -1910,20 +2089,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         for name, tensor in shared_metadata.items():
             self._copy_shared(buffers.tensors[name], tensor, name=f"prefill_fwd_{name}")
 
-        # Sparse tables are now a single shared copy used by every layer. The kernel
-        # consumes the sliding-window index set (the ratio-0 view), so pass that copy.
-        sparse_indices, sparse_lens = inputs.sparse_inputs_for_ratio(0)
-        self._copy_shared(
-            buffers.tensors["cmp_sparse_indices"],
-            sparse_indices,
-            name="prefill_fwd_cmp_sparse_indices",
-        )
-        self._copy_shared(
-            buffers.tensors["cmp_sparse_lens"],
-            sparse_lens,
-            name="prefill_fwd_cmp_sparse_lens",
-        )
-
         # Compressor-state and work caches start zeroed; the kernel populates them.
         for name in (
             "hca_cmp_kv_state",
@@ -1935,6 +2100,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "kv_cache",
             "cmp_kv",
             "idx_kv_cache",
+            "idx_kv_scale",
         ):
             buffers.tensors[name].zero_()
 
@@ -1948,7 +2114,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             raise RuntimeError("DeepSeekV4 RoPE sine table is not initialized")
         return self._rank_stack(self._compiled.freqs_sin)
 
-    def _snapshot_prefill_fwd_caches(self, slot: int) -> None:
+    def _snapshot_prefill_fwd_caches(self, slot: int, kv_seq_len: int) -> None:
         """Capture per-layer cache slices from the packed prefill Out caches."""
         buffers = self._require_prefill_fwd_buffers()
         csa_order = 0
@@ -1959,7 +2125,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
             # The flattened 5-D work caches fuse the layer axis with the per-layer
             # block axis; slice the contiguous per-layer block span back out.
             snapshot: dict[str, torch.Tensor] = {
-                "kv_cache": self._slice_layer_state(buffers.tensors["kv_cache"], fwd, layout.ori_max_blocks),
+                "kv_cache": self._slice_layer_state(
+                    buffers.tensors["kv_cache"], fwd, layout.prefill_ori_max_blocks
+                ),
                 "cmp_kv": self._slice_layer_slot_state(
                     buffers.tensors["cmp_kv"],
                     fwd,
@@ -1972,6 +2140,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 # idx_kv_cache stacks across the CSA layers (x21), so index by csa_order.
                 snapshot["idx_kv_cache"] = self._slice_layer_slot_state(
                     buffers.tensors["idx_kv_cache"],
+                    csa_order,
+                    layout.prefill_idx_block_num,
+                    slot,
+                    layout.prefill_idx_max_blocks,
+                )
+                snapshot["idx_kv_scale"] = self._slice_layer_slot_state(
+                    buffers.tensors["idx_kv_scale"],
                     csa_order,
                     layout.prefill_idx_block_num,
                     slot,
@@ -1998,7 +2173,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     buffers.tensors["hca_cmp_score_state"], hca_order, self._compiled.layout.prefill_hca_state_max_blocks
                 )
                 hca_order += 1
-            self._prefill_cache_snapshots[layer.layer_id] = DeepSeekV4LayerCacheSnapshot(snapshot)
+            self._prefill_cache_snapshots[layer.layer_id] = DeepSeekV4LayerCacheSnapshot(
+                snapshot,
+                kv_seq_len=kv_seq_len,
+            )
 
     @staticmethod
     def _slice_layer_state(stacked: torch.Tensor, order: int, blocks_per_layer: int) -> torch.Tensor:
@@ -2159,11 +2337,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
             tensors = snapshot.tensors
             fwd_offset = int(layer.layer_id)
             for slot in slots_to_seed:
-                self._copy_snapshot_blocks_to_work(
+                self._copy_prefill_ori_snapshot_to_work(
                     tensors["kv_cache"],
                     cache.kv_cache,
                     fwd_offset * batch + int(slot),
-                    layout.ori_max_blocks,
+                    layout.decode_ori_max_blocks,
+                    snapshot.kv_seq_len,
+                    layout.block_size,
                 )
                 self._copy_snapshot_blocks_to_work(
                     tensors["cmp_kv"],
@@ -2176,6 +2356,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     self._copy_snapshot_blocks_to_work(
                         tensors["idx_kv_cache"],
                         cache.idx_kv_cache,
+                        csa_order * batch + int(slot),
+                        layout.idx_max_blocks,
+                    )
+                    self._copy_snapshot_blocks_to_work(
+                        tensors["idx_kv_scale"],
+                        cache.idx_kv_scale,
                         csa_order * batch + int(slot),
                         layout.idx_max_blocks,
                     )
@@ -2238,6 +2424,28 @@ class DeepSeekV4ModelRunner(ModelRunner):
         dst.zero_()
         blocks = min(snapshot.shape[1], int(blocks_per_slot))
         dst[:, :blocks].copy_(snapshot[:, :blocks])
+
+    @staticmethod
+    def _copy_prefill_ori_snapshot_to_work(
+        snapshot: torch.Tensor,
+        work: torch.Tensor,
+        slot: int,
+        blocks_per_slot: int,
+        kv_seq_len: int | None,
+        block_size: int,
+    ) -> None:
+        """Lower full-context prefill KV pages into decode's physical ring."""
+        if kv_seq_len is None or kv_seq_len <= 0:
+            raise ValueError("prefill KV snapshot is missing a positive sequence length")
+        slot_slice = DeepSeekV4ModelRunner._slot_block_slice(slot, blocks_per_slot)
+        dst = work[:, slot_slice]
+        dst.zero_()
+        valid_blocks = min(snapshot.shape[1], math.ceil(int(kv_seq_len) / int(block_size)))
+        ring_blocks = int(blocks_per_slot)
+        start_block = max(0, valid_blocks - ring_blocks)
+        for logical_block in range(start_block, valid_blocks):
+            physical_block = logical_block % ring_blocks
+            dst[:, physical_block].copy_(snapshot[:, logical_block])
 
     def _copy_split_state_to_work(
         self,
@@ -2523,7 +2731,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             kv_cache=self._shared_empty(
                 (
                     layout.ranks,
-                    fwd_layers * layout.decode_batch * layout.ori_max_blocks,
+                    fwd_layers * layout.decode_batch * layout.decode_ori_max_blocks,
                     layout.block_size,
                     1,
                     DEEPSEEK_V4_HEAD_DIM,
@@ -2550,8 +2758,19 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     1,
                     DEEPSEEK_V4_IDX_HEAD_DIM,
                 ),
-                torch.bfloat16,
+                torch.int8,
                 name="decode_work_idx_kv_cache",
+            ),
+            idx_kv_scale=self._shared_empty(
+                (
+                    layout.ranks,
+                    csa_layers * layout.decode_batch * layout.idx_max_blocks,
+                    layout.block_size,
+                    1,
+                    1,
+                ),
+                torch.float32,
+                name="decode_work_idx_kv_scale",
             ),
             hca_compress_state=self._shared_empty(
                 (
@@ -2635,7 +2854,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return tensor.unsqueeze(0).expand(self._compiled.layout.ranks, *tensor.shape).contiguous()
 
     def _prefill_kernel_tokens(self, actual_tokens: int) -> int:
-        # The packed prefill kernel currently uses its static 128-row contract.
         if actual_tokens <= 0:
             raise ValueError("actual_tokens must be positive")
         return self._compiled.layout.prefill_seq
@@ -2670,18 +2888,17 @@ class DeepSeekV4ModelRunner(ModelRunner):
             scratch_slot = (slot + self._compiled.layout.decode_batch - 1) % self._compiled.layout.decode_batch
         return [slot] * actual_tokens + [scratch_slot] * (kernel_tokens - actual_tokens)
 
-    def _prefill_sliding_window_slot_mapping(
-        self,
-        slots: Sequence[int],
-        positions: Sequence[int],
-    ) -> torch.Tensor:
+    def _prefill_ori_slot_mapping(self, positions: Sequence[int]) -> torch.Tensor:
         layout = self._compiled.layout
-        if len(slots) != len(positions):
-            raise ValueError("prefill slots and positions must have the same length")
         mapping = torch.empty((len(positions),), dtype=torch.long)
-        capacity = layout.ori_max_blocks * layout.block_size
-        for row, (slot, position) in enumerate(zip(slots, positions, strict=True)):
-            mapping[row] = int(slot) * capacity + (int(position) % layout.block_size)
+        capacity = layout.prefill_ori_max_blocks * layout.block_size
+        for row, position in enumerate(positions):
+            position = int(position)
+            if position < 0 or position >= capacity:
+                raise ValueError(
+                    f"prefill ori position {position} exceeds cache capacity {capacity}"
+                )
+            mapping[row] = position
         return mapping
 
     def _prefill_compressed_slot_mapping(
@@ -2712,24 +2929,21 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
     def _prefill_state_slot_mapping(
         self,
-        slots: Sequence[int],
         positions: Sequence[int],
         *,
         max_blocks: int,
         state_block_size: int,
     ) -> torch.Tensor:
-        if len(slots) != len(positions):
-            raise ValueError("prefill slots and positions must have the same length")
         capacity = int(max_blocks) * int(state_block_size)
         mapping = torch.empty((len(positions),), dtype=torch.long)
-        for row, (slot, position) in enumerate(zip(slots, positions, strict=True)):
+        for row, position in enumerate(positions):
             position = int(position)
             if position >= capacity:
                 raise ValueError(
                     f"position {position} exceeds compressor-state capacity {capacity} "
                     f"(max_blocks={max_blocks}, state_block_size={state_block_size})"
                 )
-            mapping[row] = int(slot) * capacity + position
+            mapping[row] = position
         return mapping
 
     @staticmethod
@@ -2809,57 +3023,6 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 f"positions={positions[:8]}{'...' if len(positions) > 8 else ''}"
             )
         return positions
-
-    def _prefill_sparse_by_ratio(
-        self,
-        positions: Sequence[int],
-        actual_tokens: int,
-    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
-        return {
-            ratio: self._prefill_sparse_indices(positions, actual_tokens, compress_ratio=ratio)
-            for ratio in (0, 4, 128)
-        }
-
-    def _prefill_sparse_indices(
-        self,
-        positions: Sequence[int],
-        actual_tokens: int,
-        *,
-        compress_ratio: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        layout = self._compiled.layout
-        indices = torch.full(
-            (layout.prefill_seq, layout.prefill_sparse_topk),
-            -1,
-            dtype=torch.int32,
-        )
-        lens = torch.zeros((layout.prefill_seq,), dtype=torch.int32)
-        current = {int(pos): row for row, pos in enumerate(positions[:actual_tokens])}
-        for row in range(actual_tokens):
-            abs_pos = int(positions[row])
-            window_valid = min(layout.block_size, abs_pos + 1)
-            key_start_abs = abs_pos + 1 - window_valid
-            cursor = 0
-            for key_abs in range(key_start_abs, abs_pos + 1):
-                overlay_row = current.get(key_abs)
-                if overlay_row is not None and overlay_row <= row:
-                    indices[row, cursor] = layout.block_size + overlay_row
-                else:
-                    indices[row, cursor] = key_abs % layout.block_size
-                cursor += 1
-            if compress_ratio > 0:
-                compressed_visible = min(
-                    (abs_pos + 1) // compress_ratio,
-                    layout.cmp_max_blocks * layout.block_size,
-                    layout.prefill_sparse_topk - layout.block_size,
-                )
-                for cmp_slot in range(compressed_visible):
-                    if cursor >= layout.prefill_sparse_topk:
-                        break
-                    indices[row, cursor] = layout.block_size + layout.prefill_seq + cmp_slot
-                    cursor += 1
-            lens[row] = cursor
-        return indices, lens
 
     def _decode_positions(self, batch: DecodeBatch, actual_batch: int) -> tuple[tuple[int, ...], ...]:
         decode_seq = self._compiled.layout.decode_seq

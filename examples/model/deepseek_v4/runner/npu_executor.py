@@ -459,8 +459,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         21 compress_ratio==4 layers, HCA-group weights across the 20
         compress_ratio==128 layers. The work caches (kv_cache/cmp_kv stack x43,
         idx_kv_cache stacks x21) and compressor-state kv/score caches are stacked on
-        the layer axis. The per-step metadata (slot mappings, block tables, sparse
-        tables, position ids, input ids), the RoPE tables and the compressor-state
+        the layer axis. The per-step metadata (slot mappings, block tables,
+        position ids, input ids), the RoPE tables and the compressor-state
         block tables are shared single per-rank copies, matching decode -- the kernel
         slices them per layer internally. Prefill runs final RMSNorm and emits
         normalized ``x_out`` hidden rows, so host-side LM-head can project only the
@@ -507,7 +507,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
 
         values.update(
             {
-                "x_hc": torch.empty((ranks, seq, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.bfloat16),
+                "x_hc": torch.empty((ranks, seq, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.float32),
                 # HCA-group prefill compressor state (x20).
                 "hca_cmp_kv_state": torch.empty(
                     (
@@ -580,7 +580,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 # stacks across the 21 CSA layers. The kernel reshapes the fused
                 # layer x block axis internally.
                 "kv_cache": torch.empty(
-                    (ranks, fwd * layout.ori_max_blocks, layout.block_size, 1, head_dim),
+                    (ranks, fwd * layout.prefill_ori_max_blocks, layout.block_size, 1, head_dim),
                     dtype=torch.bfloat16,
                 ),
                 "cmp_kv": torch.empty(
@@ -589,18 +589,17 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 ),
                 "idx_kv_cache": torch.empty(
                     (ranks, csa * layout.prefill_idx_block_num, layout.block_size, 1, DEEPSEEK_V4_IDX_HEAD_DIM),
-                    dtype=torch.bfloat16,
+                    dtype=torch.int8,
+                ),
+                "idx_kv_scale": torch.empty(
+                    (ranks, csa * layout.prefill_idx_block_num, layout.block_size, 1, 1),
+                    dtype=torch.float32,
                 ),
                 # Shared single per-rank prefill metadata (the kernel passes each
                 # whole tensor to every layer).
-                "ori_block_table": torch.empty((ranks, layout.ori_max_blocks), dtype=torch.int32),
+                "ori_block_table": torch.empty((ranks, layout.prefill_ori_max_blocks), dtype=torch.int32),
                 "ori_slot_mapping": torch.empty((ranks, seq), dtype=torch.long),
                 "cmp_block_table": torch.empty((ranks, layout.prefill_cmp_max_blocks), dtype=torch.int32),
-                "cmp_sparse_indices": torch.empty(
-                    (ranks, seq, layout.prefill_sparse_topk),
-                    dtype=torch.int32,
-                ),
-                "cmp_sparse_lens": torch.empty((ranks, seq), dtype=torch.int32),
                 "idx_block_table": torch.empty((ranks, layout.prefill_idx_max_blocks), dtype=torch.int32),
                 "position_ids": torch.empty((ranks, seq), dtype=torch.int32),
                 "hca_cmp_slot_mapping": torch.empty((ranks, seq), dtype=torch.long),
@@ -676,12 +675,12 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
 
         values.update(
             {
-                "x_hc": torch.empty((ranks, tokens, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.bfloat16),
+                "x_hc": torch.empty((ranks, tokens, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.float32),
                 # FWD-stacked work caches (x43).
                 "kv_cache": torch.empty(
                     (
                         ranks,
-                        fwd * batch * layout.ori_max_blocks,
+                        fwd * batch * layout.decode_ori_max_blocks,
                         layout.block_size,
                         1,
                         model.config.head_dim,
@@ -707,7 +706,17 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                         1,
                         DEEPSEEK_V4_IDX_HEAD_DIM,
                     ),
-                    dtype=torch.bfloat16,
+                    dtype=torch.int8,
+                ),
+                "idx_kv_scale": torch.empty(
+                    (
+                        ranks,
+                        csa * batch * layout.idx_max_blocks,
+                        layout.block_size,
+                        1,
+                        1,
+                    ),
+                    dtype=torch.float32,
                 ),
                 "csa_compress_state": torch.empty(
                     (
@@ -738,8 +747,13 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                     dtype=torch.float32,
                 ),
                 # Shared single-copy per-step inputs.
-                "block_table": torch.empty((ranks, batch, layout.ori_max_blocks), dtype=torch.int32),
+                "block_table": torch.empty((ranks, batch, layout.ori_table_max_blocks), dtype=torch.int32),
                 "ori_slot_mapping": torch.empty((ranks, tokens), dtype=torch.long),
+                "window_swa_indices": torch.empty((ranks, tokens, layout.sliding_window), dtype=torch.int32),
+                "window_swa_lens": torch.empty((ranks, tokens), dtype=torch.int32),
+                "swa_slot_mapping": torch.empty((ranks, tokens), dtype=torch.long),
+                "swa_indices": torch.empty((ranks, tokens, layout.sliding_window), dtype=torch.int32),
+                "swa_lens": torch.empty((ranks, tokens), dtype=torch.int32),
                 "hca_cmp_slot_mapping": torch.empty((ranks, tokens), dtype=torch.long),
                 "hca_state_slot_mapping": torch.empty((ranks, tokens), dtype=torch.long),
                 "csa_cmp_slot_mapping": torch.empty((ranks, tokens), dtype=torch.long),
@@ -914,9 +928,11 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             "DECODE_TOKENS": layout.decode_tokens,
             "PREFILL_BATCH": layout.prefill_batch,
             "PREFILL_SEQ": layout.prefill_seq,
-            "KV_ORI_MAX_BLOCKS": layout.ori_max_blocks,
+            "KV_ORI_MAX_BLOCKS": layout.decode_ori_max_blocks,
+            "KV_ORI_TABLE_MAX_BLOCKS": layout.ori_table_max_blocks,
             "KV_CMP_MAX_BLOCKS": layout.cmp_max_blocks,
             "IDX_CACHE_MAX_BLOCKS": layout.idx_max_blocks,
+            "PREFILL_ORI_MAX_BLOCKS": layout.prefill_ori_max_blocks,
             "PREFILL_CMP_MAX_BLOCKS": layout.prefill_cmp_max_blocks,
             "PREFILL_IDX_MAX_BLOCKS": layout.prefill_idx_max_blocks,
             "EP_WORLD_SIZE": layout.ranks,
