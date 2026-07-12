@@ -162,6 +162,17 @@ class WorkerProcess:
 
         logger.info("Worker exiting")
 
+    def close(self) -> None:
+        """Release executor-owned runtime and device resources."""
+        executor = self.executor
+        self.executor = None
+        if executor is None:
+            return
+
+        close = getattr(executor, "close", None)
+        if callable(close):
+            close()
+
     def _execute_step(self, scheduler_output) -> StepOutput:
         """Execute one batch step (may contain prefill + decode requests)."""
         runtime_model = self.model_record.runtime_model
@@ -412,6 +423,11 @@ def _worker_entry(
     except Exception as e:
         logger.error(f"Worker process failed: {e}", exc_info=True)
         ready_event.set()
+    finally:
+        try:
+            worker.close()
+        except Exception:
+            logger.exception("Worker process cleanup failed")
 
 
 def spawn_worker(config: EngineConfig):
