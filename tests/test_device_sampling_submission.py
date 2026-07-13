@@ -48,7 +48,10 @@ def test_device_sampling_is_limited_by_runtime_vocab_size() -> None:
 
 def test_device_greedy_tie_break_matches_host_argmax() -> None:
     greedy = _source(QWEN / "greedy_sample.py")
-    decode = _source(QWEN / "decode_layer.py")
+    decode_path = QWEN / "decode_layer.py"
+    if not decode_path.is_file():
+        decode_path = QWEN / "decode_fwd.py"
+    decode = _source(decode_path)
 
     for source in (greedy, decode):
         assert "local_token = pl.cast(0, pl.INT32)" in source
