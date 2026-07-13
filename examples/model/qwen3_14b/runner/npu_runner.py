@@ -82,7 +82,6 @@ class _CompiledKernels:
     prefill: _L3Callable
     decode: _L3Callable
     greedy_sample: _L3Callable
-    token_embed: _L3Callable
     final_norm_weight: torch.Tensor
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
@@ -607,7 +606,7 @@ class Qwen314BModelRunner(ModelRunner):
         )
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
-        """Run the fused all-layer PAGED ``decode_layer.decode_fwd`` and return logits.
+        """Run the fused all-layer PAGED ``decode_fwd.decode_fwd`` and return logits.
 
         ``decode_fwd`` runs all NUM_LAYERS + the LM head in one dispatch over the
         PAGED KV pool, addressing KV via ``block_table`` + ``slot_mapping``, the
@@ -878,7 +877,6 @@ class Qwen314BModelRunner(ModelRunner):
                 self._compiled.prefill.compiled,
                 self._compiled.decode.compiled,
                 self._compiled.greedy_sample.compiled,
-                self._compiled.token_embed.compiled,
             ])
             self._l3_worker = worker
         return worker

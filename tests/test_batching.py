@@ -161,7 +161,6 @@ def _compiled_kernels(
         prefill=callable_,
         decode=callable_,
         greedy_sample=callable_,
-        token_embed=callable_,
         final_norm_weight=torch.ones(1, hidden_size),
         rope_cos=torch.zeros(max_seq, head_dim),
         rope_sin=torch.zeros(max_seq, head_dim),
