@@ -1072,6 +1072,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
             raise ValueError(
                 f"prefill position {positions[-1]} exceeds max_seq_len={model.runtime.max_seq_len}"
             )
+        if batch.input_embeddings is None:
+            raise ValueError("DeepSeek V4 prefill requires host input embeddings")
         embeddings = batch.input_embeddings[0, :actual_tokens].to(torch.float32).cpu()
         token_ids = batch.token_ids[0, :actual_tokens].detach().cpu().to(torch.long)
         kernel_tokens = self._prefill_kernel_tokens(actual_tokens)

@@ -52,11 +52,11 @@ class ModelExecutor(ABC):
 
     @property
     def supports_device_embedding(self) -> bool:
-        """Return whether decode token embedding can be handled inside the device kernel.
+        """Return whether token embedding can be handled inside the device kernels.
 
-        When true, callers may pass a same-shape placeholder hidden tensor for
-        decode because the executor's decode kernel is responsible for gathering
-        the current token embedding from ``DecodeBatch.token_ids``.
+        When true, callers may omit prefill embeddings and pass a same-shape
+        placeholder hidden tensor for decode because the executor gathers token
+        embeddings from the batch token ids.
         """
         return False
 
