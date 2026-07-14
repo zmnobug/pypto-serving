@@ -15,11 +15,7 @@ import pytest
 import torch
 from simpler.task_interface import DataType
 
-from python.core.async_engine import ReplicaEngineCore, TokenOutput
-from python.core.engine import LLMEngine
-from python.core.executor import ModelExecutor
-from python.core.kv_cache import KvCacheManager
-from python.core.types import (
+from pypto_serving.config.types import (
     DecodeBatch,
     DecodeResult,
     GenerateConfig,
@@ -31,20 +27,26 @@ from python.core.types import (
     RuntimeConfig,
     RuntimeModel,
 )
-from python.core.scheduler import Request, ScheduledRequest
-from python.core.serving_worker import WorkerProcess
-from examples.model.qwen3_14b.runner.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
-from examples.model.qwen3_14b.runner.npu_runner import Qwen314BModelRunner as ModelRunner
-from examples.model.qwen3_14b.runner.npu_runner import _CompiledKernels
-from examples.model.qwen3_14b.runner.npu_runner import _L3Callable
-from examples.model.qwen3_14b.runner.npu_runner import _add_run_timing_args
-from examples.model.qwen3_14b.runner.npu_runner import _kernel_trace_name
-from examples.model.qwen3_14b.runner.npu_runner import _run_timing_us
-from python.runtime.worker import WorkerTensor
+from pypto_serving.model.common.executor.executor import ModelExecutor
+from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
+from pypto_serving.model.qwen.npu_runner import (
+    _CompiledKernels,
+    _L3Callable,
+    Qwen314BModelRunner as ModelRunner,
+    _add_run_timing_args,
+    _kernel_trace_name,
+    _run_timing_us,
+)
+from pypto_serving.serving.engine.async_engine import ReplicaEngineCore, TokenOutput
+from pypto_serving.serving.engine.engine import LLMEngine
+from pypto_serving.serving.memory.kv_cache import KvCacheManager
+from pypto_serving.serving.sched.scheduler import Request, ScheduledRequest
+from pypto_serving.serving.server.serving_worker import WorkerProcess
+from pypto_serving.worker.worker import WorkerTensor
 
 
 ROOT = Path(__file__).resolve().parents[1]
-QWEN3_DISPATCH = ROOT / "examples" / "model" / "qwen3_14b" / "runner" / "qwen3_l3_dispatch.py"
+QWEN3_DISPATCH = ROOT / "pypto_serving" / "model" / "qwen" / "qwen3_l3_dispatch.py"
 QWEN3_KERNEL_DIR = ROOT / "pypto-lib" / "models" / "qwen3" / "14b"
 
 
@@ -561,6 +563,7 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         decode_weights=executor._stack_decode_weights([cached_layer]),
     )
     executor._compiled[model.config.model_id] = compiled
+    monkeypatch.setattr(ModelRunner, "_static_device_tensor", staticmethod(lambda tensor: tensor))
     runner = ModelRunner(
         compiled=compiled,
     )
@@ -568,7 +571,6 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
     monkeypatch.setattr(runner, "_compute_kv_cache_pages", lambda config, runtime, device_id=0: 1)
     monkeypatch.setattr(runner, "_print_memory_breakdown", lambda *a, **kw: None)
     runner.init_kv_cache(model.config.model_id, model.config, model.runtime)
-    monkeypatch.setattr(runner, "_static_device_tensor", lambda tensor: tensor)
     monkeypatch.setattr(
         runner,
         "_run_distributed_program",

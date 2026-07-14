@@ -4,6 +4,12 @@ These commands are for Qwen3 serving checks on the shared Ascend development
 machines that provide `task-submit` and `$TASK_DEVICE`. Use the README commands
 for environment-neutral usage.
 
+Install the checkout before running the commands below:
+
+```bash
+python -m pip install --no-deps -e .
+```
+
 ## Single-Device Serving
 
 When launching through `task-submit`, keep the payload in single quotes so
@@ -11,7 +17,7 @@ When launching through `task-submit`, keep the payload in single quotes so
 
 ```bash
 task-submit --device auto --max-time 1200 --run \
-  'python -m python.cli.main \
+  'pypto-serving \
     --model /data/linyifan/models/Qwen3-14B \
     --backend npu \
     --platform a2a3 \
@@ -51,7 +57,7 @@ fail with `rtMalloc failed: 207001`.
 ```bash
 task-submit --device auto --device-num 2 --max-time 1800 --run \
   'export PTO2_RING_HEAP=4294967296 PTO2_RING_TASK_WINDOW=131072 PTO2_RING_DEP_POOL=131072; \
-  python -m python.cli.main \
+  pypto-serving \
     --model /data/linyifan/models/Qwen3-14B \
     --backend npu \
     --platform a2a3 \

@@ -61,7 +61,8 @@ def _server_command(model_dir: Path, devices: tuple[int, ...], port: int) -> lis
     # CI substitutes only the checkpoint, task-submit devices, and free port.
     return [
         sys.executable,
-        "python/cli/main.py",
+        "-m",
+        "pypto_serving.cli",
         "--model",
         str(model_dir),
         "--served-model-name",
