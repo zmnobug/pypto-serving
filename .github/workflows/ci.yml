@@ -137,6 +137,11 @@ jobs:
           pip install torch transformers safetensors numpy fastapi uvicorn pytest
           pip install --no-deps -e .
 
+      - name: Run Radix prefix cache unit tests
+        run: |
+          source activate.sh
+          python -m pytest tests/test_radix_cache.py -q
+
       - name: Show ccache stats (after)
         run: ccache -s || true
 
