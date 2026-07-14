@@ -197,18 +197,21 @@ class LLMEngine:
                 dtype=torch.long,
                 device=runtime_model.runtime.device,
             )
-            embeddings = torch.zeros(
-                (len(prompt_token_ids), max_prompt_len, record.config.hidden_size),
-                dtype=runtime_model.embed_tokens.dtype,
-                device=runtime_model.runtime.device,
-            )
+            embeddings = None
+            if not self._executor.supports_device_embedding:
+                embeddings = torch.zeros(
+                    (len(prompt_token_ids), max_prompt_len, record.config.hidden_size),
+                    dtype=runtime_model.embed_tokens.dtype,
+                    device=runtime_model.runtime.device,
+                )
             for batch_idx, token_ids in enumerate(prompt_token_ids):
                 row_tokens = torch.tensor(token_ids, dtype=torch.long, device=runtime_model.runtime.device)
                 token_tensor[batch_idx, : len(token_ids)] = row_tokens
-                embeddings[batch_idx, : len(token_ids), :] = self._executor.lookup_embeddings(
-                    runtime_model,
-                    row_tokens,
-                )
+                if embeddings is not None:
+                    embeddings[batch_idx, : len(token_ids), :] = self._executor.lookup_embeddings(
+                        runtime_model,
+                        row_tokens,
+                    )
 
             prefill_batch = PrefillBatch(
                 request_ids=[request.request_id for request in requests],
@@ -365,7 +368,9 @@ class LLMEngine:
 
         try:
             token_tensor = torch.tensor(prompt_token_ids, dtype=torch.long, device=runtime_model.runtime.device)
-            embeddings = self._executor.lookup_embeddings(runtime_model, token_tensor).unsqueeze(0)
+            embeddings = None
+            if not self._executor.supports_device_embedding:
+                embeddings = self._executor.lookup_embeddings(runtime_model, token_tensor).unsqueeze(0)
 
             with self._executor.session():
                 prefill_result = self._executor.run_prefill(

@@ -168,7 +168,7 @@ def _compiled_kernels(
         padded_lm_head_weight=torch.zeros(model.config.vocab_size, hidden_size),
         padded_embed_weight=torch.zeros(model.config.vocab_size, hidden_size),
         decode_weights=decode_weights,
-        prefill_hidden_buffer=torch.empty(kernel_batch * max_seq, hidden_size, dtype=torch.bfloat16),
+        prefill_token_ids_buffer=torch.empty(kernel_batch * max_seq, dtype=torch.int32),
         prefill_seq_lens_buffer=torch.empty(kernel_batch, dtype=torch.int32),
         prefill_chunk_lens_buffer=torch.empty(kernel_batch, dtype=torch.int32),
         prefill_chunk_offsets_buffer=torch.empty(kernel_batch, dtype=torch.int32),
@@ -211,29 +211,20 @@ def test_prefill_inputs_pack_actual_tokens_into_fixed_kernel_buffers():
         [idx + 1 for idx in range(len(allocations))],
         dtype=torch.int32,
     )
-    embeddings = torch.ones(
-        len(allocations),
-        int(seq_lens.max().item()),
-        model.config.hidden_size,
-    )
-
     prepared = runner._prepare_prefill_inputs(
         model,
         PrefillBatch(
             request_ids=[alloc.request_id for alloc in allocations],
-            token_ids=torch.zeros(
-                len(allocations),
-                int(seq_lens.max().item()),
-                dtype=torch.long,
-            ),
-            input_embeddings=embeddings,
+            token_ids=torch.tensor([[1, 0], [2, 3]], dtype=torch.long),
+            input_embeddings=None,
             seq_lens=seq_lens,
             kv_allocations=allocations,
         ),
     )
 
     assert prepared.actual_batch == 2
-    assert prepared.hidden.shape == (3, model.config.hidden_size)
+    assert prepared.token_ids.shape == (3,)
+    assert prepared.token_ids.tolist() == [1, 2, 3]
     assert prepared.seq_lens.shape == (model.runtime.max_batch_size,)
     assert prepared.seq_lens[:2].tolist() == [1, 2]
     assert prepared.seq_lens[2:].tolist() == [0] * (model.runtime.max_batch_size - 2)
@@ -261,15 +252,15 @@ def test_prefill_inputs_pack_resumed_chunk_positions():
         model,
         PrefillBatch(
             request_ids=[alloc.request_id],
-            token_ids=torch.zeros(1, 2, dtype=torch.long),
-            input_embeddings=torch.ones(1, 2, model.config.hidden_size),
+            token_ids=torch.tensor([[5, 6]], dtype=torch.long),
+            input_embeddings=None,
             seq_lens=torch.tensor([4], dtype=torch.int32),
             kv_allocations=[alloc],
             positions=torch.tensor([[2, 3]], dtype=torch.long),
         ),
     )
 
-    assert prepared.hidden.shape == (2, model.config.hidden_size)
+    assert prepared.token_ids.tolist() == [5, 6]
     assert prepared.seq_lens.tolist() == [4]
     assert prepared.chunk_lens.tolist() == [2]
     assert prepared.chunk_offsets.tolist() == [0]
@@ -294,7 +285,7 @@ def test_prefill_inputs_reject_non_contiguous_chunk_positions():
             PrefillBatch(
                 request_ids=[alloc.request_id],
                 token_ids=torch.zeros(1, 3, dtype=torch.long),
-                input_embeddings=torch.ones(1, 3, model.config.hidden_size),
+                input_embeddings=None,
                 seq_lens=torch.tensor([4], dtype=torch.int32),
                 kv_allocations=[alloc],
                 positions=torch.tensor([[1, 3, 4]], dtype=torch.long),
@@ -435,7 +426,7 @@ def test_engine_uses_zero_decode_placeholder_when_executor_embeds_on_device():
     )[0]
 
     assert result.token_ids == [3, 0]
-    assert executor.lookup_calls == 1
+    assert executor.lookup_calls == 0
     assert executor.decode_calls == 1
     assert torch.equal(executor.decode_hidden_seen[0], torch.zeros_like(model.embed_tokens[3]))
     assert sampler.sample_calls == 0
@@ -472,7 +463,7 @@ def test_engine_skips_decode_host_embedding_when_executor_embeds_on_device():
     )[0]
 
     assert result.token_ids == [3, 0]
-    assert executor.lookup_calls == 1
+    assert executor.lookup_calls == 0
     assert executor.decode_calls == 1
     assert torch.equal(executor.decode_hidden_seen[0], torch.zeros_like(model.embed_tokens[3]))
     assert sampler.sample_calls == 0
@@ -596,7 +587,7 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
         PrefillBatch(
             request_ids=["prefill"],
             token_ids=torch.zeros(1, 1, dtype=torch.long),
-            input_embeddings=torch.ones(1, 1, model.config.hidden_size),
+            input_embeddings=None,
             seq_lens=torch.tensor([1], dtype=torch.int32),
             kv_allocations=[prefill_alloc],
         ),
@@ -661,7 +652,7 @@ def test_decode_host_inlines_embedding_and_sampling_into_decode_fwd():
     assert 'name_hint="greedy_sample"' in decode_source
 
 
-def test_prefill_host_keeps_sampling_as_standalone_kernel():
+def test_prefill_host_inlines_embedding_and_keeps_sampling_standalone():
     module_source = QWEN3_DISPATCH.read_text(encoding="utf-8")
     start = module_source.index("def qwen3_prefill_host")
     end = module_source.index("def qwen3_decode_host")
@@ -670,12 +661,14 @@ def test_prefill_host_keeps_sampling_as_standalone_kernel():
     assert source.count("prefill_fwd(") == 1
     assert "greedy_sample_fwd(" not in source
     assert "token_embed_fwd(" not in source
+    assert "embed_weight:" in source
+    assert "input_ids:" in source
 
     if not QWEN3_KERNEL_DIR.is_dir():
         pytest.skip("pypto-lib submodule is not checked out")
     prefill_source = (QWEN3_KERNEL_DIR / "prefill_fwd.py").read_text(encoding="utf-8")
     assert 'name_hint="greedy_sample"' not in prefill_source
-    assert 'name_hint="token_embed"' not in prefill_source
+    assert 'name_hint="token_embed"' in prefill_source
 
 
 def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeights:
@@ -696,12 +689,16 @@ def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeig
 
 
 class _CopyKernel:
-    def __call__(self, hidden, *args, config=None):
-        out = args[-1]
-        if out.shape == hidden.shape:
-            out.copy_(hidden)
+    def __call__(self, *args, config=None):
+        tensors = [arg for arg in args if isinstance(arg, torch.Tensor)]
+        if len(tensors) < 2:
+            return None
+        src, out = tensors[0], tensors[-1]
+        if out.shape == src.shape:
+            out.copy_(src)
         else:
             out.zero_()
+        return None
 
 
 class _ImmediateEosExecutor(ModelExecutor):
@@ -779,12 +776,11 @@ class _DeviceSamplingExecutor(ModelExecutor):
 
     def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
         self.lookup_calls += 1
-        if self.lookup_calls > 1:
-            raise AssertionError("device-embedding decode should use a placeholder instead of host lookup")
-        return super().lookup_embeddings(model, token_ids)
+        raise AssertionError("device-embedding prefill/decode should not use host lookup")
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
         self.prefill_calls += 1
+        assert batch.input_embeddings is None
         token = torch.tensor([self.first_token], dtype=torch.int64)
         return PrefillResult(
             last_hidden=None,

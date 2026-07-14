@@ -21,7 +21,7 @@ greedy_sample_fwd = None
 
 @pl.jit.host
 def qwen3_prefill_host(
-    hidden_states: pl.Tensor,
+    input_ids: pl.Tensor,
     seq_lens: pl.Tensor,
     chunk_lens: pl.Tensor,
     chunk_offsets: pl.Tensor,
@@ -44,10 +44,11 @@ def qwen3_prefill_host(
     post_rms_weight: pl.Tensor,
     final_norm_weight: pl.Tensor,
     lm_head_weight: pl.Tensor,
+    embed_weight: pl.Tensor,
     out: pl.Out[pl.Tensor],
 ) -> pl.Tensor:
     return prefill_fwd(
-        hidden_states,
+        input_ids,
         seq_lens,
         chunk_lens,
         chunk_offsets,
@@ -70,6 +71,7 @@ def qwen3_prefill_host(
         w_down,
         final_norm_weight,
         lm_head_weight,
+        embed_weight,
         out,
     )
 

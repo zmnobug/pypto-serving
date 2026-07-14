@@ -237,19 +237,22 @@ class WorkerProcess:
                 and all(sr.request.temperature <= 0.0 for sr in scheduled)
             )
             token_tensor = torch.zeros((batch_size, max_chunk), dtype=torch.long, device=device)
-            embeddings = torch.zeros(
-                (batch_size, max_chunk, self.model_record.config.hidden_size),
-                dtype=runtime_model.embed_tokens.dtype,
-                device=device,
-            )
+            embeddings = None
+            if not self.executor.supports_device_embedding:
+                embeddings = torch.zeros(
+                    (batch_size, max_chunk, self.model_record.config.hidden_size),
+                    dtype=runtime_model.embed_tokens.dtype,
+                    device=device,
+                )
             positions_tensor = torch.full((batch_size, max_chunk), -1, dtype=torch.long, device=device)
 
             for i, tokens in enumerate(chunk_tokens_list):
                 row = torch.tensor(tokens, dtype=torch.long, device=device)
                 token_tensor[i, : len(tokens)] = row
-                embeddings[i, : len(tokens), :] = self.executor.lookup_embeddings(
-                    runtime_model, row
-                )
+                if embeddings is not None:
+                    embeddings[i, : len(tokens), :] = self.executor.lookup_embeddings(
+                        runtime_model, row
+                    )
                 positions_tensor[i, : len(tokens)] = torch.tensor(
                     list(positions_list[i]), dtype=torch.long, device=device
                 )

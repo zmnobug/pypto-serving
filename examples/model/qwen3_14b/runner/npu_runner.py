@@ -89,7 +89,7 @@ class _CompiledKernels:
     padded_lm_head_weight: torch.Tensor
     padded_embed_weight: torch.Tensor
     decode_weights: dict[str, torch.Tensor]
-    prefill_hidden_buffer: torch.Tensor
+    prefill_token_ids_buffer: torch.Tensor
     prefill_seq_lens_buffer: torch.Tensor
     prefill_chunk_lens_buffer: torch.Tensor
     prefill_chunk_offsets_buffer: torch.Tensor
@@ -112,7 +112,7 @@ class _PrefillInputs:
     """Host tensors passed to the prefill kernel."""
 
     actual_batch: int
-    hidden: torch.Tensor
+    token_ids: torch.Tensor
     seq_lens: torch.Tensor
     chunk_lens: torch.Tensor
     chunk_offsets: torch.Tensor
@@ -407,7 +407,7 @@ class Qwen314BModelRunner(ModelRunner):
         kv_cache = list(self._kv_caches.values())[0]
 
         # -- prefill ---------------------------------------------------------
-        compiled.prefill_hidden_buffer[:total_tokens].zero_()
+        compiled.prefill_token_ids_buffer[:total_tokens].zero_()
         compiled.prefill_seq_lens_buffer.zero_()
         compiled.prefill_chunk_lens_buffer.zero_()
         compiled.prefill_chunk_offsets_buffer.zero_()
@@ -423,7 +423,7 @@ class Qwen314BModelRunner(ModelRunner):
 
         prefill_inputs = _PrefillInputs(
             actual_batch=batch,
-            hidden=compiled.prefill_hidden_buffer[:total_tokens],
+            token_ids=compiled.prefill_token_ids_buffer[:total_tokens],
             seq_lens=compiled.prefill_seq_lens_buffer,
             chunk_lens=compiled.prefill_chunk_lens_buffer,
             chunk_offsets=compiled.prefill_chunk_offsets_buffer,
@@ -532,7 +532,7 @@ class Qwen314BModelRunner(ModelRunner):
             compiled.padded_lm_head_weight,
             compiled.padded_embed_weight,
             *compiled.decode_weights.values(),
-            compiled.prefill_hidden_buffer,
+            compiled.prefill_token_ids_buffer,
             compiled.prefill_seq_lens_buffer,
             compiled.prefill_chunk_lens_buffer,
             compiled.prefill_chunk_offsets_buffer,
@@ -717,7 +717,7 @@ class Qwen314BModelRunner(ModelRunner):
         static = self._require_static_args()
         weights = static.decode_weights
         return (
-            inputs.hidden,
+            inputs.token_ids,
             inputs.seq_lens,
             inputs.chunk_lens,
             inputs.chunk_offsets,
@@ -740,6 +740,7 @@ class Qwen314BModelRunner(ModelRunner):
             weights["decode_post_rms_weight"],
             static.final_norm_weight,
             static.padded_lm_head_weight,
+            static.padded_embed_weight,
             logits,
         )
 
@@ -1006,7 +1007,7 @@ class Qwen314BModelRunner(ModelRunner):
         if total_tokens > max_tokens:
             raise ValueError(f"prefill total tokens {total_tokens} exceeds kernel capacity {max_tokens}")
 
-        hidden = compiled.prefill_hidden_buffer[:total_tokens]
+        token_ids = compiled.prefill_token_ids_buffer[:total_tokens]
         seq_lens = compiled.prefill_seq_lens_buffer
         chunk_lens = compiled.prefill_chunk_lens_buffer
         chunk_offsets = compiled.prefill_chunk_offsets_buffer
@@ -1030,8 +1031,8 @@ class Qwen314BModelRunner(ModelRunner):
             chunk_start = chunk_start_values[batch_idx]
             chunk_lens[batch_idx] = chunk_len
             chunk_offsets[batch_idx] = token_offset
-            embeddings = batch.input_embeddings[batch_idx, :chunk_len, :].to(torch.bfloat16).cpu()
-            hidden[token_offset : token_offset + chunk_len, :] = embeddings
+            chunk_token_ids = batch.token_ids[batch_idx, :chunk_len].to(torch.int32).cpu()
+            token_ids[token_offset : token_offset + chunk_len] = chunk_token_ids
 
             if alloc is not None:
                 page_ids = alloc.page_ids
@@ -1047,7 +1048,7 @@ class Qwen314BModelRunner(ModelRunner):
 
         return _PrefillInputs(
             actual_batch=actual_batch,
-            hidden=hidden,
+            token_ids=token_ids,
             seq_lens=seq_lens,
             chunk_lens=chunk_lens,
             chunk_offsets=chunk_offsets,

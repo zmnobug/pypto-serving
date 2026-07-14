@@ -183,7 +183,7 @@ class PrefillBatch:
 
     request_ids: list[str]
     token_ids: torch.Tensor
-    input_embeddings: torch.Tensor
+    input_embeddings: torch.Tensor | None
     seq_lens: torch.Tensor
     allow_device_greedy_sampling: bool = False
     kv_allocations: list[KvAllocation] = field(default_factory=list)

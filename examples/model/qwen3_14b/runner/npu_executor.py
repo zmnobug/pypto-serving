@@ -129,7 +129,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
 
     @property
     def supports_device_embedding(self) -> bool:
-        """Qwen3 NPU decode embeds greedy token ids inside the device kernel."""
+        """Qwen3 NPU prefill and decode embed token ids inside device kernels."""
         return True
 
     def _create_runner(self, model_id: str, compiled: object) -> ModelRunner:
@@ -303,9 +303,9 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             for name, tensor in self._stack_decode_weights(layers).items()
         }
         _mark("stack_decode_weights")
-        prefill_hidden_buffer = torch.empty(
-            (kernel_batch * model.runtime.max_seq_len, model.config.hidden_size),
-            dtype=torch.bfloat16,
+        prefill_token_ids_buffer = torch.empty(
+            (kernel_batch * model.runtime.max_seq_len,),
+            dtype=torch.int32,
         ).share_memory_()
         prefill_seq_lens_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
         prefill_chunk_lens_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
@@ -368,7 +368,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             padded_lm_head_weight=padded_lm_head_weight,
             padded_embed_weight=padded_embed_weight,
             decode_weights=decode_weights,
-            prefill_hidden_buffer=prefill_hidden_buffer,
+            prefill_token_ids_buffer=prefill_token_ids_buffer,
             prefill_seq_lens_buffer=prefill_seq_lens_buffer,
             prefill_chunk_lens_buffer=prefill_chunk_lens_buffer,
             prefill_chunk_offsets_buffer=prefill_chunk_offsets_buffer,
@@ -409,7 +409,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         runtime_cache_blocks = (max_seq + page_size - 1) // page_size
         cache_rows = batch * runtime_cache_blocks * num_layers * num_kv_heads * page_size
         dummy_args = [
-            torch.empty((total_tokens, hidden_size), dtype=torch.bfloat16),
+            torch.empty((total_tokens,), dtype=torch.int32),
             torch.empty((batch,), dtype=torch.int32),
             torch.empty((batch,), dtype=torch.int32),
             torch.empty((batch,), dtype=torch.int32),
@@ -431,6 +431,7 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             torch.empty((num_layers * intermediate_size, hidden_size), dtype=torch.bfloat16),
             torch.empty((num_layers, hidden_size), dtype=torch.float32),
             torch.empty((1, hidden_size), dtype=torch.float32),
+            torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
             torch.empty((vocab_size, hidden_size), dtype=torch.bfloat16),
             torch.empty((batch, vocab_size), dtype=torch.float32),
         ]
