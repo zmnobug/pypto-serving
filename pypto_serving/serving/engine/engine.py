@@ -422,7 +422,7 @@ class LLMEngine:
 
     def _sample_batch_rows(
         self,
-        logits: torch.Tensor,
+        logits: torch.Tensor | None,
         sampling_params,
         row_count: int,
         sampled_token_ids: torch.Tensor | None = None,
