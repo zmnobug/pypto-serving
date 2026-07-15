@@ -368,11 +368,15 @@ class WorkerProcess:
 
             for i, sr in enumerate(scheduled):
                 request = sr.request
-                logits = (
-                    decode_result.logits[i]
-                    if decode_result.logits.dim() > 1
-                    else decode_result.logits
-                )
+                # logits is None on the device-greedy path (the row is taken from
+                # sampled_token_ids in _sample_result_row); only index it otherwise.
+                logits = None
+                if decode_result.logits is not None:
+                    logits = (
+                        decode_result.logits[i]
+                        if decode_result.logits.dim() > 1
+                        else decode_result.logits
+                    )
                 params = SamplingParams(
                     temperature=request.temperature,
                     top_p=request.top_p,
@@ -390,7 +394,7 @@ class WorkerProcess:
     def _sample_result_row(
         self,
         result,
-        logits: torch.Tensor,
+        logits: torch.Tensor | None,
         params: SamplingParams,
         row_idx: int,
         allow_device_sampled: bool,

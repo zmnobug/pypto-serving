@@ -225,7 +225,9 @@ class DecodeResult:
     """Outputs from one decode step."""
 
     hidden_states: torch.Tensor
-    logits: torch.Tensor
+    # None on the device-greedy decode path: the host consumes sampled_token_ids and
+    # the logits buffer stays device-resident (never copied back).
+    logits: torch.Tensor | None
     sampled_token_ids: torch.Tensor | None = None
     next_hidden_states: torch.Tensor | None = None
 

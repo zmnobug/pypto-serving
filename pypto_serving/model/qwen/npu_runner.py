@@ -177,6 +177,11 @@ class Qwen314BModelRunner(ModelRunner):
         self._device_id = device_id
         self._l3_worker: Any | None = None
         self._l3_static_tensors: dict[tuple[int, tuple[int, ...], torch.dtype], object] = {}
+        # Device-resident decode output scratch (greedy path): allocated directly on
+        # the worker (no host copy) so the per-step memset + D2H copy-back of the
+        # max-batch logits/next_hidden vanish.
+        self._decode_logits_dev_tensor: DeviceTensor | None = None
+        self._decode_next_hidden_dev_tensor: DeviceTensor | None = None
         self._static_args: _StaticKernelArgs | None = None
         self._pending_kv_cache_specs: dict[str, tuple[ModelConfig, RuntimeConfig]] = {}
         if compiled is not None:
@@ -211,6 +216,12 @@ class Qwen314BModelRunner(ModelRunner):
         logger.info("[init_kv_cache] uploading static tensors …")
         with profile_span("Qwen314BModelRunner.upload_static_tensors", cat="executor"):
             self._materialize_static_tensors()
+            # Reserve the device-resident decode output scratch (logits + next_hidden)
+            # now, before the KV-cache sizing below measures peak_non_kv, so its ~10MB
+            # is counted in the memory budget instead of being lazily allocated on the
+            # first greedy step and eating into the runtime safety margin.
+            self._decode_logits_device_arg()
+            self._decode_next_hidden_device_arg()
 
         # -- phase 1: profile warmup → arena allocated ----------------------
         # Uses slot_mapping=-1 so no real KV cache pages are needed; the
@@ -637,9 +648,10 @@ class Qwen314BModelRunner(ModelRunner):
         # already-valid pages, so bound-check exactly what the kernel will read.
         self._validate_kv_cache_bounds(model, kernel_inputs.block_table, kernel_inputs.slot_mapping, k_cache)
 
+        device_greedy = batch.allow_device_greedy_sampling
         self._run_distributed_program(
             compiled.decode,
-            *self._decode_kernel_args(kernel_inputs, k_cache, v_cache),
+            *self._decode_kernel_args(kernel_inputs, k_cache, v_cache, device_greedy=device_greedy),
         )
         for batch_idx, alloc in enumerate(batch.kv_allocations):
             alloc.tokens_used = max(alloc.tokens_used, int(batch.seq_lens[batch_idx].item()))
@@ -655,8 +667,14 @@ class Qwen314BModelRunner(ModelRunner):
         )
         return DecodeResult(
             hidden_states=decode_inputs.hidden.float(),
-            logits=kernel_inputs.logits[: kernel_inputs.actual_batch, : model.config.vocab_size].to(
-                decode_inputs.hidden.device
+            # Device-greedy path: the host consumes sampled_ids, never logits, so we
+            # keep the logits buffer device-resident and skip its ~9.7MB D2H copy-back.
+            logits=(
+                None
+                if device_greedy
+                else kernel_inputs.logits[: kernel_inputs.actual_batch, : model.config.vocab_size].to(
+                    decode_inputs.hidden.device
+                )
             ),
             sampled_token_ids=sampled_ids,
             next_hidden_states=next_hidden,
@@ -749,10 +767,21 @@ class Qwen314BModelRunner(ModelRunner):
         inputs: _DecodeKernelInputs,
         k_cache: DeviceTensor,
         v_cache: DeviceTensor,
+        *,
+        device_greedy: bool = False,
     ) -> tuple[Any, ...]:
-        """Return arguments in ``qwen3_decode_host`` signature order."""
+        """Return arguments in ``qwen3_decode_host`` signature order.
+
+        On ``device_greedy`` the logits + next_hidden outputs are passed as
+        worker-resident (device) tensors so they are never staged/copied-back
+        per step (no memset, no D2H); only the tiny sampled_ids stays host-visible.
+        """
         static = self._require_static_args()
         weights = static.decode_weights
+        logits_arg = self._decode_logits_device_arg() if device_greedy else inputs.logits
+        next_hidden_arg = (
+            self._decode_next_hidden_device_arg() if device_greedy else self._compiled.decode_next_hidden_buffer
+        )
         return (
             weights["decode_input_rms_weight"],
             weights["decode_wq"],
@@ -774,11 +803,11 @@ class Qwen314BModelRunner(ModelRunner):
             weights["decode_post_rms_weight"],
             static.final_norm_weight,
             static.padded_lm_head_weight,
-            inputs.logits,
+            logits_arg,
             static.padded_embed_weight,
             inputs.token_ids,
             self._compiled.decode_sampled_ids_buffer,
-            self._compiled.decode_next_hidden_buffer,
+            next_hidden_arg,
         )
 
     def _pad_decode_inputs(self, model: RuntimeModel, inputs: _DecodeInputs) -> _DecodeKernelInputs:
@@ -893,6 +922,30 @@ class Qwen314BModelRunner(ModelRunner):
             return cached
         dev = worker.alloc_tensor(tensor.shape, tensor.dtype, init=tensor)
         self._l3_static_tensors[key] = dev
+        return dev
+
+    def _decode_logits_device_arg(self) -> DeviceTensor:
+        """Device-resident decode logits scratch (greedy path: never copied back).
+
+        Allocated directly on the worker and left uninitialized — the fused decode
+        kernel writes every max_batch row before the on-device sampler reads it — so
+        it forwards as a device pointer with no per-step staging/memset/D2H (and no
+        ``_coerce_l3_arg`` dict lookup on the hot path).
+        """
+        dev = self._decode_logits_dev_tensor
+        if dev is None:
+            buffer = self._compiled.decode_logits_buffer
+            dev = self._shared_l3_worker().alloc_tensor(buffer.shape, buffer.dtype)
+            self._decode_logits_dev_tensor = dev
+        return dev
+
+    def _decode_next_hidden_device_arg(self) -> DeviceTensor:
+        """Device-resident decode next_hidden scratch (never read on host)."""
+        dev = self._decode_next_hidden_dev_tensor
+        if dev is None:
+            buffer = self._compiled.decode_next_hidden_buffer
+            dev = self._shared_l3_worker().alloc_tensor(buffer.shape, buffer.dtype)
+            self._decode_next_hidden_dev_tensor = dev
         return dev
 
     def _materialize_static_tensors(self) -> None:
