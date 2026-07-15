@@ -97,6 +97,7 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "decode_indexer",
     "decode_indexer_compressor",
     "decode_layer",
+    "decode_mtp",
     "decode_sparse_attn",
     "decode_sparse_attn_csa",
     "decode_sparse_attn_hca",
@@ -112,6 +113,7 @@ _DEEPSEEK_V4_IMPORT_MODULES = (
     "prefill_attention_swa",
     "prefill_indexer_compressor",
     "prefill_layer",
+    "prefill_mtp",
     "prefill_fwd",
     "prefill_sparse_attn",
     "qkv_proj_rope",
@@ -261,6 +263,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         save_kernels_dir: str | None = None,
         pypto_root: str | None = None,
         compile_kernels: bool = False,
+        enable_mtp: bool = False,
+        l3_trace: bool = False,
     ) -> None:
         worker_device_ids = tuple(device_ids) if device_ids is not None else (int(device_id),)
         super().__init__(
@@ -272,14 +276,30 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         self._pypto_root = pypto_root
         self._kernel_dir = _find_pypto_lib_deepseek_v4_dir(pypto_root)
         self._compile_kernels = bool(compile_kernels)
+        # Keep production serving opt-in because older checkpoints may not carry
+        # MTP weights. The CLI passes this model-specific feature flag explicitly.
+        self._enable_mtp = bool(enable_mtp)
+        self._l3_trace = l3_trace
         self._embedding_cache: dict[str, torch.Tensor] = {}
+
+    @property
+    def profile_verbose(self) -> bool:
+        """Return whether compile and L3 execution timing logs are enabled."""
+        return self._l3_trace
+
+    @property
+    def supports_device_sampling(self) -> bool:
+        """Enable executor-provided greedy token acceptance for MTP only."""
+        return self._enable_mtp
 
     def lookup_embeddings(self, model: RuntimeModel, token_ids: torch.Tensor) -> torch.Tensor:
         """Lookup token embeddings from the lazily loaded DeepSeekV4 embedding table."""
         compiled = self._compiled.get(model.config.model_id)
         if not isinstance(compiled, DeepSeekV4CompiledKernels):
             raise RuntimeError(f"DeepSeekV4 model {model.config.model_id!r} is not registered")
-        embed_weight = self._embedding_cache.get(model.config.model_id)
+        embed_weight = compiled.embedding_weight
+        if embed_weight is None:
+            embed_weight = self._embedding_cache.get(model.config.model_id)
         if embed_weight is None:
             embed_weight = compiled.weight_store.load_tensor("embed.weight").contiguous()
             if embed_weight.ndim != 2:
@@ -294,7 +314,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                     f"embed.weight hidden size must be {model.config.hidden_size}, "
                     f"got {int(embed_weight.shape[1])}"
                 )
-            self._embedding_cache[model.config.model_id] = embed_weight
+        compiled.embedding_weight = embed_weight
+        self._embedding_cache[model.config.model_id] = embed_weight
 
         flat_ids = token_ids.detach().to(device="cpu", dtype=torch.long).reshape(-1)
         embeddings = embed_weight.index_select(0, flat_ids)
@@ -348,9 +369,13 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             compress_ratios=compress_ratios,
             num_hash_layers=num_hash_layers,
         )
+        if self._enable_mtp:
+            weight_store.validate_mtp_startup_contract(n_routed_experts=n_routed_experts)
 
         prefill = None
         decode = None
+        mtp_decode = None
+        mtp_prefill = None
         freqs_cos = freqs_sin = None
         if self._compile_kernels:
             modules = self._load_kernel_modules(layout)
@@ -364,6 +389,23 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 modules["decode_fwd"].l3_decode_fwd,
                 self._decode_dummy_args(model, layout, modules["config"]),
             )
+            if self._enable_mtp:
+                mtp_prefill = self._compile_l3_callable(
+                    "deepseek_v4_mtp_prefill",
+                    modules["prefill_mtp"].l3_mtp_prefill_fwd,
+                    self._mtp_dummy_args(
+                        modules["prefill_mtp"],
+                        num_tokens=layout.prefill_seq,
+                    ),
+                )
+                mtp_decode = self._compile_l3_callable(
+                    "deepseek_v4_mtp_decode",
+                    modules["decode_mtp"].l3_mtp_decode_layer,
+                    self._mtp_dummy_args(
+                        modules["decode_mtp"],
+                        num_tokens=layout.decode_tokens,
+                    ),
+                )
             freqs_cos, freqs_sin = self._build_rope_tables(modules["rope_tables"], modules["config"])
 
         return DeepSeekV4CompiledKernels(
@@ -376,6 +418,8 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             kernel_dir=str(self._kernel_dir),
             prefill=prefill,
             decode=decode,
+            mtp_prefill=mtp_prefill,
+            mtp_decode=mtp_decode,
             freqs_cos=freqs_cos,
             freqs_sin=freqs_sin,
             platform=self._platform,
@@ -398,14 +442,40 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         ):
             prefill_layer = importlib.import_module("prefill_layer")
             prefill_fwd = importlib.import_module("prefill_fwd")
+            prefill_mtp = importlib.import_module("prefill_mtp")
         with _deepseek_v4_import_context(self._kernel_dir, pypto_root=pypto_root, ep=ranks, moe_shape="decode"):
             modules = {
                 name: importlib.import_module(name)
-                for name in ("config", "decode_layer", "decode_fwd", "rope_tables")
+                for name in ("config", "decode_layer", "decode_fwd", "decode_mtp", "rope_tables")
             }
         modules["prefill_layer"] = prefill_layer
         modules["prefill_fwd"] = prefill_fwd
+        modules["prefill_mtp"] = prefill_mtp
         return modules
+
+    def _mtp_dummy_args(
+        self,
+        mtp_module: object,
+        *,
+        num_tokens: int,
+    ) -> tuple[Any, ...]:
+        """Build shape-only dummy tensors in an MTP module's tensor-spec order."""
+        args: list[Any] = []
+        pypto_root = self._kernel_dir.parents[2]
+        is_prefill = getattr(mtp_module, "__name__", "") == "prefill_mtp"
+        with _deepseek_v4_import_context(
+            self._kernel_dir,
+            pypto_root=pypto_root,
+            ep=len(self._device_ids),
+            moe_shape="prefill" if is_prefill else "decode",
+            num_layers=DEEPSEEK_V4_FWD_NUM_LAYERS if is_prefill else None,
+        ):
+            for spec in mtp_module.build_tensor_specs(num_tokens=num_tokens):
+                if spec.name == "num_tokens":
+                    args.append(self._int32_arg(num_tokens))
+                else:
+                    args.append(torch.empty(tuple(spec.shape), dtype=spec.dtype))
+        return tuple(args)
 
     def _compile_l3_callable(self, name: str, jit_fn: object, dummy_args: Sequence[Any]) -> DeepSeekV4L3Callable:
         """Compile one DeepSeekV4 HOST wrapper into a distributed program."""
@@ -581,6 +651,9 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 # Final RMSNorm in-kernel; host-side LM-head consumes selected
                 # normalized rows from x_out.
                 "final_norm_w": torch.empty((ranks, hidden), dtype=torch.bfloat16),
+                "pre_hc_hidden_out": torch.empty(
+                    (ranks, seq, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.float32
+                ),
                 "x_out": torch.empty((ranks, seq, hidden), dtype=torch.bfloat16),
             }
         )
@@ -749,6 +822,9 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 # Decode writes final-normalized hidden rows; host-side LM-head
                 # turns the selected rows into logits.
                 "final_norm_w": torch.empty((ranks, hidden), dtype=torch.bfloat16),
+                "pre_hc_hidden_out": torch.empty(
+                    (ranks, tokens, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.float32
+                ),
                 "x_out": torch.empty((ranks, tokens, hidden), dtype=torch.bfloat16),
             }
         )
@@ -877,8 +953,10 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             "prefill_attention_csa.py",
             "prefill_layer.py",
             "prefill_fwd.py",
+            "prefill_mtp.py",
             "decode_layer.py",
             "decode_fwd.py",
+            "decode_mtp.py",
         )
         missing = [name for name in required_modules if not (self._kernel_dir / name).is_file()]
         if missing:

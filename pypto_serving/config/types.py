@@ -230,6 +230,7 @@ class DecodeResult:
     logits: torch.Tensor | None
     sampled_token_ids: torch.Tensor | None = None
     next_hidden_states: torch.Tensor | None = None
+    accepted_token_ids: list[list[int]] | None = None
 
 
 @dataclass
@@ -252,5 +253,5 @@ class WorkerCommand:
 @dataclass
 class StepOutput:
     """Result returned from worker process after executing a batch step."""
-    new_tokens: dict  # {request_id: int}
+    new_tokens: dict[str, int | list[int]]
     error: str | None = None

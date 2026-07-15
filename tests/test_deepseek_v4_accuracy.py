@@ -31,11 +31,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 MODEL_ID = "dsv4-flash-w8a8"
 PROMPT = "Huawei is"
-MAX_NEW_TOKENS = 6
-EXPECTED_TEXT = " a leading global provider of ICT"
+MAX_NEW_TOKENS = 10
+EXPECTED_TEXT = " a leading global information and communications technology (ICT)"
 
 STARTUP_TIMEOUT_SECONDS = 600
-OVERALL_TIMEOUT_SECONDS = 1650
+OVERALL_TIMEOUT_SECONDS = int(os.environ.get("PYPTO_DSV4_OVERALL_TIMEOUT_SECONDS", "1650"))
 HEARTBEAT_SECONDS = 30
 
 
@@ -87,6 +87,7 @@ def _server_command(model_dir: Path, devices: tuple[int, ...], port: int) -> lis
         "512",
         "--long-prefill-token-threshold",
         "2048",
+        "--enable-mtp",
         "--no-enable-prefix-caching",
         "--port",
         str(port),

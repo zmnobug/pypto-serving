@@ -89,6 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (default: 0.0).")
     parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus sampling probability (default: 1.0).")
     parser.add_argument("--top-k", type=int, default=None, help="Top-k sampling cutoff (default: disabled).")
+    parser.add_argument(
+        "--enable-mtp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable DeepSeek V4 MTP speculative decoding (default: False).",
+    )
 
     # Serving
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind the serving server (default: 0.0.0.0).")
@@ -135,6 +141,9 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     model_family = _detect_model_family(Path(model_dir))
     if model_family == "deepseek_v4":
         executor_kwargs["compile_kernels"] = True
+        executor_kwargs["enable_mtp"] = args.enable_mtp
+    elif args.enable_mtp:
+        raise ValueError("--enable-mtp is only supported for DeepSeek V4")
     parallel_config = ParallelConfig(
         data_parallel_size=args.data_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,

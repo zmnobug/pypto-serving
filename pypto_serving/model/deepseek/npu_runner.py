@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import math
+import logging
 import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -30,16 +31,20 @@ from pypto_serving.config.types import (
 from pypto_serving.model.common.runner.model_runner import ModelRunner
 from pypto_serving.model.deepseek.weight_loader import (
     DeepSeekV4GlobalWeights,
+    DeepSeekV4MtpWeights,
     DeepSeekV4StackedLayerWeights,
     DeepSeekV4WeightStore,
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 DEEPSEEK_V4_RANKS = 8
 DEEPSEEK_V4_HC_MULT = 4
 DEEPSEEK_V4_BLOCK_SIZE = 128
-DEEPSEEK_V4_DECODE_BATCH = 8
-DEEPSEEK_V4_DECODE_SEQ = 1
+DEEPSEEK_V4_DECODE_BATCH = 4
+DEEPSEEK_V4_DECODE_SEQ = 2
 DEEPSEEK_V4_DECODE_TOKENS = DEEPSEEK_V4_DECODE_BATCH * DEEPSEEK_V4_DECODE_SEQ
 DEEPSEEK_V4_PREFILL_BATCH = 1
 DEEPSEEK_V4_PREFILL_SEQ = 128
@@ -166,6 +171,7 @@ _PREFILL_FWD_TENSOR_ORDER = (
     "hc_head_scale",
     "hc_head_base",
     "final_norm_w",
+    "pre_hc_hidden_out",
     "x_out",
 )
 
@@ -258,7 +264,42 @@ _DECODE_FWD_TENSOR_ORDER = (
     "hc_head_scale",
     "hc_head_base",
     "final_norm_w",
+    "pre_hc_hidden_out",
     "x_out",
+)
+
+_MTP_PREFILL_TENSOR_ORDER = (
+    "hidden_states", "prev_hidden_states",
+    "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
+    "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
+    "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
+    "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
+    "freqs_cos", "freqs_sin", "kv_cache", "ori_block_table", "ori_slot_mapping",
+    "position_ids", "attn_sink", "wo_a", "wo_b", "wo_b_scale",
+    "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
+    "gate_w", "gate_bias", "tid2eid", "input_ids",
+    "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
+    "routed_w2", "routed_w2_scale", "shared_w1", "shared_w1_scale",
+    "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
+    "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
+    "hidden_out", "pre_hc_hidden_out",
+)
+
+_MTP_DECODE_TENSOR_ORDER = (
+    "hidden_states", "prev_pre_hc_hidden", "position_ids",
+    "enorm_w", "hnorm_w", "e_proj_w", "e_proj_w_scale", "e_proj_smooth",
+    "h_proj_w", "h_proj_w_scale", "h_proj_smooth",
+    "hc_attn_fn", "hc_attn_scale", "hc_attn_base", "attn_norm_w",
+    "wq_a", "wq_b", "wq_b_scale", "wkv", "gamma_cq", "gamma_ckv",
+    "freqs_cos", "freqs_sin", "kv_cache", "swa_slot_mapping", "swa_indices", "swa_lens",
+    "attn_sink", "wo_a", "wo_b", "wo_b_scale",
+    "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "norm_w",
+    "gate_w", "gate_bias", "tid2eid", "input_ids",
+    "routed_w1", "routed_w1_scale", "routed_w3", "routed_w3_scale",
+    "routed_w2", "routed_w2_scale", "shared_w1", "shared_w1_scale",
+    "shared_w3", "shared_w3_scale", "shared_w2", "shared_w2_scale",
+    "mtp_hc_head_fn", "mtp_hc_head_scale", "mtp_hc_head_base", "mtp_norm_w",
+    "hidden_out", "next_pre_hc_hidden",
 )
 
 _DECODE_INPUT_TENSOR_FIELDS = (
@@ -850,12 +891,15 @@ class DeepSeekV4CompiledKernels:
     kernel_dir: str
     prefill: DeepSeekV4L3Callable | None = None
     decode: DeepSeekV4L3Callable | None = None
+    mtp_prefill: DeepSeekV4L3Callable | None = None
+    mtp_decode: DeepSeekV4L3Callable | None = None
     freqs_cos: torch.Tensor | None = None
     freqs_sin: torch.Tensor | None = None
     platform: str = "a2a3"
     device_id: int = 0
     n_routed_experts: int = 256
     num_hash_layers: int = 3
+    embedding_weight: torch.Tensor | None = None
 
     def l3_callables(self) -> tuple[DeepSeekV4L3Callable, ...]:
         """Return every compiled L3 program that the shared worker may run."""
@@ -864,6 +908,10 @@ class DeepSeekV4CompiledKernels:
             callables.append(self.prefill)
         if self.decode is not None:
             callables.append(self.decode)
+        if self.mtp_prefill is not None:
+            callables.append(self.mtp_prefill)
+        if self.mtp_decode is not None:
+            callables.append(self.mtp_decode)
         return tuple(callables)
 
 
@@ -930,6 +978,7 @@ class _DeepSeekV4DecodeSharedBuffers:
 
     x_hc_a: torch.Tensor
     x_hc_b: torch.Tensor
+    pre_hc_hidden_out: torch.Tensor
     x_out: torch.Tensor
     tensors: dict[str, torch.Tensor]
 
@@ -953,6 +1002,32 @@ class _DeepSeekV4PrefillFwdSharedBuffers:
     freqs_cos: torch.Tensor
     freqs_sin: torch.Tensor
     tensors: dict[str, torch.Tensor]
+
+
+@dataclass
+class _DeepSeekV4MtpSharedBuffers:
+    """MTP weights, unified SWA cache, recurrent state, and outputs."""
+
+    weights: dict[str, torch.Tensor]
+    prefill_hidden_in: torch.Tensor
+    prefill_prev_hidden_in: torch.Tensor
+    prefill_input_ids: torch.Tensor
+    prefill_position_ids: torch.Tensor
+    prefill_block_table: torch.Tensor
+    prefill_slot_mapping: torch.Tensor
+    prefill_kv_cache: torch.Tensor
+    decode_hidden_in: torch.Tensor
+    decode_prev_hidden_in: torch.Tensor
+    decode_input_ids: torch.Tensor
+    decode_position_ids: torch.Tensor
+    decode_slot_mapping: torch.Tensor
+    decode_swa_indices: torch.Tensor
+    decode_swa_lens: torch.Tensor
+    decode_kv_cache: torch.Tensor
+    prefill_hidden_out: torch.Tensor
+    prefill_pre_hc_out: torch.Tensor
+    decode_hidden_out: torch.Tensor
+    decode_pre_hc_out: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -998,6 +1073,30 @@ def build_deepseek_v4_layer_plan(
     )
 
 
+def accept_mtp_tokens(main_token_ids: torch.Tensor, draft_token_ids: torch.Tensor) -> list[list[int]]:
+    """Accept one MTP draft against two-token main-model greedy predictions.
+
+    ``main_token_ids[:, 0]`` is always committed.  The second main prediction is
+    committed only when the draft equals the first prediction, matching the
+    ``next_n=1`` reference algorithm.
+    """
+    main = main_token_ids.detach().cpu().to(torch.long)
+    draft = draft_token_ids.detach().cpu().to(torch.long).reshape(-1)
+    if main.ndim != 2 or main.shape[1] != 2:
+        raise ValueError(f"main_token_ids must have shape [batch, 2], got {tuple(main.shape)}")
+    if draft.numel() != main.shape[0]:
+        raise ValueError(
+            f"draft_token_ids must have {main.shape[0]} entries, got {draft.numel()}"
+        )
+    accepted: list[list[int]] = []
+    for row in range(main.shape[0]):
+        row_tokens = [int(main[row, 0].item())]
+        if int(draft[row].item()) == row_tokens[0]:
+            row_tokens.append(int(main[row, 1].item()))
+        accepted.append(row_tokens)
+    return accepted
+
+
 class DeepSeekV4ModelRunner(ModelRunner):
     """Runner boundary for DeepSeekV4 W8A8 kernels and model-specific caches."""
 
@@ -1020,6 +1119,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._hc_head_buffers: dict[str, torch.Tensor] | None = None
         self._decode_logits_buffer: torch.Tensor | None = None
         self._prefill_output_buffer: torch.Tensor | None = None
+        self._prefill_pre_hc_output_buffer: torch.Tensor | None = None
+        self._mtp_buffers: _DeepSeekV4MtpSharedBuffers | None = None
+        self._mtp_prefill_context: DeepSeekV4PreparedPrefillInputs | None = None
+        self._mtp_draft_token_ids: torch.Tensor | None = None
+        self._mtp_tail_token_id: torch.Tensor | None = None
+        self._mtp_tail_pre_hc_hidden: torch.Tensor | None = None
+        self._mtp_tail_position: torch.Tensor | None = None
+        self._mtp_initialized_slots: set[int] = set()
+        self._mtp_proposed_tokens = 0
+        self._mtp_accepted_tokens = 0
 
     def init_kv_cache(self, model_id: str, config: ModelConfig, runtime: RuntimeConfig) -> int:
         """Initialize runner state and return scheduler-only KV block capacity.
@@ -1043,7 +1152,22 @@ class DeepSeekV4ModelRunner(ModelRunner):
         request_ids = tuple(request_ids)
         self.cache_manager.release(request_ids)
         if request_ids:
+            if self._mtp_proposed_tokens:
+                logger.info(
+                    "DeepSeekV4 MTP acceptance: accepted=%d proposed=%d rate=%.2f%%",
+                    self._mtp_accepted_tokens,
+                    self._mtp_proposed_tokens,
+                    100.0 * self._mtp_accepted_tokens / self._mtp_proposed_tokens,
+                )
             self._initialized_cache_requests.difference_update(request_ids)
+            self._mtp_prefill_context = None
+            self._mtp_draft_token_ids = None
+            self._mtp_tail_token_id = None
+            self._mtp_tail_pre_hc_hidden = None
+            self._mtp_tail_position = None
+            self._mtp_initialized_slots.clear()
+            self._mtp_proposed_tokens = 0
+            self._mtp_accepted_tokens = 0
 
     def load_packed_global_weights(self) -> DeepSeekV4GlobalWeights:
         """Load global tensors and pack the LM head for host-side projection."""
@@ -1061,6 +1185,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
             n_routed_experts=self._compiled.n_routed_experts,
             compress_ratios=compress_ratios,
             num_hash_layers=self._compiled.num_hash_layers,
+        )
+
+    def load_mtp_weights(self) -> DeepSeekV4MtpWeights:
+        """Load the single checkpoint MTP draft layer."""
+        return self._compiled.weight_store.load_mtp_weights(
+            ranks=self._compiled.layout.ranks,
+            n_routed_experts=self._compiled.n_routed_experts,
         )
 
     def prepare_prefill_inputs(self, model: RuntimeModel, batch: PrefillBatch) -> DeepSeekV4PreparedPrefillInputs:
@@ -1431,8 +1562,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
             )
         self._stage_prefill_fwd_inputs(inputs)
         hidden_buffer = self._require_prefill_output_buffer(model.config.hidden_size)
+        pre_hc_hidden_buffer = self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)
         hidden_buffer.zero_()
-        args = self._prefill_fwd_args(hidden_buffer)
+        pre_hc_hidden_buffer.zero_()
+        args = self._prefill_fwd_args(pre_hc_hidden_buffer, hidden_buffer)
         self._debug_prefill_dispatch(inputs, args)
         if os.environ.get("PYPTO_DSV4_SKIP_PREFILL_KERNEL") == "1":
             # Diagnostic: skip the prefill kernel dispatch to isolate the decode
@@ -1454,6 +1587,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "DeepSeekV4 packed prefill dispatch failed "
                 f"(tokens={inputs.actual_tokens}, slot={inputs.slot})"
             ) from exc
+        if self._mtp_buffers is not None:
+            # MTP prefill is shifted by one token and therefore needs the first
+            # sampled token.  Keep the immutable host metadata here; the first
+            # decode call supplies that token and completes draft initialization.
+            self._mtp_prefill_context = inputs
+
         active_hidden = hidden_buffer[:, : inputs.actual_tokens, :]
         self._debug_tensor_stats("prefill.output.hidden.active", active_hidden, per_rank=True)
         if self._debug_tensor_stats_enabled() and not self._tensor_is_finite(active_hidden):
@@ -1470,6 +1609,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if self._compiled.decode is None:
             raise RuntimeError("DeepSeekV4 kernels were not compiled for this runner")
         self._ensure_l3_shared_buffers(model)
+        mtp_active = self._mtp_buffers is not None and batch.allow_device_greedy_sampling
+        if mtp_active and self._mtp_draft_token_ids is None and self._mtp_prefill_context is not None:
+            self._initialize_mtp_draft(model, batch)
+        speculative_step = mtp_active and self._mtp_draft_token_ids is not None
+        if speculative_step:
+            batch = self._main_speculative_batch(model, batch, self._mtp_draft_token_ids)
         inputs = self._stage_decode_inputs(self.prepare_decode_inputs(model, batch))
         if inputs.actual_batch != 1 or inputs.slots != (0,):
             raise RuntimeError(
@@ -1482,12 +1627,14 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._debug_tensor_stats("decode.input.initial.active", x_hc[:, :active_decode_tokens, :, :])
 
         hidden_buffer = self._require_decode_output_buffer(model.config.hidden_size)
+        pre_hc_hidden_buffer = decode_buffers.pre_hc_hidden_out
         hidden_buffer.zero_()
+        pre_hc_hidden_buffer.zero_()
         # ``num_tokens`` is the real active token count. PR 677 restores the
         # gate norm/quant scopes for this num_tokens-aware path; the fixed padding
         # rows remain valid metadata for attention but must not be routed by MoE.
         num_tokens = active_decode_tokens
-        args = self._decode_fwd_args(inputs, x_hc, hidden_buffer)
+        args = self._decode_fwd_args(inputs, x_hc, pre_hc_hidden_buffer, hidden_buffer)
         self._debug_decode_dispatch(inputs, args)
         try:
             self._run_l3(
@@ -1505,8 +1652,46 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if self._debug_tensor_stats_enabled() and not self._tensor_is_finite(active_hidden):
             raise RuntimeError("DeepSeekV4 packed decode produced non-finite active hidden rows")
 
-        # Sample the final real slot for each active request row.
         decode_seq = self._compiled.layout.decode_seq
+        if speculative_step:
+            rows = tuple(range(inputs.actual_batch * decode_seq))
+            pair_logits = self._logits_for_hidden(hidden_buffer, active_rows=rows, label="decode.mtp_main").float()
+            main_ids = pair_logits.argmax(dim=-1).reshape(inputs.actual_batch, decode_seq)
+            accepted = accept_mtp_tokens(main_ids, self._mtp_draft_token_ids[: inputs.actual_batch])
+            self._mtp_proposed_tokens += inputs.actual_batch
+            self._mtp_accepted_tokens += sum(len(tokens) == decode_seq for tokens in accepted)
+            logger.info(
+                "DeepSeekV4 MTP acceptance progress: accepted=%d proposed=%d rate=%.2f%%",
+                self._mtp_accepted_tokens,
+                self._mtp_proposed_tokens,
+                100.0 * self._mtp_accepted_tokens / self._mtp_proposed_tokens,
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "DeepSeekV4 MTP step: draft=%s main=%s",
+                    self._mtp_draft_token_ids[: inputs.actual_batch].detach().cpu().tolist(),
+                    main_ids.detach().cpu().tolist(),
+                )
+            # Match the reference accepted_num flow: update the MTP window from
+            # committed main-model outputs immediately, even after rejection.
+            # On rejection only row 0 is accepted; the helper prepends the last
+            # committed MTP row instead of consuming row 1, whose hidden state
+            # depends on the rejected draft. The next cache-first main decode
+            # overwrites the rejected position with the committed token.
+            self._advance_mtp_draft(
+                model,
+                inputs,
+                main_ids,
+                pre_hc_hidden_buffer,
+                accepted_count=len(accepted[0]),
+            )
+            return DecodeResult(
+                hidden_states=None,
+                logits=pair_logits[::decode_seq],
+                accepted_token_ids=accepted,
+            )
+
+        # Standard B4S2 decode samples only the final real slot.
         active_rows = tuple(row * decode_seq + (decode_seq - 1) for row in range(inputs.actual_batch))
         logits = self._logits_for_hidden(hidden_buffer, active_rows=active_rows, label="decode").float()
         return DecodeResult(hidden_states=None, logits=logits)
@@ -1533,8 +1718,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._static_freqs_cos_tensor()
         self._static_freqs_sin_tensor()
         self._ensure_decode_buffers(model.config.hidden_size)
+        self._ensure_mtp_buffers(model.config.hidden_size)
         self._ensure_decode_work_cache()
         self._require_prefill_output_buffer(model.config.hidden_size)
+        self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)
         self._static_final_norm_weight_tensor()
         if self._stacked_weight_buffers is None:
             self._stage_stacked_weights(self.load_stacked_layer_weights())
@@ -1562,7 +1749,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "stacked_weight_buffers": self._stacked_weight_buffers,
             "hc_head_buffers": self._hc_head_buffers,
             "prefill_output": self._prefill_output_buffer,
+            "prefill_pre_hc_output": self._prefill_pre_hc_output_buffer,
         }
+        if self._compiled.mtp_prefill is not None or self._compiled.mtp_decode is not None:
+            expected["mtp_buffers"] = self._mtp_buffers
         for name, value in expected.items():
             if value is None:
                 missing.append(name)
@@ -1572,7 +1762,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
             missing.append("hc_head_buffers")
         return missing
 
-    def _prefill_fwd_args(self, x_out: torch.Tensor) -> tuple[Any, ...]:
+    def _prefill_fwd_args(
+        self,
+        pre_hc_hidden_out: torch.Tensor,
+        x_out: torch.Tensor,
+    ) -> tuple[Any, ...]:
         """Build the single packed ``l3_prefill_fwd`` argument tuple.
 
         The kernel runs final RMSNorm and emits normalized hidden rows. LM-head is
@@ -1591,6 +1785,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "hc_head_scale": hc_head["hc_head_scale"],
                 "hc_head_base": hc_head["hc_head_base"],
                 "final_norm_w": self._static_final_norm_weight_tensor(),
+                "pre_hc_hidden_out": pre_hc_hidden_out,
                 "x_out": x_out,
             }
         )
@@ -1601,6 +1796,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self,
         inputs: DeepSeekV4PreparedDecodeInputs,
         x_hc: torch.Tensor,
+        pre_hc_hidden_out: torch.Tensor,
         x_out: torch.Tensor,
     ) -> tuple[Any, ...]:
         """Build the single packed ``l3_decode_fwd`` argument tuple."""
@@ -1645,10 +1841,264 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "hc_head_scale": hc_head["hc_head_scale"],
                 "hc_head_base": hc_head["hc_head_base"],
                 "final_norm_w": self._static_final_norm_weight_tensor(),
+                "pre_hc_hidden_out": pre_hc_hidden_out,
                 "x_out": x_out,
             }
         )
         return self._ordered_layer_args(values, _DECODE_FWD_TENSOR_ORDER)
+
+    def _mtp_prefill_args(self) -> tuple[Any, ...]:
+        buffers = self._require_mtp_buffers()
+        values = dict(buffers.weights)
+        values.update(
+            {
+                "hidden_states": buffers.prefill_hidden_in,
+                "prev_hidden_states": buffers.prefill_prev_hidden_in,
+                "freqs_cos": self._static_freqs_cos_tensor(),
+                "freqs_sin": self._static_freqs_sin_tensor(),
+                "kv_cache": buffers.prefill_kv_cache,
+                "ori_block_table": buffers.prefill_block_table,
+                "ori_slot_mapping": buffers.prefill_slot_mapping,
+                "position_ids": buffers.prefill_position_ids,
+                "input_ids": buffers.prefill_input_ids,
+                "hidden_out": buffers.prefill_hidden_out,
+                "pre_hc_hidden_out": buffers.prefill_pre_hc_out,
+            }
+        )
+        return self._ordered_layer_args(values, _MTP_PREFILL_TENSOR_ORDER)
+
+    def _mtp_decode_args(self) -> tuple[Any, ...]:
+        buffers = self._require_mtp_buffers()
+        values = dict(buffers.weights)
+        values.update(
+            {
+                "hidden_states": buffers.decode_hidden_in,
+                "prev_pre_hc_hidden": buffers.decode_prev_hidden_in,
+                "position_ids": buffers.decode_position_ids,
+                "freqs_cos": self._static_freqs_cos_tensor(),
+                "freqs_sin": self._static_freqs_sin_tensor(),
+                "kv_cache": buffers.decode_kv_cache,
+                "swa_slot_mapping": buffers.decode_slot_mapping,
+                "swa_indices": buffers.decode_swa_indices,
+                "swa_lens": buffers.decode_swa_lens,
+                "input_ids": buffers.decode_input_ids,
+                "hidden_out": buffers.decode_hidden_out,
+                "next_pre_hc_hidden": buffers.decode_pre_hc_out,
+            }
+        )
+        return self._ordered_layer_args(values, _MTP_DECODE_TENSOR_ORDER)
+
+    def _require_mtp_buffers(self) -> _DeepSeekV4MtpSharedBuffers:
+        if self._mtp_buffers is None:
+            raise RuntimeError("DeepSeekV4 MTP shared buffers are not staged")
+        return self._mtp_buffers
+
+    def _require_mtp_prefill_callable(self) -> DeepSeekV4L3Callable:
+        if self._compiled.mtp_prefill is None:
+            raise RuntimeError("DeepSeekV4 MTP prefill kernel is not compiled")
+        return self._compiled.mtp_prefill
+
+    def _require_mtp_decode_callable(self) -> DeepSeekV4L3Callable:
+        if self._compiled.mtp_decode is None:
+            raise RuntimeError("DeepSeekV4 MTP decode kernel is not compiled")
+        return self._compiled.mtp_decode
+
+    def _embedding_rows(self, token_ids: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        embed = self._compiled.embedding_weight
+        if embed is None:
+            embed = self._compiled.weight_store.load_tensor("embed.weight").contiguous().cpu()
+            self._compiled.embedding_weight = embed
+        return embed.index_select(0, token_ids.detach().cpu().to(torch.long).reshape(-1)).to(dtype)
+
+    def _main_speculative_batch(
+        self,
+        model: RuntimeModel,
+        batch: DecodeBatch,
+        draft_token_ids: torch.Tensor,
+    ) -> DecodeBatch:
+        actual_batch = len(batch.request_ids)
+        draft = draft_token_ids[:actual_batch].detach().cpu().to(torch.long)
+        current = batch.token_ids[:actual_batch].detach().cpu().to(torch.long).reshape(-1)
+        current_hidden = batch.hidden_states[:actual_batch].detach().cpu()
+        draft_hidden = self._embedding_rows(draft, current_hidden.dtype)
+        return replace(
+            batch,
+            token_ids=draft.reshape(actual_batch, 1),
+            hidden_states=draft_hidden,
+            prev_token_ids=current,
+            prev_hidden_states=current_hidden,
+            seq_lens=batch.seq_lens.detach().cpu().to(torch.int32) + 1,
+        )
+
+    def _initialize_mtp_draft(self, model: RuntimeModel, batch: DecodeBatch) -> None:
+        context = self._mtp_prefill_context
+        if context is None:
+            return
+        if len(batch.request_ids) != 1 or context.request_id != batch.request_ids[0]:
+            raise RuntimeError("DeepSeekV4 MTP prefill context does not match the decode request")
+        buffers = self._require_mtp_buffers()
+        n = context.actual_tokens
+        first_token = batch.token_ids[0].detach().cpu().to(torch.long).reshape(1)
+        first_hidden = batch.hidden_states[0].detach().cpu().to(torch.bfloat16)
+        buffers.prefill_hidden_in.zero_()
+        buffers.prefill_hidden_in[:, : n - 1].copy_(context.x_hc[:, 1:n, 0].to(torch.bfloat16))
+        buffers.prefill_hidden_in[:, n - 1].copy_(first_hidden)
+        buffers.prefill_prev_hidden_in.zero_()
+        buffers.prefill_prev_hidden_in[:, :n].copy_(
+            self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)[:, :n]
+        )
+        buffers.prefill_input_ids.copy_(context.input_ids)
+        buffers.prefill_input_ids[:, : n - 1].copy_(context.input_ids[:, 1:n])
+        buffers.prefill_input_ids[:, n - 1].copy_(first_token)
+        buffers.prefill_position_ids.copy_(context.position_ids)
+        buffers.prefill_block_table.copy_(context.ori_block_table)
+        buffers.prefill_slot_mapping.copy_(context.ori_slot_mapping)
+        buffers.prefill_hidden_out.zero_()
+        buffers.prefill_pre_hc_out.zero_()
+        self._run_l3(
+            self._require_mtp_prefill_callable(),
+            *self._mtp_prefill_args(),
+            self._int32_scalar(n),
+        )
+        draft_logits = self._logits_for_hidden(
+            buffers.prefill_hidden_out,
+            active_rows=(n - 1,),
+            label="mtp.prefill",
+        )
+        self._mtp_draft_token_ids = draft_logits.argmax(dim=-1).to(torch.long)
+        # The shifted MTP row for ``first_token`` is paired with the main-model
+        # hidden state and position of the prompt's final token. Keep that tail
+        # so a later rejection can rebuild the fixed two-row MTP window from
+        # [last committed token, newly accepted token], as the reference runner
+        # does when slicing prev_hidden_states to ``spec_len``.
+        self._mtp_tail_token_id = first_token.clone()
+        self._mtp_tail_pre_hc_hidden = buffers.prefill_prev_hidden_in[:, n - 1].clone()
+        self._mtp_tail_position = context.position_ids[0, n - 1].reshape(1).clone()
+        self._mtp_initialized_slots.add(context.slot)
+        self._mtp_prefill_context = None
+
+    def _mtp_committed_window(
+        self,
+        inputs: DeepSeekV4PreparedDecodeInputs,
+        main_ids: torch.Tensor,
+        main_pre_hc: torch.Tensor,
+        *,
+        accepted_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build the fixed MTP window from accepted main-model outputs only."""
+        layout = self._compiled.layout
+        if inputs.actual_batch != 1:
+            raise RuntimeError("DeepSeekV4 MTP accepted-window update requires one active request")
+        if accepted_count == layout.decode_seq:
+            return (
+                main_ids[0, :layout.decode_seq].detach().cpu().to(torch.long),
+                main_pre_hc[:, :layout.decode_seq].detach().cpu(),
+                inputs.position_ids[0, :layout.decode_seq].detach().cpu().to(torch.int32),
+            )
+        if accepted_count != 1 or layout.decode_seq != 2:
+            raise ValueError(
+                "DeepSeekV4 MTP currently supports next_n=1 acceptance only; "
+                f"got accepted_count={accepted_count}, decode_seq={layout.decode_seq}"
+            )
+        if (
+            self._mtp_tail_token_id is None
+            or self._mtp_tail_pre_hc_hidden is None
+            or self._mtp_tail_position is None
+        ):
+            raise RuntimeError("DeepSeekV4 MTP committed tail is not initialized")
+        committed_ids = torch.cat(
+            (
+                self._mtp_tail_token_id.reshape(1),
+                main_ids[0, :1].detach().cpu().to(torch.long),
+            )
+        )
+        committed_pre_hc = torch.cat(
+            (
+                self._mtp_tail_pre_hc_hidden.unsqueeze(1),
+                main_pre_hc[:, :1].detach().cpu(),
+            ),
+            dim=1,
+        )
+        committed_positions = torch.cat(
+            (
+                self._mtp_tail_position.reshape(1),
+                inputs.position_ids[0, :1].detach().cpu().to(torch.int32),
+            )
+        )
+        return committed_ids, committed_pre_hc, committed_positions
+
+    def _advance_mtp_draft(
+        self,
+        model: RuntimeModel,
+        inputs: DeepSeekV4PreparedDecodeInputs,
+        main_ids: torch.Tensor,
+        main_pre_hc: torch.Tensor,
+        *,
+        accepted_count: int,
+    ) -> None:
+        """Advance the MTP draft window from tokens committed by the main model."""
+        del model
+        buffers = self._require_mtp_buffers()
+        layout = self._compiled.layout
+        active_tokens = inputs.actual_batch * layout.decode_seq
+        committed_pair, committed_pre_hc, mtp_positions = self._mtp_committed_window(
+            inputs,
+            main_ids,
+            main_pre_hc,
+            accepted_count=accepted_count,
+        )
+
+        kernel_ids = committed_pair.repeat(layout.decode_batch)
+        embeddings = self._embedding_rows(kernel_ids, torch.bfloat16)
+        buffers.decode_hidden_in.zero_()
+        buffers.decode_hidden_in.copy_(embeddings.unsqueeze(0).expand(layout.ranks, -1, -1))
+        buffers.decode_prev_hidden_in.zero_()
+        buffers.decode_prev_hidden_in[:, :active_tokens].copy_(committed_pre_hc[:, :active_tokens])
+        if active_tokens < layout.decode_tokens:
+            buffers.decode_prev_hidden_in[:, active_tokens:].copy_(
+                committed_pre_hc[:, :1].expand(-1, layout.decode_tokens - active_tokens, -1, -1)
+            )
+        buffers.decode_input_ids.copy_(self._rank_stack(kernel_ids))
+
+        decode_positions = tuple(
+            tuple(int(position) for position in mtp_positions.tolist())
+            for _ in range(layout.decode_batch)
+        )
+        buffers.decode_position_ids.copy_(
+            self._rank_stack(torch.tensor(decode_positions, dtype=torch.int32).reshape(-1))
+        )
+        slot_mapping = self.cache_manager.paged_decode_slot_mapping(
+            inputs.kernel_slots,
+            decode_positions,
+            kernel_rows=layout.decode_batch,
+        )
+        swa_indices, swa_lens = self.cache_manager.swa_window_indices_and_lens(
+            inputs.kernel_slots,
+            decode_positions,
+            kernel_rows=layout.decode_batch,
+        )
+        buffers.decode_slot_mapping.copy_(self._rank_stack(slot_mapping.reshape(-1)))
+        buffers.decode_swa_indices.copy_(self._rank_stack(swa_indices))
+        buffers.decode_swa_lens.copy_(self._rank_stack(swa_lens))
+        buffers.decode_hidden_out.zero_()
+        buffers.decode_pre_hc_out.zero_()
+        self._run_l3(
+            self._require_mtp_decode_callable(),
+            *self._mtp_decode_args(),
+            self._int32_scalar(active_tokens),
+        )
+        draft_rows = tuple(
+            row * layout.decode_seq + layout.decode_seq - 1 for row in range(inputs.actual_batch)
+        )
+        draft_logits = self._logits_for_hidden(
+            buffers.decode_hidden_out,
+            active_rows=draft_rows,
+            label="mtp.decode",
+        )
+        self._mtp_draft_token_ids = draft_logits.argmax(dim=-1).to(torch.long)
+        self._mtp_tail_token_id = committed_pair[-1:].clone()
+        self._mtp_tail_pre_hc_hidden = committed_pre_hc[:, -1].clone()
+        self._mtp_tail_position = mtp_positions[-1:].clone()
 
     def _require_stacked_weights(self) -> DeepSeekV4StackedLayerWeights:
         if self._stacked_weight_buffers is None:
@@ -1836,6 +2286,11 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     torch.float32,
                     name="decode_x_hc_next",
                 ),
+                pre_hc_hidden_out=self._shared_empty(
+                    (ranks, tokens, layout.hc_mult, int(hidden_size)),
+                    torch.float32,
+                    name="decode_pre_hc_hidden_out",
+                ),
                 x_out=self._shared_empty(
                     (ranks, tokens, int(hidden_size)),
                     torch.bfloat16,
@@ -1939,6 +2394,96 @@ class DeepSeekV4ModelRunner(ModelRunner):
             )
             self._decode_buffers = buffers
         return buffers
+
+    def _ensure_mtp_buffers(self, hidden_size: int) -> _DeepSeekV4MtpSharedBuffers | None:
+        """Allocate and stage all MTP-owned shared tensors before worker fork."""
+        if self._compiled.mtp_prefill is None or self._compiled.mtp_decode is None:
+            return None
+        if self._mtp_buffers is not None:
+            return self._mtp_buffers
+        self._ensure_shared_host_allocation_before_worker("mtp buffers")
+        layout = self._compiled.layout
+        ranks = layout.ranks
+        tokens = layout.decode_tokens
+        hidden = int(hidden_size)
+        loaded = self.load_mtp_weights()
+        weights = {
+            name: self._new_shared_like(tensor, name=f"mtp_weight[{name}]")
+            for name, tensor in loaded.tensors.items()
+        }
+        for name, tensor in loaded.tensors.items():
+            self._copy_shared(weights[name], tensor, name=f"mtp_weight[{name}]")
+        mtp_kv_cache = self._shared_empty(
+            (ranks, layout.prefill_ori_max_blocks, layout.block_size, 1, DEEPSEEK_V4_HEAD_DIM),
+            torch.bfloat16,
+            name="mtp_unified_kv_cache",
+        )
+        self._mtp_buffers = _DeepSeekV4MtpSharedBuffers(
+            weights=weights,
+            prefill_hidden_in=self._shared_empty(
+                (ranks, layout.prefill_seq, hidden), torch.bfloat16, name="mtp_prefill_hidden_in"
+            ),
+            prefill_prev_hidden_in=self._shared_empty(
+                (ranks, layout.prefill_seq, layout.hc_mult, hidden),
+                torch.float32,
+                name="mtp_prefill_prev_hidden_in",
+            ),
+            prefill_input_ids=self._shared_empty(
+                (ranks, layout.prefill_seq), torch.long, name="mtp_prefill_input_ids"
+            ),
+            prefill_position_ids=self._shared_empty(
+                (ranks, layout.prefill_seq), torch.int32, name="mtp_prefill_position_ids"
+            ),
+            prefill_block_table=self._shared_empty(
+                (ranks, layout.prefill_ori_max_blocks), torch.int32, name="mtp_prefill_block_table"
+            ),
+            prefill_slot_mapping=self._shared_empty(
+                (ranks, layout.prefill_seq), torch.long, name="mtp_prefill_slot_mapping"
+            ),
+            prefill_kv_cache=mtp_kv_cache,
+            decode_hidden_in=self._shared_empty(
+                (ranks, tokens, hidden), torch.bfloat16, name="mtp_decode_hidden_in"
+            ),
+            decode_prev_hidden_in=self._shared_empty(
+                (ranks, tokens, layout.hc_mult, hidden),
+                torch.float32,
+                name="mtp_decode_prev_hidden_in",
+            ),
+            decode_input_ids=self._shared_empty(
+                (ranks, tokens), torch.long, name="mtp_decode_input_ids"
+            ),
+            decode_position_ids=self._shared_empty(
+                (ranks, tokens), torch.int32, name="mtp_decode_position_ids"
+            ),
+            decode_slot_mapping=self._shared_empty(
+                (ranks, tokens), torch.long, name="mtp_decode_slot_mapping"
+            ),
+            decode_swa_indices=self._shared_empty(
+                (ranks, tokens, layout.sliding_window), torch.int32, name="mtp_decode_swa_indices"
+            ),
+            decode_swa_lens=self._shared_empty(
+                (ranks, tokens), torch.int32, name="mtp_decode_swa_lens"
+            ),
+            decode_kv_cache=mtp_kv_cache,
+            prefill_hidden_out=self._shared_empty(
+                (ranks, layout.prefill_seq, hidden), torch.bfloat16, name="mtp_prefill_hidden_out"
+            ),
+            prefill_pre_hc_out=self._shared_empty(
+                (ranks, layout.prefill_seq, layout.hc_mult, hidden),
+                torch.float32,
+                name="mtp_prefill_pre_hc_out",
+            ),
+            decode_hidden_out=self._shared_empty(
+                (ranks, tokens, hidden), torch.bfloat16, name="mtp_decode_hidden_out"
+            ),
+            decode_pre_hc_out=self._shared_empty(
+                (ranks, tokens, layout.hc_mult, hidden),
+                torch.float32,
+                name="mtp_decode_pre_hc_out",
+            ),
+        )
+        self._mtp_buffers.prefill_kv_cache.zero_()
+        return self._mtp_buffers
 
     def _stage_decode_inputs(self, inputs: DeepSeekV4PreparedDecodeInputs) -> DeepSeekV4PreparedDecodeInputs:
         buffers = self._ensure_decode_buffers(inputs.x_hc.shape[-1])
@@ -2098,6 +2643,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
             DEEPSEEK_V4_CSA_NUM_LAYERS,
             layout.csa_inner_state_max_blocks,
         )
+        if self._mtp_buffers is not None:
+            zero_pages(self._mtp_buffers.prefill_kv_cache, 1, layout.decode_ori_max_blocks)
+
     def _static_freqs_cos_table(self) -> torch.Tensor:
         if self._compiled.freqs_cos is None:
             raise RuntimeError("DeepSeekV4 RoPE cosine table is not initialized")
@@ -2174,6 +2722,19 @@ class DeepSeekV4ModelRunner(ModelRunner):
             self._ensure_shared_host_allocation_before_worker("prefill_output")
             self._prefill_output_buffer = self._shared_empty(output_shape, torch.bfloat16, name="prefill_output")
         return self._prefill_output_buffer
+
+    def _require_prefill_pre_hc_output_buffer(self, hidden_size: int) -> torch.Tensor:
+        """Return the main-model final pre-HC rows used to seed MTP prefill."""
+        layout = self._compiled.layout
+        output_shape = (layout.ranks, layout.prefill_seq, layout.hc_mult, int(hidden_size))
+        if self._prefill_pre_hc_output_buffer is None:
+            self._ensure_shared_host_allocation_before_worker("prefill_pre_hc_output")
+            self._prefill_pre_hc_output_buffer = self._shared_empty(
+                output_shape,
+                torch.float32,
+                name="prefill_pre_hc_output",
+            )
+        return self._prefill_pre_hc_output_buffer
 
     def _static_final_norm_weight_tensor(self) -> torch.Tensor:
         """Return the worker-resident per-rank final RMSNorm weight ``[ranks, D]``.
