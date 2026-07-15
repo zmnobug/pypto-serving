@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from python.core import serving_worker
+from pypto_serving.serving.server import serving_worker
 
 
 def test_worker_close_releases_executor_once():

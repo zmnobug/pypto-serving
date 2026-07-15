@@ -17,16 +17,12 @@ from pathlib import Path
 import pytest
 import torch
 
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-import python.cli.main as cli
-from python.core import async_engine
-from python.core import tokenizer as tokenizer_module
-from examples.model.deepseek_v4.runner import npu_executor, npu_runner, weight_loader
-from examples.model.deepseek_v4.runner.npu_runner import (
+import pypto_serving.cli.main as cli
+from pypto_serving.config.types import DecodeBatch, PrefillBatch, RuntimeConfig
+from pypto_serving.model import model_loader
+from pypto_serving.model import tokenizer as tokenizer_module
+from pypto_serving.model.deepseek import npu_executor, npu_runner, weight_loader
+from pypto_serving.model.deepseek.npu_runner import (
     DeepSeekV4CacheLayout,
     DeepSeekV4CacheManager,
     DeepSeekV4CompiledKernels,
@@ -39,7 +35,7 @@ from examples.model.deepseek_v4.runner.npu_runner import (
     build_deepseek_v4_layer_plan,
     deepseek_v4_attention_kind,
 )
-from examples.model.deepseek_v4.runner.weight_loader import (
+from pypto_serving.model.deepseek.weight_loader import (
     DeepSeekV4WeightStore,
     deepseek_v4_layer_core_weight_names,
     deepseek_v4_hadamard_idx,
@@ -49,9 +45,8 @@ from examples.model.deepseek_v4.runner.weight_loader import (
     pack_deepseek_v4_lm_head_weight,
     pack_deepseek_v4_layer_weights,
 )
-from python.core import model_loader
-from python.core.model_loader import ModelLoader
-from python.core.types import DecodeBatch, PrefillBatch, RuntimeConfig
+from pypto_serving.model.model_loader import ModelLoader
+from pypto_serving.serving.engine import async_engine
 
 
 def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
@@ -1619,7 +1614,7 @@ class _Tokenizer:
 
 
 def _runtime_model_for_embeddings():
-    from python.core.types import ModelConfig, RuntimeModel
+    from pypto_serving.config.types import ModelConfig, RuntimeModel
 
     config = ModelConfig(
         model_id="dsv4",
