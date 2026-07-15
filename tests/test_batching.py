@@ -26,8 +26,11 @@ from pypto_serving.config.types import (
     PrefillResult,
     RuntimeConfig,
     RuntimeModel,
+    SamplingCandidates,
+    SamplingParams,
 )
 from pypto_serving.model.common.executor.executor import ModelExecutor
+from pypto_serving.model.common.executor.sampler import Sampler
 from pypto_serving.model.qwen.npu_executor import Qwen314BPyptoExecutor as PyptoExecutor
 from pypto_serving.model.qwen.npu_runner import (
     _CompiledKernels,
@@ -55,6 +58,18 @@ from pypto_serving.worker.worker import WorkerTensor
 ROOT = Path(__file__).resolve().parents[1]
 QWEN3_DISPATCH = ROOT / "pypto_serving" / "model" / "qwen" / "qwen3_l3_dispatch.py"
 QWEN3_KERNEL_DIR = ROOT / "pypto-lib" / "models" / "qwen3" / "14b"
+
+
+@pytest.mark.parametrize("row_idx", [-1, 1])
+def test_candidate_sampling_rejects_out_of_bounds_row(row_idx):
+    candidates = SamplingCandidates(
+        values=torch.tensor([[4.0, 3.0]], dtype=torch.float32),
+        token_ids=torch.tensor([[7, 6]], dtype=torch.int32),
+    )
+    params = SamplingParams(temperature=0.8, top_p=1.0, top_k=2)
+
+    with pytest.raises(ValueError, match=rf"row_idx {row_idx} is out of bounds"):
+        Sampler().sample_from_candidates(candidates, row_idx, params)
 
 
 class _Tokenizer:
@@ -197,7 +212,7 @@ def _compiled_kernels(
     return _CompiledKernels(
         prefill=callable_,
         decode=callable_,
-        greedy_sample=callable_,
+        topk_select=callable_,
         final_norm_weight=torch.ones(1, hidden_size),
         rope_cos=torch.zeros(max_seq, head_dim),
         rope_sin=torch.zeros(max_seq, head_dim),
@@ -212,14 +227,17 @@ def _compiled_kernels(
         prefill_block_table_buffer=torch.empty(kernel_batch * max_blocks, dtype=torch.int32),
         prefill_slot_mapping_buffer=torch.empty(kernel_batch * max_seq, dtype=torch.int32),
         prefill_logits_buffer=torch.empty(kernel_batch, model.config.vocab_size),
-        prefill_sampled_ids_buffer=torch.empty(kernel_batch, sampled_ids_width, dtype=torch.int32),
-        prefill_next_hidden_buffer=torch.empty(kernel_batch, hidden_size, dtype=torch.bfloat16),
+        prefill_topk_values_buffer=torch.empty(kernel_batch, 4, dtype=torch.float32),
+        prefill_topk_indices_buffer=torch.empty(kernel_batch, 4, dtype=torch.int32),
         decode_seq_lens_buffer=torch.zeros(kernel_batch, dtype=torch.int32),
         decode_block_table_buffer=torch.zeros(kernel_batch * max_blocks, dtype=torch.int32),
         decode_slot_mapping_buffer=torch.zeros(kernel_batch, dtype=torch.int32),
         decode_logits_buffer=torch.zeros(kernel_batch, model.config.vocab_size),
         decode_token_ids_buffer=torch.empty(kernel_batch, sampled_ids_width, dtype=torch.int32),
         decode_sampled_ids_buffer=torch.empty(kernel_batch, sampled_ids_width, dtype=torch.int32),
+        decode_topk_values_buffer=torch.empty(kernel_batch, 4, dtype=torch.float32),
+        decode_topk_indices_buffer=torch.empty(kernel_batch, 4, dtype=torch.int32),
+        sampling_control_buffer=torch.empty(2, dtype=torch.int32),
         decode_next_hidden_buffer=torch.empty(kernel_batch, hidden_size, dtype=torch.bfloat16),
     )
 
@@ -573,6 +591,61 @@ def test_engine_ignores_device_sampled_tokens_for_non_greedy_config():
     assert sampler.sample_calls == 1
 
 
+def test_engine_uses_device_topk_candidates_for_topk_config():
+    model = _model(max_batch_size=1)
+    manager = KvCacheManager()
+    executor = _DeviceTopkExecutor(manager, token_id=7)
+    sampler = _CandidateSampler(token_id=7)
+    engine = LLMEngine(kv_cache_manager=manager, executor=executor, sampler=sampler)
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    engine._models[model.config.model_id] = ModelRecord(
+        config=model.config,
+        runtime=model.runtime,
+        tokenizer=_Tokenizer(),
+        layer_specs=[],
+        runtime_model=model,
+    )
+
+    result = engine.generate_batch(
+        model.config.model_id,
+        ["abc"],
+        GenerateConfig(max_new_tokens=2, temperature=0.8, top_k=4, top_p=1.0),
+    )[0]
+
+    assert result.token_ids == [7, 7]
+    assert executor.prefill_allow_topk is True
+    assert executor.decode_allow_topk is True
+    assert sampler.sample_calls == 0
+    assert sampler.candidate_calls == 2
+
+
+def test_engine_skips_device_topk_candidates_without_topk_config():
+    model = _model(max_batch_size=1)
+    manager = KvCacheManager()
+    executor = _DeviceTopkExecutor(manager, token_id=7)
+    sampler = _CandidateSampler(token_id=9)
+    engine = LLMEngine(kv_cache_manager=manager, executor=executor, sampler=sampler)
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    engine._models[model.config.model_id] = ModelRecord(
+        config=model.config,
+        runtime=model.runtime,
+        tokenizer=_Tokenizer(),
+        layer_specs=[],
+        runtime_model=model,
+    )
+
+    result = engine.generate_batch(
+        model.config.model_id,
+        ["abc"],
+        GenerateConfig(max_new_tokens=1, temperature=0.8, top_k=None),
+    )[0]
+
+    assert result.token_ids == [9]
+    assert executor.prefill_allow_topk is False
+    assert sampler.sample_calls == 1
+    assert sampler.candidate_calls == 0
+
+
 def test_serving_worker_skips_decode_host_embedding_when_executor_embeds_on_device():
     model = _model(max_batch_size=1, eos_token_id=0)
     manager = KvCacheManager()
@@ -645,7 +718,9 @@ def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatc
     monkeypatch.setattr(
         runner,
         "_run_distributed_program",
-        lambda callable_spec, *args: callable_spec.compiled(*args),
+        lambda callable_spec, *args: callable_spec.compiled(
+            *(getattr(arg, "tensor", arg) for arg in args)
+        ),
     )
     executor._runners[model.config.model_id] = runner
     monkeypatch.setattr(
@@ -708,7 +783,7 @@ def test_kernel_profile_helpers_emit_kernel_name_and_runtime_timing():
 def test_decode_host_inlines_embedding_and_sampling_into_decode_fwd():
     module_source = QWEN3_DISPATCH.read_text(encoding="utf-8")
     start = module_source.index("def qwen3_decode_host")
-    end = module_source.index("def qwen3_greedy_sample_host")
+    end = module_source.index("def qwen3_topk_select_host")
     source = module_source[start:end]
 
     assert source.count("decode_fwd(") == 1
@@ -741,7 +816,7 @@ def test_prefill_host_inlines_embedding_and_keeps_sampling_standalone():
         pytest.skip("pypto-lib submodule is not checked out")
     prefill_source = (QWEN3_KERNEL_DIR / "prefill_fwd.py").read_text(encoding="utf-8")
     assert 'name_hint="greedy_sample"' not in prefill_source
-    assert 'name_hint="token_embed"' in prefill_source
+    assert 'name_hint="token_embed' in prefill_source
 
 
 def _layer(hidden_size: int, intermediate_size: int, head_dim: int) -> LayerWeights:
@@ -821,6 +896,16 @@ class _FixedSampler:
         return self.token_id
 
 
+class _CandidateSampler(_FixedSampler):
+    def __init__(self, token_id: int) -> None:
+        super().__init__(token_id)
+        self.candidate_calls = 0
+
+    def sample_from_candidates(self, candidates, row_idx, params) -> int:
+        self.candidate_calls += 1
+        return self.token_id
+
+
 class _DeviceSamplingExecutor(ModelExecutor):
     def __init__(
         self,
@@ -872,6 +957,50 @@ class _DeviceSamplingExecutor(ModelExecutor):
             logits=torch.zeros(1, model.config.vocab_size),
             sampled_token_ids=token.to(torch.int32),
             next_hidden_states=model.embed_tokens.index_select(0, token) if self.return_next_hidden else None,
+        )
+
+
+class _DeviceTopkExecutor(ModelExecutor):
+    def __init__(self, kv_cache_manager: KvCacheManager, token_id: int = 7) -> None:
+        super().__init__(kv_cache_manager)
+        self.token_id = token_id
+        self.prefill_allow_topk = False
+        self.decode_allow_topk = False
+
+    @property
+    def device_topk_sampling_k(self) -> int:
+        return 4
+
+    def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
+        self.prefill_allow_topk = batch.allow_device_topk_sampling
+        candidates = None
+        logits = torch.zeros(1, model.config.vocab_size)
+        if batch.allow_device_topk_sampling:
+            logits = torch.empty(1, 0)
+            candidates = SamplingCandidates(
+                values=torch.tensor([[4.0, 3.0, 2.0, 1.0]], dtype=torch.float32),
+                token_ids=torch.tensor([[self.token_id, 6, 5, 4]], dtype=torch.int32),
+            )
+        return PrefillResult(
+            last_hidden=None,
+            logits=logits,
+            sampling_candidates=candidates,
+        )
+
+    def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
+        self.decode_allow_topk = batch.allow_device_topk_sampling
+        candidates = None
+        logits = torch.zeros(1, model.config.vocab_size)
+        if batch.allow_device_topk_sampling:
+            logits = torch.empty(1, 0)
+            candidates = SamplingCandidates(
+                values=torch.tensor([[4.0, 3.0, 2.0, 1.0]], dtype=torch.float32),
+                token_ids=torch.tensor([[self.token_id, 6, 5, 4]], dtype=torch.int32),
+            )
+        return DecodeResult(
+            hidden_states=batch.hidden_states,
+            logits=logits,
+            sampling_candidates=candidates,
         )
 
 

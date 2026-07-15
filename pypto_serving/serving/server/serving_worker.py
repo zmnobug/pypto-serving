@@ -239,6 +239,7 @@ class WorkerProcess:
                 self.executor.supports_device_sampling
                 and all(sr.request.temperature <= 0.0 for sr in scheduled)
             )
+            allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
             token_tensor = torch.zeros((batch_size, max_chunk), dtype=torch.long, device=device)
             embeddings = None
             if not self.executor.supports_device_embedding:
@@ -268,6 +269,7 @@ class WorkerProcess:
                     input_embeddings=embeddings,
                     seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
                     allow_device_greedy_sampling=allow_device_greedy_sampling,
+                    allow_device_topk_sampling=allow_device_topk_sampling,
                     positions=positions_tensor,
                     block_ids=block_ids_list,
                 ),
@@ -317,6 +319,7 @@ class WorkerProcess:
                 self.executor.supports_device_sampling
                 and all(sr.request.temperature <= 0.0 for sr in scheduled)
             )
+            allow_device_topk_sampling = self._allow_device_topk_sampling(scheduled)
 
             for sr in scheduled:
                 request = sr.request
@@ -356,6 +359,7 @@ class WorkerProcess:
                     hidden_states=decode_embeddings,
                     seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
                     allow_device_greedy_sampling=allow_device_greedy_sampling,
+                    allow_device_topk_sampling=allow_device_topk_sampling,
                     block_ids=block_ids_list,
                     prev_token_ids=prev_token_tensor,
                     prev_hidden_states=prev_embeddings,
@@ -407,7 +411,21 @@ class WorkerProcess:
                     f"sampled_token_ids has {flat.numel()} rows, expected row {row_idx}"
                 )
             return int(flat[row_idx].item())
+        candidates = getattr(result, "sampling_candidates", None)
+        if candidates is not None:
+            return self.sampler.sample_from_candidates(candidates, row_idx, params)
         return self.sampler.sample(logits, params)
+
+    def _allow_device_topk_sampling(self, scheduled: list) -> bool:
+        """Return whether a scheduled batch can use executor top-k candidates."""
+        max_device_topk = self.executor.device_topk_sampling_k
+        return (
+            max_device_topk > 0
+            and all(sr.request.temperature > 0.0 for sr in scheduled)
+            and all(sr.request.top_k is not None for sr in scheduled)
+            and all(sr.request.top_k > 0 for sr in scheduled)
+            and all(sr.request.top_k <= max_device_topk for sr in scheduled)
+        )
 
 def _worker_entry(
     config: EngineConfig,

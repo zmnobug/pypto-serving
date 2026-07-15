@@ -22,6 +22,7 @@ from pypto_serving.config.types import (
     PrefillBatch,
     RequestState,
     RuntimeConfig,
+    SamplingCandidates,
 )
 from pypto_serving.model.common.executor.executor import ModelExecutor
 from pypto_serving.model.common.executor.sampler import Sampler
@@ -174,6 +175,7 @@ class LLMEngine:
                 and self._executor.supports_device_sampling
                 and self._executor.supports_device_embedding
             )
+            allow_device_topk_sampling = self._allow_device_topk_sampling(generate_config)
             token_tensor = torch.zeros(
                 (len(prompt_token_ids), max_prompt_len),
                 dtype=torch.long,
@@ -205,6 +207,7 @@ class LLMEngine:
                     device=runtime_model.runtime.device,
                 ),
                 allow_device_greedy_sampling=allow_device_greedy_sampling,
+                allow_device_topk_sampling=allow_device_topk_sampling,
                 kv_allocations=allocations,
             )
             fast_path_result = self._executor.try_generate_batch(
@@ -234,6 +237,7 @@ class LLMEngine:
                     sampling_params,
                     len(requests),
                     prefill_sampled_token_ids,
+                    prefill_result.sampling_candidates,
                 )
                 active_indices = list(range(len(requests)))
                 finish_reasons = ["length"] * len(requests)
@@ -295,6 +299,7 @@ class LLMEngine:
                                 device=runtime_model.runtime.device,
                             ),
                             allow_device_greedy_sampling=allow_device_greedy_sampling,
+                            allow_device_topk_sampling=allow_device_topk_sampling,
                             kv_allocations=active_allocations,
                         ),
                     )
@@ -303,6 +308,7 @@ class LLMEngine:
                         sampling_params,
                         len(next_active),
                         decode_result.sampled_token_ids if allow_device_greedy_sampling else None,
+                        decode_result.sampling_candidates,
                     )
                     for row_idx, request_idx in enumerate(next_active):
                         current_tokens[request_idx] = decoded_tokens[row_idx]
@@ -429,6 +435,7 @@ class LLMEngine:
         sampling_params,
         row_count: int,
         sampled_token_ids: torch.Tensor | None = None,
+        sampling_candidates: SamplingCandidates | None = None,
     ) -> list[int]:
         """Return sampled token IDs, preferring executor-provided device samples."""
         if sampled_token_ids is not None:
@@ -438,6 +445,20 @@ class LLMEngine:
                     f"sampled_token_ids has {flat_ids.numel()} rows, expected at least {row_count}"
                 )
             return [int(flat_ids[idx].item()) for idx in range(row_count)]
+        if sampling_candidates is not None:
+            if sampling_candidates.values.shape[0] < row_count:
+                raise ValueError(
+                    "sampling candidates have fewer rows than expected: "
+                    f"{sampling_candidates.values.shape[0]} < {row_count}"
+                )
+            return [
+                self._sampler.sample_from_candidates(
+                    sampling_candidates,
+                    row_idx,
+                    sampling_params,
+                )
+                for row_idx in range(row_count)
+            ]
         return [
             self._sampler.sample(
                 self._select_batch_row(logits, row_idx),
@@ -445,6 +466,16 @@ class LLMEngine:
             )
             for row_idx in range(row_count)
         ]
+
+    def _allow_device_topk_sampling(self, generate_config: GenerateConfig) -> bool:
+        """Return whether generation can use executor-provided top-k candidates."""
+        max_device_topk = self._executor.device_topk_sampling_k
+        return (
+            generate_config.temperature > 0.0
+            and generate_config.top_k is not None
+            and generate_config.top_k > 0
+            and max_device_topk >= generate_config.top_k
+        )
 
     def _decode_embeddings_from_cache_or_lookup(
         self,
