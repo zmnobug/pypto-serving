@@ -2,8 +2,7 @@
 
 PyPTO Serving is a small local inference stack for running Qwen3-14B and
 DeepSeek V4 generation with PyPTO kernels on Ascend NPUs. It includes an
-installable Python package, model executor integrations, CLI entry points, and
-tests for batching and configuration handling.
+installable Python package, model executor integrations and CLI entry points.
 
 ## Layout
 
@@ -48,17 +47,10 @@ git submodule update --init --recursive
 python -m pip install --no-deps -e .
 ```
 
-Run the unit tests:
-
-```bash
-python -m pytest tests/test_batching.py tests/test_parallel.py
-```
-
 Show CLI help:
 
 ```bash
 pypto-serving --help
-python -m pypto_serving.cli --help
 ```
 
 ## NPU Generation
@@ -73,24 +65,6 @@ python examples/model/qwen3_14b/npu_generate.py \
   --device-id 0 \
   --max-seq-len 512 \
   --max-new-tokens 5
-```
-
-Offline generation does not require the larger PTO2 ring settings used for
-concurrent HTTP serving.
-
-Add `--profile` to print timing and write a Chrome trace when `SA_PROFILE_OUTPUT`
-or `SA_PROFILE_LEVEL` is set:
-
-```bash
-SA_PROFILE_OUTPUT=/tmp/pypto-serving-profile-offline SA_PROFILE_LEVEL=verbose \
-python examples/model/qwen3_14b/npu_generate.py \
-  --model-dir /path/to/Qwen3-14B \
-  --prompt 'Huawei is' \
-  --platform a2a3 \
-  --device-id 0 \
-  --max-seq-len 512 \
-  --max-new-tokens 5 \
-  --profile
 ```
 
 ## HTTP Serving (OpenAI-compatible API)
@@ -139,14 +113,9 @@ python tests/bench_serving.py --port 8899 --stream -n 8 -c 4 --max-tokens 16
 
 - All model/device/runtime options are passed via CLI arguments. Run
   `pypto-serving --help` for the full list.
-- Parallel serving development notes live in `docs/dev/parallel.md`.
-- Generated kernel artifacts are written under `build_output/` and are ignored
-  by git.
 - This repository expects PyPTO, CANN, torch, safetensors, transformers, and the
   local Ascend runtime environment to be available in the active Python
   environment.
 - `pypto-lib/` is not included in the wheel. An editable checkout discovers its
   kernel submodule automatically; for any other installation, set `PYPTO_ROOT`
   to the root of a `pypto-lib` checkout before loading a model.
-- HTTP serving mode additionally requires `fastapi`, `uvicorn`, and `pydantic`.
-  The benchmark script requires `aiohttp`.

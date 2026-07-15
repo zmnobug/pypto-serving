@@ -4,12 +4,6 @@ These commands are for DeepSeek V4 Flash W8A8 serving checks on shared Ascend
 development machines with `task-submit`. Run them from the pypto-serving
 checkout.
 
-Install the checkout before running the commands below:
-
-```bash
-python -m pip install --no-deps -e .
-```
-
 ## 8-Device TP Serving
 
 Use the quantized checkpoint under `/data/models/dsv4-flash-w8a8` and run with
