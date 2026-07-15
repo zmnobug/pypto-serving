@@ -28,12 +28,8 @@ from pypto_serving.model.deepseek.npu_runner import (
     DeepSeekV4CompiledKernels,
     DeepSeekV4InputBuilder,
     DeepSeekV4L3Callable,
-    DeepSeekV4LayerCache,
-    DeepSeekV4LayerCacheSnapshot,
-    DeepSeekV4LayerPlan,
     DeepSeekV4ModelRunner,
     build_deepseek_v4_layer_plan,
-    deepseek_v4_attention_kind,
 )
 from pypto_serving.model.deepseek.weight_loader import (
     DeepSeekV4WeightStore,
@@ -305,7 +301,7 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert compiled_names == ["deepseek_v4_prefill", "deepseek_v4_decode"]
     # The packed l3_prefill_fwd emits final-normalized x_out and carries a trailing
     # num_tokens scalar. LM-head is computed on the host side.
-    assert len(compiled_args["deepseek_v4_prefill"]) == 83
+    assert len(compiled_args["deepseek_v4_prefill"]) == len(npu_executor._PREFILL_FWD_TENSOR_ORDER) + 1
     # The packed l3_decode_fwd emits final-normalized x_out and carries a trailing
     # num_tokens scalar. LM-head is computed on the host side.
     assert len(compiled_args["deepseek_v4_decode"]) == 86
@@ -325,16 +321,16 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     # final-normalized hidden rows.
     prefill_args = compiled_args["deepseek_v4_prefill"]
     assert prefill_args[prefill_order.index("kv_cache")].shape == (8, 43 * 128, 128, 1, 512)
-    assert prefill_args[prefill_order.index("cmp_kv")].shape == (8, 43 * 256, 128, 1, 512)
-    assert prefill_args[prefill_order.index("idx_kv_cache")].shape == (8, 21 * 512, 128, 1, 128)
+    assert prefill_args[prefill_order.index("cmp_kv")].shape == (8, 43 * 32, 128, 1, 512)
+    assert prefill_args[prefill_order.index("idx_kv_cache")].shape == (8, 21 * 64, 128, 1, 128)
     assert prefill_args[prefill_order.index("idx_kv_cache")].dtype == torch.int8
-    assert prefill_args[prefill_order.index("idx_kv_scale")].shape == (8, 21 * 512, 128, 1, 1)
+    assert prefill_args[prefill_order.index("idx_kv_scale")].shape == (8, 21 * 64, 128, 1, 1)
     assert prefill_args[prefill_order.index("hca_cmp_wkv")].shape == (8, 20 * 512, 4096)
     assert prefill_args[prefill_order.index("csa_cmp_wkv")].shape == (8, 21 * 1024, 4096)
     assert prefill_args[prefill_order.index("csa_inner_wkv")].shape == (8, 21 * 256, 4096)
-    assert prefill_args[prefill_order.index("hca_cmp_kv_state")].shape == (8, 20 * 2048, 8, 512)
-    assert prefill_args[prefill_order.index("csa_cmp_kv_state")].shape == (8, 21 * 4096, 4, 1024)
-    assert prefill_args[prefill_order.index("csa_inner_kv_state")].shape == (8, 21 * 4096, 4, 256)
+    assert prefill_args[prefill_order.index("hca_compress_state")].shape == (8, 20 * 64, 8, 1024)
+    assert prefill_args[prefill_order.index("csa_compress_state")].shape == (8, 21 * 65, 4, 2048)
+    assert prefill_args[prefill_order.index("csa_inner_compress_state")].shape == (8, 21 * 65, 4, 512)
     assert prefill_args[prefill_order.index("hca_compress_state_block_table")].shape == (8, 2048)
     assert prefill_args[prefill_order.index("csa_compress_state_block_table")].shape == (8, 4096)
     assert prefill_args[prefill_order.index("csa_inner_compress_state_block_table")].shape == (8, 4096)
@@ -352,12 +348,12 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert prefill_args[prefill_order.index("x_out")].shape == (8, 128, 4096)
     decode_order = npu_executor._DECODE_FWD_TENSOR_ORDER
     # Compress-state work caches are stacked across the CSA (x21) and HCA (x20) layer
-    # groups, each layer holding decode_batch (8) x state_max_blocks rows.
-    assert compiled_args["deepseek_v4_decode"][decode_order.index("hca_compress_state")].shape == (8, 20 * 8 * 64, 8, 1024)
-    assert compiled_args["deepseek_v4_decode"][decode_order.index("csa_compress_state")].shape == (8, 21 * 8 * 65, 4, 2048)
+    # groups, each layer holding decode_batch (4) x state_max_blocks rows.
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("hca_compress_state")].shape == (8, 20 * 64, 8, 1024)
+    assert compiled_args["deepseek_v4_decode"][decode_order.index("csa_compress_state")].shape == (8, 21 * 65, 4, 2048)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("csa_inner_compress_state")].shape == (
         8,
-        21 * 8 * 65,
+        21 * 65,
         4,
         512,
     )
@@ -368,15 +364,14 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     # rows and the TP vocab shards from the packed checkpoint weights.
     assert compiled_args["deepseek_v4_decode"][decode_order.index("final_norm_w")].shape == (8, 4096)
     assert compiled_args["deepseek_v4_decode"][decode_order.index("x_out")].shape == (8, 8, 4096)
-    # Decode ori-KV is a 2-block sliding-window ring (KV_ORI_MAX_BLOCKS) with a
-    # vLLM-style 128-column absolute block table (KV_ORI_TABLE_MAX_BLOCKS).
+    # Decode ori-KV uses the same fixed 128-block physical pool as prefill.
     decode_args = compiled_args["deepseek_v4_decode"]
-    assert decode_args[decode_order.index("kv_cache")].shape == (8, 43 * 8 * 2, 128, 1, 512)
+    assert decode_args[decode_order.index("kv_cache")].shape == (8, 43 * 128, 128, 1, 512)
     assert decode_args[decode_order.index("block_table")].shape == (8, 8, 128)
     assert decode_args[decode_order.index("idx_kv_cache")].dtype == torch.int8
-    assert decode_args[decode_order.index("idx_kv_scale")].shape == (8, 21 * 8 * 64, 128, 1, 1)
-    # SWA metadata: full window (incl. current) for the SWA layer, history window
-    # (excludes current chunk) for HCA/CSA, plus the paged write slot mapping.
+    assert decode_args[decode_order.index("idx_kv_scale")].shape == (8, 21 * 64, 128, 1, 1)
+    # SWA/HCA/CSA metadata all use the cache-first full window, plus the paged
+    # write slot mapping.
     assert decode_args[decode_order.index("swa_slot_mapping")].shape == (8, 8)
     assert decode_args[decode_order.index("swa_indices")].shape == (8, 8, 128)
     assert decode_args[decode_order.index("swa_lens")].shape == (8, 8)
@@ -439,9 +434,9 @@ def test_deepseek_kernel_contract_rejects_prefill_state_mismatch(tmp_path):
     with pytest.raises(
         ValueError,
         match=(
-            r"prefill_attention_hca.py:HCA_STATE_BLOCK_NUM=1024 expected 2048"
-            r".*prefill_attention_csa.py:CSA_STATE_BLOCK_NUM=2048 expected 4096"
-            r".*prefill_attention_csa.py:INNER_STATE_BLOCK_NUM=2048 expected 4096"
+            r"prefill_attention_hca.py:HCA_STATE_MAX_BLOCKS=1024 expected 2048"
+            r".*prefill_attention_csa.py:CSA_STATE_MAX_BLOCKS=2048 expected 4096"
+            r".*prefill_attention_csa.py:INNER_STATE_MAX_BLOCKS=2048 expected 4096"
         ),
     ):
         executor._validate_kernel_contract(DeepSeekV4CacheLayout())
@@ -475,10 +470,10 @@ def test_deepseek_hc_input_builder_shapes_prefill_and_decode():
 def test_deepseek_layout_rejects_context_beyond_decode_state_capacity():
     model = _runtime_model_for_embeddings()
 
-    with pytest.raises(ValueError, match="max_seq_len=260"):
+    with pytest.raises(ValueError, match="max_seq_len=16384"):
         DeepSeekV4CacheLayout().validate_runtime(
             model.config,
-            RuntimeConfig(page_size=128, max_batch_size=1, max_seq_len=261, weight_dtype="int8"),
+            RuntimeConfig(page_size=128, max_batch_size=1, max_seq_len=16385, weight_dtype="int8"),
             tuple(range(8)),
         )
 
@@ -725,12 +720,11 @@ def test_deepseek_cache_slots_tables_and_mappings():
 
     table = manager.block_table([1], max_blocks=64)
     assert table.shape == (1, 64)
-    assert table[0, 0].item() == 64
-    assert table[0, 63].item() == 127
+    assert table[0, 0].item() == 1
+    assert table[0, 63].item() == 57
 
     cmp_mapping = manager.slot_mapping([1], [[0, 4, 256]], max_blocks=64, compress_ratio=4)
-    base = 1 * 64 * 128
-    assert cmp_mapping.tolist() == [[base, base + 1, base + 64]]
+    assert cmp_mapping.tolist() == [[128, 129, 192]]
 
     hca_state_mapping = manager.slot_mapping(
         [1],
@@ -739,7 +733,7 @@ def test_deepseek_cache_slots_tables_and_mappings():
         block_size=8,
         compress_ratio=128,
     )
-    assert hca_state_mapping.tolist() == [[1 * 64 * 8, 1 * 64 * 8 + 1, 1 * 64 * 8 + 2]]
+    assert hca_state_mapping.tolist() == [[8, 9, 10]]
 
     manager.release(["req-a"])
     assert manager.allocate("req-c") == 0
@@ -767,14 +761,14 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
     assert prepared.x_hc.shape == (8, 128, 4, 4)
     assert prepared.x_hc.dtype == torch.float32
     assert prepared.ori_block_table.shape == (8, 128)
-    assert prepared.ori_block_table[0, :4].tolist() == [0, 1, 2, 3]
+    assert prepared.ori_block_table[0, :4].tolist() == [0, 32, 64, 96]
     assert prepared.cmp_block_table.shape == (8, 32)
     assert prepared.idx_block_table.shape == (8, 64)
     assert prepared.position_ids.shape == (8, 128)
     assert prepared.position_ids[0, :4].tolist() == [126, 127, 128, 129]
     assert prepared.input_ids[0, :4].tolist() == [10, 11, 12, 10]
     assert prepared.ori_slot_mapping.shape == (8, 128)
-    assert prepared.ori_slot_mapping[0, :4].tolist() == [126, 127, 128, 129]
+    assert prepared.ori_slot_mapping[0, :4].tolist() == [126, 127, 4096, 8065]
     assert prepared.hca_cmp_slot_mapping.shape == (8, 128)
     assert prepared.hca_cmp_slot_mapping[0, :3].tolist() == [-1, 0, -1]
     assert prepared.hca_cmp_slot_mapping[0, 3].item() == -1
@@ -786,24 +780,24 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
     assert prepared.csa_idx_slot_mapping[0, 3].item() == -1
     assert prepared.hca_state_slot_mapping.shape == (8, 128)
     assert prepared.hca_state_slot_mapping[0, :4].tolist() == [
-        126,
-        127,
-        128,
-        129,
+        262,
+        263,
+        0,
+        249,
     ]
     assert prepared.csa_state_slot_mapping.shape == (8, 128)
     assert prepared.csa_state_slot_mapping[0, :4].tolist() == [
-        126,
-        127,
-        128,
-        129,
+        70,
+        71,
+        196,
+        61,
     ]
     assert prepared.csa_inner_state_slot_mapping.shape == (8, 128)
     assert prepared.csa_inner_state_slot_mapping[0, :4].tolist() == [
-        126,
-        127,
-        128,
-        129,
+        70,
+        71,
+        196,
+        61,
     ]
 
 
@@ -840,11 +834,11 @@ def test_deepseek_prepare_decode_inputs_uses_scratch_slots_for_fixed_rows():
     assert prepared.kv_seq_lens[0, :4].tolist() == [128, 5, 128, 128]
     assert prepared.block_table.shape == (8, 32, 128)
     assert prepared.cmp_block_table.shape == (8, 32, 32)
-    assert prepared.ori_slot_mapping[0, :6].tolist() == [126, 127, 259, 260, 638, 639]
-    assert prepared.hca_cmp_slot_mapping[0, :6].tolist() == [-1, 0, -1, -1, -1, 8192]
-    assert prepared.csa_cmp_slot_mapping[0, :6].tolist() == [-1, 31, 4096, -1, -1, 8223]
-    assert prepared.csa_idx_slot_mapping[0, :6].tolist() == [-1, 31, 8192, -1, -1, 16415]
-    assert prepared.csa_state_slot_mapping[0, :6].tolist() == [126, 127, 263, 264, 646, 647]
+    assert prepared.ori_slot_mapping[0, :6].tolist() == [126, 127, 131, 132, 382, 383]
+    assert prepared.hca_cmp_slot_mapping[0, :6].tolist() == [-1, 0, -1, -1, -1, 256]
+    assert prepared.csa_cmp_slot_mapping[0, :6].tolist() == [-1, 31, 128, -1, -1, 287]
+    assert prepared.csa_idx_slot_mapping[0, :6].tolist() == [-1, 31, 128, -1, -1, 287]
+    assert prepared.csa_state_slot_mapping[0, :6].tolist() == [70, 71, 7, 132, 78, 79]
 
 
 def test_deepseek_prepare_decode_inputs_builds_sliding_window_metadata():
@@ -862,25 +856,26 @@ def test_deepseek_prepare_decode_inputs_builds_sliding_window_metadata():
 
     # decode_batch=32, decode_seq=2 -> tokens 0,1 are row0 (slot 0, positions
     # 126,127); tokens 2,3 are row1 (slot 1, positions 3,4).
-    # Absolute 128-column block table wraps into the 2-block physical ring per slot.
+    # The fixed physical pool is interleaved by logical page and stable request slot.
     assert prepared.block_table.shape == (8, 32, 128)
-    assert prepared.block_table[0, 0, :4].tolist() == [0, 1, 0, 1]
-    assert prepared.block_table[0, 1, :4].tolist() == [2, 3, 2, 3]
+    assert prepared.block_table[0, 0, :4].tolist() == [0, 32, 64, 96]
+    assert prepared.block_table[0, 1, :4].tolist() == [1, 33, 65, 97]
     # SWA full window (incl. current). token 1 = slot 0 pos 127 -> physical rows
-    # 0..127 in the ring; token 3 = slot 1 pos 4 -> rows 256..260.
+    # 0..127 in the pool; token 3 = slot 1 pos 4 -> rows 128..132.
     assert prepared.swa_lens[0, 0].item() == 127
     assert prepared.swa_lens[0, 1].item() == 128
     assert prepared.swa_lens[0, 3].item() == 5
     assert prepared.swa_indices[0, 1, :4].tolist() == [0, 1, 2, 3]
-    assert prepared.swa_indices[0, 3, :5].tolist() == [256, 257, 258, 259, 260]
+    assert prepared.swa_indices[0, 3, :5].tolist() == [128, 129, 130, 131, 132]
     # Paged write slot for the current token.
     assert prepared.swa_slot_mapping[0, 1].item() == 127
-    assert prepared.swa_slot_mapping[0, 3].item() == 260
-    # History window excludes the current decode chunk positions.
-    assert prepared.window_swa_lens[0, 0].item() == 126
-    assert prepared.window_swa_lens[0, 1].item() == 126
-    assert prepared.window_swa_lens[0, 3].item() == 3
-    assert prepared.window_swa_indices[0, 3, :3].tolist() == [256, 257, 258]
+    assert prepared.swa_slot_mapping[0, 3].item() == 132
+    # HCA/CSA follow pypto-lib's cache-first contract: their window contains
+    # historical rows and the current decode position after KV writeback.
+    assert prepared.window_swa_lens[0, 0].item() == 127
+    assert prepared.window_swa_lens[0, 1].item() == 128
+    assert prepared.window_swa_lens[0, 3].item() == 5
+    assert prepared.window_swa_indices[0, 3, :5].tolist() == [128, 129, 130, 131, 132]
 
 
 def test_deepseek_prepare_decode_inputs_feeds_two_real_tokens():
@@ -1010,8 +1005,6 @@ def test_deepseek_run_decode_dispatches_active_token_count():
     )
     runner._ensure_l3_shared_buffers = lambda _model: None
     runner._stage_decode_inputs = fake_stage
-    runner._require_prefill_cache_snapshots = lambda: None
-    runner._seed_decode_work_cache = lambda _slots: None
     runner._require_decode_buffers = lambda: SimpleNamespace(x_hc_a=captured["prepared"].x_hc)
     runner._require_decode_output_buffer = lambda _hidden_size: hidden_out
     runner._decode_fwd_args = fake_decode_fwd_args
@@ -1066,7 +1059,6 @@ def test_deepseek_run_prefill_dispatches_static_prefill_token_count():
     runner._stage_prefill_fwd_inputs = fake_stage
     runner._prefill_fwd_args = fake_prefill_fwd_args
     runner._run_l3 = fake_run_l3
-    runner._snapshot_prefill_fwd_caches = lambda _slot, _kv_seq_len: None
     runner._logits_for_hidden = fake_logits
 
     result = runner.run_prefill(
@@ -1126,294 +1118,75 @@ def test_deepseek_cache_replicates_decode_padding_rows():
     assert padded.tolist() == [[10, 11], [20, 21], [10, 11], [10, 11]]
 
 
-def test_deepseek_decode_work_cache_loads_snapshot_into_kernel_slots():
+def test_deepseek_prefill_and_decode_reuse_same_cache_tensors():
     layout = DeepSeekV4CacheLayout(
         ranks=1,
-        decode_batch=3,
-        decode_seq=2,
-        decode_tokens=6,
-        prefill_ori_max_blocks=1,
-        cmp_max_blocks=1,
-    )
-    layer = DeepSeekV4LayerPlan(
-        layer_id=0,
-        compress_ratio=0,
-        attention_kind="swa",
-        include_tid2eid=True,
-        include_gate_bias=False,
-    )
-    compiled = DeepSeekV4CompiledKernels(
-        layout=layout,
-        model_dir="",
-        weight_map={},
-        weight_store=None,
-        compress_ratios=(),
-        layer_plan=(layer,),
-        kernel_dir="",
-    )
-    runner = DeepSeekV4ModelRunner(compiled=compiled)
-
-    # ``_populate_decode_work_cache`` zeroes the stacked cache, then copies each
-    # layer's prefill snapshot into its kernel slots at stacked offset
-    # ``fwd_offset * decode_batch + slot``. Exercise that per-slot copy primitive
-    # directly for a single swa layer (fwd_offset 0) into kernel slots 0 and 2.
-    work_kv = torch.full((1, 3, 1, 1, 1), -1.0, dtype=torch.bfloat16)
-    work_cmp = torch.full((1, 3, 1, 1, 1), -2.0, dtype=torch.bfloat16)
-    snap_kv = torch.tensor([[[[[7.0]]]]], dtype=torch.bfloat16)
-    snap_cmp = torch.tensor([[[[[8.0]]]]], dtype=torch.bfloat16)
-    work_kv.zero_()
-    work_cmp.zero_()
-    for slot in (0, 2):
-        runner._copy_snapshot_blocks_to_work(
-            snap_kv,
-            work_kv,
-            slot,
-            layout.prefill_ori_max_blocks,
-        )
-        runner._copy_snapshot_blocks_to_work(snap_cmp, work_cmp, slot, layout.cmp_max_blocks)
-
-    # The unused slot 1 is left at zero.
-    assert work_kv.flatten().tolist() == [7.0, 0.0, 7.0]
-    assert work_cmp.flatten().tolist() == [8.0, 0.0, 8.0]
-
-
-def test_deepseek_prefill_ori_snapshot_is_lowered_into_decode_ring():
-    snapshot = torch.tensor([10.0, 11.0, 12.0, 13.0], dtype=torch.bfloat16).reshape(
-        1, 4, 1, 1, 1
-    )
-    work = torch.full((1, 4, 1, 1, 1), -1.0, dtype=torch.bfloat16)
-
-    DeepSeekV4ModelRunner._copy_prefill_ori_snapshot_to_work(
-        snapshot,
-        work,
-        slot=1,
-        blocks_per_slot=2,
-        kv_seq_len=3,
+        prefill_seq=1,
+        decode_batch=1,
+        decode_seq=1,
+        decode_tokens=1,
         block_size=1,
+        prefill_ori_max_blocks=1,
+        decode_ori_max_blocks=1,
+        ori_table_max_blocks=1,
+        cmp_max_blocks=1,
+        idx_max_blocks=1,
+        hca_state_max_blocks=1,
+        csa_state_max_blocks=1,
+        csa_inner_state_max_blocks=1,
+        c128_state_block_size=1,
+        c4_state_block_size=1,
+        prefill_cmp_max_blocks=1,
+        prefill_idx_max_blocks=1,
+        prefill_hca_state_max_blocks=1,
+        prefill_csa_state_max_blocks=1,
+        prefill_csa_inner_state_max_blocks=1,
     )
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=layout,
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+            freqs_cos=torch.empty((1, 1), dtype=torch.bfloat16),
+            freqs_sin=torch.empty((1, 1), dtype=torch.bfloat16),
+        )
+    )
+    cache = runner._ensure_decode_work_cache()
+    prefill = runner._ensure_prefill_fwd_buffers(hidden_size=1)
 
-    # Logical blocks 0, 1, 2 lower to ring blocks 0, 1, 0. Slot 0 is untouched.
-    assert work.flatten().tolist() == [-1.0, -1.0, 12.0, 11.0]
+    for name in (
+        "kv_cache",
+        "cmp_kv",
+        "idx_kv_cache",
+        "idx_kv_scale",
+        "hca_compress_state",
+        "csa_compress_state",
+        "csa_inner_compress_state",
+    ):
+        assert prefill.tensors[name] is getattr(cache, name)
 
 
-def test_deepseek_prefill_snapshot_slices_physical_slot_pool():
+def test_deepseek_unified_cache_zeroing_is_isolated_by_slot():
     layout = DeepSeekV4CacheLayout(
         ranks=1,
         decode_batch=2,
         decode_seq=1,
         decode_tokens=2,
         block_size=1,
-        prefill_ori_max_blocks=1,
-        prefill_cmp_max_blocks=2,
-        prefill_idx_max_blocks=3,
-        prefill_hca_state_max_blocks=1,
-        prefill_csa_state_max_blocks=1,
-        prefill_csa_inner_state_max_blocks=1,
-    )
-    layer_plan = (
-        DeepSeekV4LayerPlan(
-            layer_id=0,
-            compress_ratio=4,
-            attention_kind="csa",
-            include_tid2eid=True,
-            include_gate_bias=False,
-        ),
-        DeepSeekV4LayerPlan(
-            layer_id=1,
-            compress_ratio=128,
-            attention_kind="hca",
-            include_tid2eid=False,
-            include_gate_bias=True,
-        ),
-    )
-    runner = DeepSeekV4ModelRunner(
-        compiled=DeepSeekV4CompiledKernels(
-            layout=layout,
-            model_dir="",
-            weight_map={},
-            weight_store=None,
-            compress_ratios=(4, 128),
-            layer_plan=layer_plan,
-            kernel_dir="",
-        )
-    )
-    runner._prefill_fwd_buffers = npu_runner._DeepSeekV4PrefillFwdSharedBuffers(
-        x_hc=torch.empty(0),
-        freqs_cos=torch.empty(0),
-        freqs_sin=torch.empty(0),
-        tensors={
-            "kv_cache": torch.tensor([100.0, 200.0], dtype=torch.bfloat16).reshape(1, 2, 1, 1, 1),
-            "cmp_kv": torch.tensor(
-                [10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0],
-                dtype=torch.bfloat16,
-            ).reshape(1, 8, 1, 1, 1),
-            "idx_kv_cache": torch.tensor([30, 31, 32, 33, 34, 35], dtype=torch.int8).reshape(
-                1, 6, 1, 1, 1
-            ),
-            "idx_kv_scale": torch.tensor(
-                [40.0, 41.0, 42.0, 43.0, 44.0, 45.0], dtype=torch.float32
-            ).reshape(1, 6, 1, 1, 1),
-            "csa_cmp_kv_state": torch.ones((1, 1, 1, 1, 1), dtype=torch.float32),
-            "csa_cmp_score_state": torch.ones((1, 1, 1, 1, 1), dtype=torch.float32) * 2,
-            "csa_inner_kv_state": torch.ones((1, 1, 1, 1, 1), dtype=torch.float32) * 3,
-            "csa_inner_score_state": torch.ones((1, 1, 1, 1, 1), dtype=torch.float32) * 4,
-            "hca_cmp_kv_state": torch.ones((1, 1, 1, 1, 1), dtype=torch.float32) * 5,
-            "hca_cmp_score_state": torch.ones((1, 1, 1, 1, 1), dtype=torch.float32) * 6,
-        },
-    )
-
-    runner._snapshot_prefill_fwd_caches(slot=1, kv_seq_len=1)
-
-    csa_snapshot = runner._prefill_cache_snapshots[0].tensors
-    hca_snapshot = runner._prefill_cache_snapshots[1].tensors
-    assert csa_snapshot["kv_cache"].flatten().tolist() == [100.0]
-    assert csa_snapshot["cmp_kv"].flatten().tolist() == [12.0, 13.0]
-    assert csa_snapshot["idx_kv_cache"].flatten().tolist() == [33.0, 34.0, 35.0]
-    assert csa_snapshot["idx_kv_scale"].flatten().tolist() == [43.0, 44.0, 45.0]
-    assert hca_snapshot["kv_cache"].flatten().tolist() == [200.0]
-    assert hca_snapshot["cmp_kv"].flatten().tolist() == [22.0, 23.0]
-
-
-def test_deepseek_decode_work_cache_preserves_decode_state_after_initial_seed():
-    layout = DeepSeekV4CacheLayout(
-        ranks=1,
-        decode_batch=3,
-        decode_seq=1,
-        decode_tokens=3,
-        prefill_ori_max_blocks=1,
-        decode_ori_max_blocks=1,
-        cmp_max_blocks=1,
-        idx_max_blocks=1,
-        hca_state_max_blocks=1,
-        csa_state_max_blocks=1,
-        csa_inner_state_max_blocks=1,
-        block_size=1,
+        prefill_ori_max_blocks=2,
+        decode_ori_max_blocks=2,
+        cmp_max_blocks=2,
+        idx_max_blocks=2,
+        hca_state_max_blocks=2,
+        csa_state_max_blocks=2,
+        csa_inner_state_max_blocks=2,
         c128_state_block_size=1,
         c4_state_block_size=1,
     )
-    ratios = _deepseek_flash_compress_ratios()[: npu_runner.DEEPSEEK_V4_FWD_NUM_LAYERS]
-    layer_plan = tuple(
-        DeepSeekV4LayerPlan(
-            layer_id=layer_id,
-            compress_ratio=ratio,
-            attention_kind=deepseek_v4_attention_kind(ratio),
-            include_tid2eid=layer_id < 3,
-            include_gate_bias=layer_id >= 3,
-        )
-        for layer_id, ratio in enumerate(ratios)
-    )
-    runner = DeepSeekV4ModelRunner(
-        compiled=DeepSeekV4CompiledKernels(
-            layout=layout,
-            model_dir="",
-            weight_map={},
-            weight_store=None,
-            compress_ratios=tuple(ratios),
-            layer_plan=layer_plan,
-            kernel_dir="",
-        )
-    )
-
-    hca_dim = 2 * npu_runner.DEEPSEEK_V4_HCA_MAIN_OUT_DIM
-    csa_dim = 2 * npu_runner.DEEPSEEK_V4_CSA_MAIN_OUT_DIM
-    csa_inner_dim = 2 * npu_runner.DEEPSEEK_V4_CSA_INNER_OUT_DIM
-    runner._decode_work_cache = DeepSeekV4LayerCache(
-        kv_cache=torch.zeros((1, 43 * layout.decode_batch, 1, 1, 1), dtype=torch.bfloat16),
-        cmp_kv=torch.zeros((1, 43 * layout.decode_batch, 1, 1, 1), dtype=torch.bfloat16),
-        idx_kv_cache=torch.zeros((1, 21 * layout.decode_batch, 1, 1, 1), dtype=torch.int8),
-        idx_kv_scale=torch.zeros((1, 21 * layout.decode_batch, 1, 1, 1), dtype=torch.float32),
-        hca_compress_state=torch.zeros((1, 20 * layout.decode_batch, 1, 1, hca_dim), dtype=torch.float32),
-        csa_compress_state=torch.zeros((1, 21 * layout.decode_batch, 1, 1, csa_dim), dtype=torch.float32),
-        csa_inner_compress_state=torch.zeros((1, 21 * layout.decode_batch, 1, 1, csa_inner_dim), dtype=torch.float32),
-    )
-
-    def snapshot_for(
-        layer_id: int,
-        ratio: int,
-        *,
-        value_offset: float = 0.0,
-    ) -> DeepSeekV4LayerCacheSnapshot:
-        value = float(layer_id + 1) + value_offset
-        tensors = {
-            "kv_cache": torch.full((1, 1, 1, 1, 1), value, dtype=torch.bfloat16),
-            "cmp_kv": torch.full((1, 1, 1, 1, 1), value + 0.25, dtype=torch.bfloat16),
-        }
-        if ratio == 4:
-            tensors.update(
-                {
-                    "idx_kv_cache": torch.full((1, 1, 1, 1, 1), int(value) + 3, dtype=torch.int8),
-                    "idx_kv_scale": torch.full((1, 1, 1, 1, 1), value + 0.5, dtype=torch.float32),
-                    "csa_cmp_kv_state": torch.full(
-                        (1, 1, 1, 1, npu_runner.DEEPSEEK_V4_CSA_MAIN_OUT_DIM),
-                        value,
-                        dtype=torch.float32,
-                    ),
-                    "csa_cmp_score_state": torch.full(
-                        (1, 1, 1, 1, npu_runner.DEEPSEEK_V4_CSA_MAIN_OUT_DIM),
-                        value + 1.0,
-                        dtype=torch.float32,
-                    ),
-                    "csa_inner_kv_state": torch.full(
-                        (1, 1, 1, 1, npu_runner.DEEPSEEK_V4_CSA_INNER_OUT_DIM),
-                        value,
-                        dtype=torch.float32,
-                    ),
-                    "csa_inner_score_state": torch.full(
-                        (1, 1, 1, 1, npu_runner.DEEPSEEK_V4_CSA_INNER_OUT_DIM),
-                        value + 1.0,
-                        dtype=torch.float32,
-                    ),
-                }
-            )
-        elif ratio == 128:
-            tensors.update(
-                {
-                    "hca_cmp_kv_state": torch.full(
-                        (1, 1, 1, 1, npu_runner.DEEPSEEK_V4_HCA_MAIN_OUT_DIM),
-                        value,
-                        dtype=torch.float32,
-                    ),
-                    "hca_cmp_score_state": torch.full(
-                        (1, 1, 1, 1, npu_runner.DEEPSEEK_V4_HCA_MAIN_OUT_DIM),
-                        value + 1.0,
-                        dtype=torch.float32,
-                    ),
-                }
-            )
-        return DeepSeekV4LayerCacheSnapshot(tensors, kv_seq_len=1)
-
-    runner._prefill_cache_snapshots = {
-        layer_id: snapshot_for(layer_id, ratio)
-        for layer_id, ratio in enumerate(ratios)
-    }
-
-    runner._seed_decode_work_cache((0, 2))
-    assert runner._decode_work_cache.kv_cache[0, 0, 0, 0, 0].item() == 1.0
-    assert runner._decode_work_cache.kv_cache[0, 2, 0, 0, 0].item() == 1.0
-
-    runner._decode_work_cache.kv_cache[0, 0, 0, 0, 0] = 99.0
-    runner._seed_decode_work_cache((0, 2))
-    assert runner._decode_work_cache.kv_cache[0, 0, 0, 0, 0].item() == 99.0
-
-    runner._seed_decode_work_cache((1,))
-    assert runner._decode_work_cache.kv_cache[0, 1, 0, 0, 0].item() == 1.0
-
-    runner._prefill_cache_snapshots = {
-        layer_id: snapshot_for(layer_id, ratio, value_offset=10.0)
-        for layer_id, ratio in enumerate(ratios)
-    }
-    runner._decode_work_cache.kv_cache[0, 2, 0, 0, 0] = 77.0
-    runner._decode_cache_seeded_slots.clear()
-
-    runner._seed_decode_work_cache((0, 1, 2))
-
-    assert runner._decode_work_cache.kv_cache[0, 0, 0, 0, 0].item() == 11.0
-    assert runner._decode_work_cache.kv_cache[0, 1, 0, 0, 0].item() == 11.0
-    assert runner._decode_work_cache.kv_cache[0, 2, 0, 0, 0].item() == 11.0
-
-
-def test_deepseek_release_invalidates_all_decode_kernel_slots():
-    layout = DeepSeekV4CacheLayout(decode_batch=3)
     runner = DeepSeekV4ModelRunner(
         compiled=DeepSeekV4CompiledKernels(
             layout=layout,
@@ -1425,14 +1198,36 @@ def test_deepseek_release_invalidates_all_decode_kernel_slots():
             kernel_dir="",
         )
     )
+    cache = runner._ensure_decode_work_cache()
+    for tensor in cache.__dict__.values():
+        tensor.fill_(1)
+
+    runner._zero_unified_cache_slot(0)
+
+    for tensor in cache.__dict__.values():
+        per_layer = tensor.reshape(layout.ranks, -1, 2, *tensor.shape[2:])
+        assert torch.count_nonzero(per_layer[:, :, 0]) == 0
+        assert torch.all(per_layer[:, :, 1] == 1)
+
+
+def test_deepseek_release_invalidates_unified_cache_request():
+    runner = DeepSeekV4ModelRunner(
+        compiled=DeepSeekV4CompiledKernels(
+            layout=DeepSeekV4CacheLayout(decode_batch=3),
+            model_dir="",
+            weight_map={},
+            weight_store=None,
+            compress_ratios=(),
+            layer_plan=(),
+            kernel_dir="",
+        )
+    )
     assert runner.cache_manager.allocate("request-a") == 0
-    runner._decode_cache_seeded_slots.update({0, 1, 2})
-    runner._prefill_cache_snapshots[0] = DeepSeekV4LayerCacheSnapshot({})
+    runner._initialized_cache_requests.add("request-a")
 
     runner.release_finished_requests(["request-a"])
 
-    assert runner._decode_cache_seeded_slots == set()
-    assert runner._prefill_cache_snapshots == {}
+    assert runner._initialized_cache_requests == set()
 
 
 def _write_deepseek_model_dir(tmp_path: Path, *, quant_method: str = "compressed-tensors") -> Path:
@@ -1495,8 +1290,8 @@ def _write_deepseek_kernel_dir(
     (kernel_dir / "prefill_attention_hca.py").write_text(
         "\n".join(
             [
-                f"HCA_STATE_BLOCK_NUM = {hca_state_blocks}",
-                "HCA_STATE_MAX_BLOCKS = HCA_STATE_BLOCK_NUM",
+                "HCA_STATE_BLOCK_NUM = 64",
+                f"HCA_STATE_MAX_BLOCKS = {hca_state_blocks}",
                 "",
             ]
         )
@@ -1504,10 +1299,10 @@ def _write_deepseek_kernel_dir(
     (kernel_dir / "prefill_attention_csa.py").write_text(
         "\n".join(
             [
-                f"CSA_STATE_BLOCK_NUM = {csa_state_blocks}",
-                "CSA_STATE_MAX_BLOCKS = CSA_STATE_BLOCK_NUM",
-                f"INNER_STATE_BLOCK_NUM = {csa_inner_state_blocks}",
-                "INNER_STATE_MAX_BLOCKS = INNER_STATE_BLOCK_NUM",
+                "CSA_STATE_BLOCK_NUM = 65",
+                f"CSA_STATE_MAX_BLOCKS = {csa_state_blocks}",
+                "INNER_STATE_BLOCK_NUM = 65",
+                f"INNER_STATE_MAX_BLOCKS = {csa_inner_state_blocks}",
                 "",
             ]
         )
@@ -1525,10 +1320,14 @@ def _write_deepseek_kernel_dir(
                 "DECODE_TOKENS = DECODE_BATCH * DECODE_SEQ",
                 "PREFILL_BATCH = 1",
                 "PREFILL_SEQ = 128",
-                "KV_ORI_MAX_BLOCKS = 2",
+                "KV_ORI_MAX_BLOCKS = 128",
                 "KV_ORI_TABLE_MAX_BLOCKS = 128",
                 "KV_CMP_MAX_BLOCKS = 32",
                 "IDX_CACHE_MAX_BLOCKS = 64",
+                "ORI_KV_BLOCK_NUM = 128",
+                "HCA_STATE_PHYSICAL_BLOCKS = 64",
+                "CSA_STATE_PHYSICAL_BLOCKS = 65",
+                "CSA_INNER_STATE_PHYSICAL_BLOCKS = 65",
                 "PREFILL_ORI_MAX_BLOCKS = 128",
                 "PREFILL_CMP_MAX_BLOCKS = KV_CMP_MAX_BLOCKS",
                 "PREFILL_IDX_MAX_BLOCKS = IDX_CACHE_MAX_BLOCKS",

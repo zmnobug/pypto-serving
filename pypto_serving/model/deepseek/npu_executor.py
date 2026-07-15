@@ -501,22 +501,13 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
         values.update(
             {
                 "x_hc": torch.empty((ranks, seq, DEEPSEEK_V4_HC_MULT, hidden), dtype=torch.float32),
-                # HCA-group prefill compressor state (x20).
-                "hca_cmp_kv_state": torch.empty(
+                # HCA-group merged compressor state (x20).
+                "hca_compress_state": torch.empty(
                     (
                         ranks,
-                        hca * layout.prefill_hca_state_max_blocks,
+                        hca * layout.hca_state_max_blocks,
                         layout.c128_state_block_size,
-                        DEEPSEEK_V4_HCA_MAIN_OUT_DIM,
-                    ),
-                    dtype=torch.float32,
-                ),
-                "hca_cmp_score_state": torch.empty(
-                    (
-                        ranks,
-                        hca * layout.prefill_hca_state_max_blocks,
-                        layout.c128_state_block_size,
-                        DEEPSEEK_V4_HCA_MAIN_OUT_DIM,
+                        DEEPSEEK_V4_HCA_STATE_DIM,
                     ),
                     dtype=torch.float32,
                 ),
@@ -525,21 +516,12 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                     dtype=torch.int32,
                 ),
                 # CSA-group prefill compressor state (x21).
-                "csa_cmp_kv_state": torch.empty(
+                "csa_compress_state": torch.empty(
                     (
                         ranks,
-                        csa * layout.prefill_csa_state_max_blocks,
+                        csa * layout.csa_state_max_blocks,
                         layout.c4_state_block_size,
-                        DEEPSEEK_V4_CSA_MAIN_OUT_DIM,
-                    ),
-                    dtype=torch.float32,
-                ),
-                "csa_cmp_score_state": torch.empty(
-                    (
-                        ranks,
-                        csa * layout.prefill_csa_state_max_blocks,
-                        layout.c4_state_block_size,
-                        DEEPSEEK_V4_CSA_MAIN_OUT_DIM,
+                        DEEPSEEK_V4_CSA_STATE_DIM,
                     ),
                     dtype=torch.float32,
                 ),
@@ -547,21 +529,12 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                     (ranks, layout.prefill_csa_state_max_blocks),
                     dtype=torch.int32,
                 ),
-                "csa_inner_kv_state": torch.empty(
+                "csa_inner_compress_state": torch.empty(
                     (
                         ranks,
-                        csa * layout.prefill_csa_inner_state_max_blocks,
+                        csa * layout.csa_inner_state_max_blocks,
                         layout.c4_state_block_size,
-                        DEEPSEEK_V4_CSA_INNER_OUT_DIM,
-                    ),
-                    dtype=torch.float32,
-                ),
-                "csa_inner_score_state": torch.empty(
-                    (
-                        ranks,
-                        csa * layout.prefill_csa_inner_state_max_blocks,
-                        layout.c4_state_block_size,
-                        DEEPSEEK_V4_CSA_INNER_OUT_DIM,
+                        DEEPSEEK_V4_CSA_INNER_STATE_DIM,
                     ),
                     dtype=torch.float32,
                 ),
@@ -673,7 +646,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "kv_cache": torch.empty(
                     (
                         ranks,
-                        fwd * batch * layout.decode_ori_max_blocks,
+                        fwd * layout.decode_ori_max_blocks,
                         layout.block_size,
                         1,
                         model.config.head_dim,
@@ -683,7 +656,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "cmp_kv": torch.empty(
                     (
                         ranks,
-                        fwd * batch * layout.cmp_max_blocks,
+                        fwd * layout.cmp_max_blocks,
                         layout.block_size,
                         1,
                         model.config.head_dim,
@@ -694,7 +667,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "idx_kv_cache": torch.empty(
                     (
                         ranks,
-                        csa * batch * layout.idx_max_blocks,
+                        csa * layout.idx_max_blocks,
                         layout.block_size,
                         1,
                         DEEPSEEK_V4_IDX_HEAD_DIM,
@@ -704,7 +677,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "idx_kv_scale": torch.empty(
                     (
                         ranks,
-                        csa * batch * layout.idx_max_blocks,
+                        csa * layout.idx_max_blocks,
                         layout.block_size,
                         1,
                         1,
@@ -714,7 +687,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "csa_compress_state": torch.empty(
                     (
                         ranks,
-                        csa * batch * layout.csa_state_max_blocks,
+                        csa * layout.csa_state_max_blocks,
                         layout.c4_state_block_size,
                         DEEPSEEK_V4_CSA_STATE_DIM,
                     ),
@@ -723,7 +696,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "csa_inner_compress_state": torch.empty(
                     (
                         ranks,
-                        csa * batch * layout.csa_inner_state_max_blocks,
+                        csa * layout.csa_inner_state_max_blocks,
                         layout.c4_state_block_size,
                         DEEPSEEK_V4_CSA_INNER_STATE_DIM,
                     ),
@@ -733,7 +706,7 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "hca_compress_state": torch.empty(
                     (
                         ranks,
-                        hca * batch * layout.hca_state_max_blocks,
+                        hca * layout.hca_state_max_blocks,
                         layout.c128_state_block_size,
                         DEEPSEEK_V4_HCA_STATE_DIM,
                     ),
@@ -756,15 +729,15 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 "position_ids": torch.empty((ranks, tokens), dtype=torch.int32),
                 "kv_seq_lens": torch.empty((ranks, batch), dtype=torch.int32),
                 "hca_compress_state_block_table": torch.empty(
-                    (ranks, batch, layout.hca_state_max_blocks),
+                    (ranks, batch, layout.prefill_hca_state_max_blocks),
                     dtype=torch.int32,
                 ),
                 "csa_compress_state_block_table": torch.empty(
-                    (ranks, batch, layout.csa_state_max_blocks),
+                    (ranks, batch, layout.prefill_csa_state_max_blocks),
                     dtype=torch.int32,
                 ),
                 "csa_inner_compress_state_block_table": torch.empty(
-                    (ranks, batch, layout.csa_inner_state_max_blocks),
+                    (ranks, batch, layout.prefill_csa_inner_state_max_blocks),
                     dtype=torch.int32,
                 ),
                 "cmp_block_table": torch.empty((ranks, batch, layout.cmp_max_blocks), dtype=torch.int32),
@@ -925,6 +898,10 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
             "KV_ORI_TABLE_MAX_BLOCKS": layout.ori_table_max_blocks,
             "KV_CMP_MAX_BLOCKS": layout.cmp_max_blocks,
             "IDX_CACHE_MAX_BLOCKS": layout.idx_max_blocks,
+            "ORI_KV_BLOCK_NUM": layout.decode_ori_max_blocks,
+            "HCA_STATE_PHYSICAL_BLOCKS": layout.hca_state_max_blocks,
+            "CSA_STATE_PHYSICAL_BLOCKS": layout.csa_state_max_blocks,
+            "CSA_INNER_STATE_PHYSICAL_BLOCKS": layout.csa_inner_state_max_blocks,
             "PREFILL_ORI_MAX_BLOCKS": layout.prefill_ori_max_blocks,
             "PREFILL_CMP_MAX_BLOCKS": layout.prefill_cmp_max_blocks,
             "PREFILL_IDX_MAX_BLOCKS": layout.prefill_idx_max_blocks,
@@ -937,13 +914,13 @@ class DeepSeekV4PyptoExecutor(CorePyptoExecutor):
                 mismatched.append(f"{name}={actual} expected {expected}")
         expected_module_constants = {
             "prefill_attention_hca.py": {
-                "HCA_STATE_BLOCK_NUM": layout.prefill_hca_state_max_blocks,
+                "HCA_STATE_BLOCK_NUM": layout.hca_state_max_blocks,
                 "HCA_STATE_MAX_BLOCKS": layout.prefill_hca_state_max_blocks,
             },
             "prefill_attention_csa.py": {
-                "CSA_STATE_BLOCK_NUM": layout.prefill_csa_state_max_blocks,
+                "CSA_STATE_BLOCK_NUM": layout.csa_state_max_blocks,
                 "CSA_STATE_MAX_BLOCKS": layout.prefill_csa_state_max_blocks,
-                "INNER_STATE_BLOCK_NUM": layout.prefill_csa_inner_state_max_blocks,
+                "INNER_STATE_BLOCK_NUM": layout.csa_inner_state_max_blocks,
                 "INNER_STATE_MAX_BLOCKS": layout.prefill_csa_inner_state_max_blocks,
             },
         }
