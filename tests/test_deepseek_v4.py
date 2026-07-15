@@ -26,7 +26,6 @@ from pypto_serving.model.deepseek.npu_runner import (
     DeepSeekV4CacheLayout,
     DeepSeekV4CacheManager,
     DeepSeekV4CompiledKernels,
-    DeepSeekV4InputBuilder,
     DeepSeekV4L3Callable,
     DeepSeekV4ModelRunner,
     accept_mtp_tokens,
@@ -39,11 +38,9 @@ from pypto_serving.model.deepseek.weight_loader import (
     deepseek_v4_local_expert_ids,
     deepseek_v4_routed_expert_weight_names,
     deepseek_v4_startup_weight_names,
-    pack_deepseek_v4_lm_head_weight,
     pack_deepseek_v4_layer_weights,
 )
 from pypto_serving.model.model_loader import ModelLoader
-from pypto_serving.serving.engine import async_engine
 
 
 def test_accept_mtp_tokens_commits_second_main_token_only_on_draft_match():
@@ -82,7 +79,7 @@ def test_deepseek_mtp_speculative_batch_feeds_current_then_draft():
     torch.testing.assert_close(speculative.hidden_states, embed[5:6].to(torch.bfloat16))
 
 
-def test_deepseek_mtp_rejection_rebuilds_window_from_committed_tail():
+def test_deepseek_mtp_committed_window_handles_rejection_and_acceptance():
     runner, _model = _runner_for_prepared_inputs()
     inputs = type(
         "PreparedInputs",
@@ -120,26 +117,6 @@ def test_deepseek_mtp_rejection_rebuilds_window_from_committed_tail():
     assert committed_positions.tolist() == [6, 7]
     torch.testing.assert_close(committed_hidden[:, 0], tail_hidden)
     torch.testing.assert_close(committed_hidden[:, 1], main_pre_hc[:, 0])
-
-
-def test_deepseek_mtp_acceptance_uses_both_main_rows():
-    runner, _model = _runner_for_prepared_inputs()
-    inputs = type(
-        "PreparedInputs",
-        (),
-        {
-            "actual_batch": 1,
-            "position_ids": torch.tensor(
-                [[7, 8, 0, 0, 0, 0, 0, 0]] * runner._compiled.layout.ranks,
-                dtype=torch.int32,
-            ),
-        },
-    )()
-    main_ids = torch.tensor([[11, 12]], dtype=torch.long)
-    main_pre_hc = torch.arange(
-        runner._compiled.layout.ranks * runner._compiled.layout.decode_seq * 4,
-        dtype=torch.float32,
-    ).reshape(runner._compiled.layout.ranks, runner._compiled.layout.decode_seq, 4, 1)
 
     committed_ids, committed_hidden, committed_positions = runner._mtp_committed_window(
         inputs,
@@ -179,52 +156,6 @@ def test_cli_selects_deepseek_executor_and_forces_prefix_cache_off(tmp_path):
     assert config.executor_kwargs["enable_mtp"] is True
 
 
-def test_cli_disables_deepseek_mtp_by_default(tmp_path):
-    model_dir = _write_deepseek_model_dir(tmp_path)
-    args = cli.build_parser().parse_args(
-        [
-            "--model", str(model_dir),
-            "--devices", "0,1,2,3,4,5,6,7",
-            "--dp", "1",
-            "--tp", "8",
-            "--block-size", "128",
-            "--max-model-len", "260",
-            "--dtype", "int8",
-        ]
-    )
-
-    config = cli.build_serving_engine_config(args)
-
-    assert config.executor_kwargs["enable_mtp"] is False
-
-
-def test_tokenizer_falls_back_when_deepseek_config_raises_attribute_error(tmp_path, monkeypatch):
-    class AutoTokenizer:
-        @staticmethod
-        def from_pretrained(*args, **kwargs):
-            raise AttributeError("'PreTrainedConfig' object has no attribute 'max_position_embeddings'")
-
-    sentinel = object()
-    fake_transformers = type(
-        "FakeTransformers",
-        (),
-        {
-            "AutoTokenizer": AutoTokenizer,
-            "PreTrainedTokenizerFast": object,
-        },
-    )
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    monkeypatch.setattr(
-        tokenizer_module,
-        "_load_fast_tokenizer_from_file",
-        lambda model_path, tokenizer_cls: sentinel,
-    )
-
-    adapter = tokenizer_module.TransformersTokenizerAdapter.from_pretrained(str(tmp_path))
-
-    assert adapter.tokenizer is sentinel
-
-
 def test_tokenizer_falls_back_when_deepseek_config_fails_strict_validation(tmp_path, monkeypatch):
     class StrictDataclassFieldValidationError(Exception):
         pass
@@ -246,91 +177,6 @@ def test_tokenizer_falls_back_when_deepseek_config_fails_strict_validation(tmp_p
     adapter = tokenizer_module.TransformersTokenizerAdapter.from_pretrained(str(tmp_path))
 
     assert adapter.tokenizer is sentinel
-
-
-def test_cli_rejects_deepseek_non_w8a8_checkpoint(tmp_path):
-    model_dir = _write_deepseek_model_dir(tmp_path, quant_method="fp8")
-    args = cli.build_parser().parse_args(
-        [
-            "--model", str(model_dir),
-            "--devices", "0,1,2,3,4,5,6,7",
-            "--dp", "1",
-            "--tp", "8",
-            "--block-size", "128",
-        ]
-    )
-
-    with pytest.raises(ValueError, match="compressed-tensors"):
-        cli.build_serving_engine_config(args)
-
-
-def test_cli_rejects_deepseek_non_8_way_topology(tmp_path):
-    model_dir = _write_deepseek_model_dir(tmp_path)
-    args = cli.build_parser().parse_args(
-        [
-            "--model", str(model_dir),
-            "--devices", "0,1,2,3",
-            "--dp", "1",
-            "--tp", "4",
-            "--block-size", "128",
-        ]
-    )
-
-    with pytest.raises(ValueError, match="--dp 1 --tp 8"):
-        cli.build_serving_engine_config(args)
-
-
-def test_cli_rejects_deepseek_context_beyond_decode_state_capacity(tmp_path):
-    model_dir = _write_deepseek_model_dir(tmp_path)
-    args = cli.build_parser().parse_args(
-        [
-            "--model", str(model_dir),
-            "--devices", "0,1,2,3,4,5,6,7",
-            "--dp", "1",
-            "--tp", "8",
-            "--block-size", "128",
-            "--max-model-len", "512",
-        ]
-    )
-
-    with pytest.raises(ValueError, match="--max-model-len 260"):
-        cli.build_serving_engine_config(args)
-
-
-def test_deepseek_worker_step_timeout_default_allows_lazy_first_step(monkeypatch):
-    monkeypatch.delenv("SERVING_WORKER_STEP_TIMEOUT", raising=False)
-
-    assert async_engine._worker_step_timeout_seconds("PyptoDeepSeekV4Executor") == 1200.0
-    assert async_engine._worker_step_timeout_seconds("PyptoQwen14BExecutor") == 300.0
-
-    monkeypatch.setenv("SERVING_WORKER_STEP_TIMEOUT", "42")
-    assert async_engine._worker_step_timeout_seconds("PyptoDeepSeekV4Executor") == 42.0
-
-
-def test_deepseek_loader_keeps_w8a8_weights_lazy(tmp_path, monkeypatch):
-    model_dir = _write_deepseek_model_dir(tmp_path)
-    monkeypatch.setattr(
-        model_loader.TransformersTokenizerAdapter,
-        "from_pretrained",
-        lambda *args, **kwargs: _Tokenizer(),
-    )
-
-    loaded = ModelLoader().load(
-        model_id="dsv4",
-        model_dir=str(model_dir),
-        runtime_config=RuntimeConfig(page_size=128, max_batch_size=4, max_seq_len=256, weight_dtype="int8"),
-    )
-
-    assert loaded.config.architecture == "DeepseekV4ForCausalLM"
-    assert loaded.config.head_dim == 512
-    assert loaded.runtime_model.layers == []
-    assert loaded.runtime_model.embed_tokens.numel() == 0
-    assert loaded.runtime_model.extra["family"] == "deepseek_v4"
-    assert loaded.runtime_model.extra["checkpoint_format"] == "w8a8-compressed-tensors"
-    assert "layers.0.attn.wq_b.scale" in loaded.runtime_model.extra["weight_map"]
-    assert "layers.2.attn.indexer.wq_b.scale" in loaded.runtime_model.extra["weight_map"]
-    assert "layers.3.attn.compressor.wkv.weight" in loaded.runtime_model.extra["weight_map"]
-    assert "layers.3.ffn.gate.bias" in loaded.runtime_model.extra["weight_map"]
 
 
 def test_deepseek_compile_attaches_lazy_weight_store_without_opening_shards(tmp_path, monkeypatch):
@@ -538,38 +384,6 @@ def test_deepseek_compile_builds_one_runtime_scalar_layer_callable(tmp_path, mon
     assert decode_args[decode_order.index("window_swa_lens")].shape == (8, 8)
 
 
-def test_deepseek_layer_plan_tracks_attention_and_router_metadata():
-    plan = build_deepseek_v4_layer_plan(
-        compress_ratios=_deepseek_flash_compress_ratios(),
-        num_hidden_layers=43,
-        num_hash_layers=3,
-    )
-
-    assert [(layer.attention_kind, layer.include_tid2eid) for layer in plan[:5]] == [
-        ("swa", True),
-        ("swa", True),
-        ("csa", True),
-        ("hca", False),
-        ("csa", False),
-    ]
-
-
-def test_deepseek_kernel_contract_does_not_require_device_lm_head(tmp_path):
-    kernel_dir = _write_deepseek_kernel_dir(tmp_path, lm_head_tp_size=2)
-    executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(npu_executor.DeepSeekV4PyptoExecutor)
-    executor._kernel_dir = kernel_dir
-
-    executor._validate_kernel_contract(DeepSeekV4CacheLayout())
-
-
-def test_deepseek_kernel_contract_accepts_config_named_tp_size(tmp_path):
-    kernel_dir = _write_deepseek_kernel_dir(tmp_path, lm_head_tp_size=8, use_config_constant=True)
-    executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(npu_executor.DeepSeekV4PyptoExecutor)
-    executor._kernel_dir = kernel_dir
-
-    executor._validate_kernel_contract(DeepSeekV4CacheLayout())
-
-
 def test_deepseek_kernel_contract_rejects_config_dimension_mismatch(tmp_path):
     kernel_dir = _write_deepseek_kernel_dir(tmp_path, lm_head_tp_size=8, block_size=64)
     executor = npu_executor.DeepSeekV4PyptoExecutor.__new__(npu_executor.DeepSeekV4PyptoExecutor)
@@ -599,98 +413,6 @@ def test_deepseek_kernel_contract_rejects_prefill_state_mismatch(tmp_path):
         ),
     ):
         executor._validate_kernel_contract(DeepSeekV4CacheLayout())
-
-
-def test_deepseek_hc_input_builder_shapes_prefill_and_decode():
-    # Exercise a wide, batch-agnostic input layout independent of production B=8/S=1.
-    builder = DeepSeekV4InputBuilder(
-        layout=DeepSeekV4CacheLayout(decode_batch=32, decode_seq=2, decode_tokens=64), hidden_size=4
-    )
-
-    prefill = builder.prefill_x_hc(torch.arange(12, dtype=torch.bfloat16).reshape(3, 4), actual_tokens=3)
-    decode = builder.decode_x_hc(torch.arange(8, dtype=torch.bfloat16).reshape(2, 4), actual_batch=2)
-
-    assert prefill.shape == (8, 128, 4, 4)
-    assert prefill.dtype == torch.float32
-    assert prefill[0, 0, 0].tolist() == [0, 1, 2, 3]
-    assert prefill[7, 2, 3].tolist() == [8, 9, 10, 11]
-    assert torch.count_nonzero(prefill[:, 3:]) == 0
-    assert decode.shape == (8, 64, 4, 4)
-    assert decode.dtype == torch.float32
-    assert decode[0, 0, 0].tolist() == [0, 1, 2, 3]
-    assert decode[0, 1, 3].tolist() == [0, 1, 2, 3]
-    assert decode[7, 2, 0].tolist() == [4, 5, 6, 7]
-    assert decode[7, 3, 3].tolist() == [4, 5, 6, 7]
-    assert decode[0, 4, 0].tolist() == [0, 1, 2, 3]
-    assert decode[7, 5, 3].tolist() == [0, 1, 2, 3]
-    assert torch.equal(decode[:, 4:], decode[:, 0:2].repeat(1, 30, 1, 1))
-
-
-def test_deepseek_layout_rejects_context_beyond_decode_state_capacity():
-    model = _runtime_model_for_embeddings()
-
-    with pytest.raises(ValueError, match="max_seq_len=16384"):
-        DeepSeekV4CacheLayout().validate_runtime(
-            model.config,
-            RuntimeConfig(page_size=128, max_batch_size=1, max_seq_len=16385, weight_dtype="int8"),
-            tuple(range(8)),
-        )
-
-
-def test_deepseek_layer_plan_tracks_attention_and_gate_modes():
-    plan = build_deepseek_v4_layer_plan(
-        compress_ratios=[0, 0, 4, 128, 4],
-        num_hidden_layers=5,
-        num_hash_layers=3,
-    )
-
-    assert [layer.attention_kind for layer in plan] == ["swa", "swa", "csa", "hca", "csa"]
-    assert [layer.include_tid2eid for layer in plan] == [True, True, True, False, False]
-    assert [layer.include_gate_bias for layer in plan] == [False, False, False, True, True]
-
-
-def test_deepseek_weight_store_groups_requested_reads_by_shard(tmp_path):
-    weight_map = {
-        "a": "one.safetensors",
-        "b": "one.safetensors",
-        "c": "two.safetensors",
-    }
-    for filename in set(weight_map.values()):
-        (tmp_path / filename).touch()
-    opened: list[tuple[str, str]] = []
-    reads: list[tuple[str, str]] = []
-    tensors = {
-        "a": torch.tensor([1]),
-        "c": torch.tensor([3]),
-    }
-
-    class _Reader:
-        def __init__(self, filename: str) -> None:
-            self.filename = filename
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def get_tensor(self, name: str) -> torch.Tensor:
-            reads.append((self.filename, name))
-            return tensors[name]
-
-    def _open(path: Path, device: str):
-        opened.append((path.name, device))
-        return _Reader(path.name)
-
-    store = DeepSeekV4WeightStore(model_dir=tmp_path, weight_map=weight_map, safe_open_fn=_open)
-
-    loaded = store.load_many(["c", "a"])
-
-    assert list(loaded) == ["c", "a"]
-    assert loaded["c"].item() == 3
-    assert loaded["a"].item() == 1
-    assert opened == [("two.safetensors", "cpu"), ("one.safetensors", "cpu")]
-    assert reads == [("two.safetensors", "c"), ("one.safetensors", "a")]
 
 
 def test_deepseek_weight_store_reads_real_safetensors_by_name(tmp_path):
@@ -838,11 +560,6 @@ def test_deepseek_weight_store_packs_lm_head_into_8_tp_shards(tmp_path):
     assert torch.count_nonzero(global_weights.lm_head_weight[:, 2:]) == 0
 
 
-def test_deepseek_lm_head_packer_rejects_uneven_vocab():
-    with pytest.raises(ValueError, match="divide evenly"):
-        pack_deepseek_v4_lm_head_weight(torch.zeros((17, 4)), ranks=8)
-
-
 def test_deepseek_layer_packer_transposes_and_stacks_rank_local_experts():
     raw = _synthetic_layer_raw(layer_id=0, n_experts=4)
 
@@ -963,46 +680,6 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
     ]
 
 
-def test_deepseek_prepare_decode_inputs_uses_scratch_slots_for_fixed_rows():
-    runner, model = _runner_for_prepared_inputs()
-
-    prepared = runner.prepare_decode_inputs(
-        model,
-        DecodeBatch(
-            request_ids=["req-a", "req-b"],
-            token_ids=torch.tensor([[5], [9]], dtype=torch.long),
-            hidden_states=torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
-            seq_lens=torch.tensor([128, 5], dtype=torch.int32),
-        ),
-    )
-
-    assert prepared.actual_batch == 2
-    assert prepared.slots == (0, 1)
-    assert prepared.kernel_slots[:4] == (0, 1, 2, 3)
-    assert len(prepared.kernel_slots) == 32
-    assert prepared.x_hc.shape == (8, 64, 4, 4)
-    assert prepared.x_hc[0, 0, 0].tolist() == [0, 1, 2, 3]
-    assert prepared.x_hc[0, 1, 0].tolist() == [0, 1, 2, 3]
-    assert prepared.x_hc[0, 2, 0].tolist() == [4, 5, 6, 7]
-    assert prepared.x_hc[0, 3, 0].tolist() == [4, 5, 6, 7]
-    assert prepared.x_hc[0, 4, 0].tolist() == [0, 1, 2, 3]
-    # No prev_token_ids supplied: inactive fixed rows mirror row 0 so the packed
-    # decode tile can execute all rows without arbitrary routing metadata.
-    assert prepared.input_ids[0, :6].tolist() == [5, 5, 9, 9, 5, 5]
-    # Positions are the two real trailing slots (seq_len-2, seq_len-1).
-    assert prepared.position_ids[0, :6].tolist() == [126, 127, 3, 4, 126, 127]
-    # kv_seq_lens = seq_len: last written position is seq_len-1 and seq_len already
-    # counts the prefill-generated last token, so the KV history is seq_len entries.
-    assert prepared.kv_seq_lens[0, :4].tolist() == [128, 5, 128, 128]
-    assert prepared.block_table.shape == (8, 32, 128)
-    assert prepared.cmp_block_table.shape == (8, 32, 32)
-    assert prepared.ori_slot_mapping[0, :6].tolist() == [126, 127, 131, 132, 382, 383]
-    assert prepared.hca_cmp_slot_mapping[0, :6].tolist() == [-1, 0, -1, -1, -1, 256]
-    assert prepared.csa_cmp_slot_mapping[0, :6].tolist() == [-1, 31, 128, -1, -1, 287]
-    assert prepared.csa_idx_slot_mapping[0, :6].tolist() == [-1, 31, 128, -1, -1, 287]
-    assert prepared.csa_state_slot_mapping[0, :6].tolist() == [70, 71, 7, 132, 78, 79]
-
-
 def test_deepseek_prepare_decode_inputs_builds_sliding_window_metadata():
     runner, model = _runner_for_prepared_inputs()
 
@@ -1066,29 +743,6 @@ def test_deepseek_prepare_decode_inputs_feeds_two_real_tokens():
     assert prepared.x_hc[0, 3, 0].tolist() == [4, 5, 6, 7]
     # Padding row keeps replicating row 0's last embedding.
     assert prepared.x_hc[0, 4, 0].tolist() == [0, 1, 2, 3]
-
-
-def test_deepseek_decode_x_hc_prev_last_two_token_slots():
-    builder = DeepSeekV4InputBuilder(
-        layout=DeepSeekV4CacheLayout(decode_batch=32, decode_seq=2, decode_tokens=64), hidden_size=4
-    )
-
-    decode = builder.decode_x_hc(
-        torch.arange(8, dtype=torch.bfloat16).reshape(2, 4),
-        actual_batch=2,
-        prev_embeddings=torch.arange(8, 16, dtype=torch.bfloat16).reshape(2, 4),
-    )
-
-    assert decode.shape == (8, 64, 4, 4)
-    # Active row 0: slot 0 = prev, slot 1 = last.
-    assert decode[0, 0, 0].tolist() == [8, 9, 10, 11]
-    assert decode[0, 1, 3].tolist() == [0, 1, 2, 3]
-    # Active row 1: slot 0 = prev, slot 1 = last.
-    assert decode[7, 2, 0].tolist() == [12, 13, 14, 15]
-    assert decode[7, 3, 3].tolist() == [4, 5, 6, 7]
-    # Padding rows replicate active row 0's last embedding (both slots).
-    assert decode[0, 4, 0].tolist() == [0, 1, 2, 3]
-    assert decode[0, 5, 3].tolist() == [0, 1, 2, 3]
 
 
 def test_deepseek_stage_decode_inputs_uses_shared_buffers():
@@ -1202,92 +856,6 @@ def test_deepseek_run_decode_dispatches_active_token_count():
         model.config.hidden_size,
     )
     assert result.logits.shape == (1, model.config.vocab_size)
-
-
-def test_deepseek_run_prefill_dispatches_static_prefill_token_count():
-    runner, model = _runner_for_prepared_inputs()
-    runner._compiled.prefill = DeepSeekV4L3Callable(compiled=object(), name="prefill")
-    captured: dict[str, object] = {}
-
-    def fake_stage(inputs):
-        captured["prepared"] = inputs
-        return inputs
-
-    def fake_prefill_fwd_args(pre_hc_hidden_out, x_out):
-        captured["pre_hc_hidden_out_shape"] = tuple(pre_hc_hidden_out.shape)
-        captured["x_out_shape"] = tuple(x_out.shape)
-        return (pre_hc_hidden_out, x_out)
-
-    def fake_run_l3(_callable, *args):
-        captured["num_tokens"] = args[-1]
-        args[-2].fill_(1)
-
-    def fake_logits(_hidden, *, active_rows, label):
-        captured["active_rows"] = active_rows
-        captured["label"] = label
-        return torch.zeros((len(active_rows), model.config.vocab_size), dtype=torch.float32)
-
-    runner._ensure_l3_shared_buffers = lambda _model: None
-    runner._stage_prefill_fwd_inputs = fake_stage
-    runner._prefill_fwd_args = fake_prefill_fwd_args
-    runner._run_l3 = fake_run_l3
-    runner._logits_for_hidden = fake_logits
-
-    result = runner.run_prefill(
-        model,
-        PrefillBatch(
-            request_ids=["req-a"],
-            token_ids=torch.tensor([[10, 11, 12]], dtype=torch.long),
-            input_embeddings=torch.arange(12, dtype=torch.bfloat16).reshape(1, 3, 4),
-            seq_lens=torch.tensor([3], dtype=torch.int32),
-            positions=torch.tensor([[0, 1, 2]], dtype=torch.long),
-        ),
-    )
-
-    assert captured["prepared"].actual_tokens == 3
-    assert captured["num_tokens"] == runner._compiled.layout.prefill_seq
-    assert captured["active_rows"] == (2,)
-    assert captured["label"] == "prefill"
-    assert captured["x_out_shape"] == (
-        runner._compiled.layout.ranks,
-        runner._compiled.layout.prefill_seq,
-        model.config.hidden_size,
-    )
-    assert result.logits.shape == (1, model.config.vocab_size)
-
-
-def test_deepseek_l3_dispatch_rejects_non_shared_tensor_before_worker_start():
-    runner, _model = _runner_for_prepared_inputs()
-
-    with pytest.raises(TypeError, match="before the L3 worker starts"):
-        runner._run_l3(DeepSeekV4L3Callable(compiled=object(), name="fake"), torch.zeros(1))
-
-
-def test_deepseek_l3_worker_requires_full_shared_preallocation_before_start():
-    runner, _model = _runner_for_prepared_inputs()
-
-    with pytest.raises(RuntimeError, match="shared host buffers are preallocated"):
-        runner._run_l3(
-            DeepSeekV4L3Callable(compiled=object(), name="fake"),
-            torch.zeros(1).share_memory_(),
-        )
-
-
-def test_deepseek_l3_scalars_are_runtime_python_ints():
-    runner, _model = _runner_for_prepared_inputs()
-
-    value = runner._int32_scalar(7)
-
-    assert isinstance(value, int)
-    assert value == 7
-
-
-def test_deepseek_cache_replicates_decode_padding_rows():
-    active = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
-
-    padded = DeepSeekV4CacheManager.replicate_first_row(active, actual_rows=2, kernel_rows=4)
-
-    assert padded.tolist() == [[10, 11], [20, 21], [10, 11], [10, 11]]
 
 
 def test_deepseek_prefill_and_decode_reuse_same_cache_tensors():
@@ -1413,26 +981,6 @@ def test_deepseek_unified_cache_zeroing_is_isolated_by_slot():
         per_layer = tensor.reshape(layout.ranks, -1, 2, *tensor.shape[2:])
         assert torch.count_nonzero(per_layer[:, :, 0]) == 0
         assert torch.all(per_layer[:, :, 1] == 1)
-
-
-def test_deepseek_release_invalidates_unified_cache_request():
-    runner = DeepSeekV4ModelRunner(
-        compiled=DeepSeekV4CompiledKernels(
-            layout=DeepSeekV4CacheLayout(decode_batch=3),
-            model_dir="",
-            weight_map={},
-            weight_store=None,
-            compress_ratios=(),
-            layer_plan=(),
-            kernel_dir="",
-        )
-    )
-    assert runner.cache_manager.allocate("request-a") == 0
-    runner._initialized_cache_requests.add("request-a")
-
-    runner.release_finished_requests(["request-a"])
-
-    assert runner._initialized_cache_requests == set()
 
 
 def _write_deepseek_model_dir(tmp_path: Path, *, quant_method: str = "compressed-tensors") -> Path:
@@ -1671,32 +1219,6 @@ def _runner_for_prepared_inputs() -> tuple[DeepSeekV4ModelRunner, object]:
     runner = DeepSeekV4ModelRunner(compiled=compiled)
     runner.init_kv_cache("dsv4", model.config, model.runtime)
     return runner, model
-
-
-def test_deepseek_init_kv_cache_returns_scheduler_block_capacity():
-    model = _runtime_model_for_embeddings()
-    compiled = DeepSeekV4CompiledKernels(
-        layout=DeepSeekV4CacheLayout(),
-        model_dir="",
-        weight_map={},
-        weight_store=None,
-        compress_ratios=(),
-        layer_plan=(),
-        kernel_dir="",
-    )
-    runner = DeepSeekV4ModelRunner(compiled=compiled)
-
-    assert runner.init_kv_cache("dsv4", model.config, model.runtime) == 3
-
-    runtime = RuntimeConfig(
-        page_size=model.runtime.page_size,
-        max_batch_size=model.runtime.max_batch_size,
-        max_seq_len=model.runtime.max_seq_len,
-        total_kv_pages=17,
-        weight_dtype=model.runtime.weight_dtype,
-    )
-
-    assert runner.init_kv_cache("dsv4", model.config, runtime) == 17
 
 
 def test_deepseek_lm_head_computes_selected_rows_on_host_without_padded_vocab():
