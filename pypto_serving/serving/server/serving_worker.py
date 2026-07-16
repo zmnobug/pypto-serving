@@ -179,7 +179,7 @@ class WorkerProcess:
     def _execute_step(self, scheduler_output) -> StepOutput:
         """Execute one batch step (may contain prefill + decode requests)."""
         runtime_model = self.model_record.runtime_model
-        new_tokens: dict[str, int] = {}
+        new_tokens: dict[str, int | list[int]] = {}
 
         prefill_requests = [
             sr for sr in scheduler_output.scheduled_requests if sr.is_prefill
@@ -202,7 +202,7 @@ class WorkerProcess:
         return StepOutput(new_tokens=new_tokens)
 
     def _batch_prefill(
-        self, scheduled: list, runtime_model, new_tokens: dict[str, int]
+        self, scheduled: list, runtime_model, new_tokens: dict[str, int | list[int]]
     ) -> None:
         with profile_span(
             "WorkerProcess.batch_prefill",
@@ -297,7 +297,7 @@ class WorkerProcess:
                     new_tokens[request.request_id] = token_id
 
     def _batch_decode(
-        self, scheduled: list, runtime_model, new_tokens: dict[str, int]
+        self, scheduled: list, runtime_model, new_tokens: dict[str, int | list[int]]
     ) -> None:
         with profile_span(
             "WorkerProcess.batch_decode",
@@ -368,6 +368,9 @@ class WorkerProcess:
 
             for i, sr in enumerate(scheduled):
                 request = sr.request
+                if decode_result.accepted_token_ids is not None:
+                    new_tokens[request.request_id] = decode_result.accepted_token_ids[i]
+                    continue
                 # logits is None on the device-greedy path (the row is taken from
                 # sampled_token_ids in _sample_result_row); only index it otherwise.
                 logits = None

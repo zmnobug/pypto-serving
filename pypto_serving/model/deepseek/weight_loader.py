@@ -204,6 +204,20 @@ class DeepSeekV4StackedLayerWeights:
         return tuple(self.tensors[name] for name in names)
 
 
+@dataclass(frozen=True)
+class DeepSeekV4MtpWeights:
+    """Rank-stacked weights consumed by ``l3_mtp_decode_layer``."""
+
+    tensors: Mapping[str, torch.Tensor]
+
+    def args(self, names: Sequence[str]) -> tuple[torch.Tensor, ...]:
+        """Return MTP tensors in kernel host order."""
+        missing = [name for name in names if name not in self.tensors]
+        if missing:
+            raise KeyError(f"Packed DeepSeekV4 MTP weights are missing tensors: {', '.join(missing)}")
+        return tuple(self.tensors[name] for name in names)
+
+
 def deepseek_v4_lm_head_layout(
     *,
     vocab_size: int,
@@ -383,6 +397,34 @@ def deepseek_v4_startup_weight_names(
     return tuple(dict.fromkeys(names))
 
 
+def deepseek_v4_mtp_startup_weight_names(n_routed_experts: int) -> tuple[str, ...]:
+    """Return the lightweight startup contract for the single MTP draft layer."""
+    edge_experts = tuple(dict.fromkeys((0, n_routed_experts - 1)))
+    layer_names = [
+        name.replace("layers.0", "mtp.0", 1)
+        for name in deepseek_v4_layer_weight_names(
+            0,
+            n_routed_experts=n_routed_experts,
+            compress_ratio=0,
+            include_gate_bias=True,
+            expert_ids=edge_experts,
+        )
+    ]
+    projection_and_head = (
+        "mtp.0.enorm.weight",
+        "mtp.0.hnorm.weight",
+        "mtp.0.e_proj.weight",
+        "mtp.0.e_proj.scale",
+        "mtp.0.h_proj.weight",
+        "mtp.0.h_proj.scale",
+        "mtp.0.hc_head_fn",
+        "mtp.0.hc_head_scale",
+        "mtp.0.hc_head_base",
+        "mtp.0.norm.weight",
+    )
+    return tuple(dict.fromkeys((*layer_names, *projection_and_head)))
+
+
 class DeepSeekV4WeightStore:
     """Lazy name-based safetensors access for DeepSeekV4 W8A8 checkpoints."""
 
@@ -440,6 +482,10 @@ class DeepSeekV4WeightStore:
                 num_hash_layers=num_hash_layers,
             )
         )
+
+    def validate_mtp_startup_contract(self, *, n_routed_experts: int) -> None:
+        """Validate MTP metadata without opening checkpoint shards."""
+        self.require(deepseek_v4_mtp_startup_weight_names(n_routed_experts))
 
     def load_tensor(self, name: str) -> torch.Tensor:
         """Load one tensor by name, leaving all unrelated shard tensors untouched."""
@@ -613,6 +659,70 @@ class DeepSeekV4WeightStore:
             )
         return stack_deepseek_v4_layer_weights(per_layer, compress_ratios=compress_ratios)
 
+    def load_mtp_weights(
+        self,
+        *,
+        ranks: int,
+        n_routed_experts: int,
+    ) -> DeepSeekV4MtpWeights:
+        """Load and pack the checkpoint's single ``mtp.0`` draft layer."""
+        prefix = "mtp.0"
+        layer_names = [
+            name.replace("layers.0", prefix, 1)
+            for name in deepseek_v4_layer_weight_names(
+                0,
+                n_routed_experts=n_routed_experts,
+                compress_ratio=0,
+                include_gate_bias=True,
+            )
+        ]
+        extra_names = (
+            f"{prefix}.enorm.weight",
+            f"{prefix}.hnorm.weight",
+            f"{prefix}.e_proj.weight",
+            f"{prefix}.e_proj.scale",
+            f"{prefix}.h_proj.weight",
+            f"{prefix}.h_proj.scale",
+            f"{prefix}.hc_head_fn",
+            f"{prefix}.hc_head_scale",
+            f"{prefix}.hc_head_base",
+            f"{prefix}.norm.weight",
+        )
+        raw = self.load_many((*layer_names, *extra_names))
+        packed_layer = pack_deepseek_v4_layer_weights(
+            0,
+            raw,
+            ranks=ranks,
+            n_routed_experts=n_routed_experts,
+            compress_ratio=0,
+            include_tid2eid=False,
+            include_gate_bias=True,
+            prefix=prefix,
+        )
+
+        def replicated(name: str, dtype: torch.dtype) -> torch.Tensor:
+            tensor = raw[f"{prefix}.{name}"].to(dtype=dtype).contiguous().cpu()
+            return tensor.unsqueeze(0).expand(ranks, *tensor.shape).contiguous()
+
+        tensors = dict(packed_layer.tensors)
+        tensors.update(
+            {
+                "enorm_w": replicated("enorm.weight", torch.float32),
+                "hnorm_w": replicated("hnorm.weight", torch.float32),
+                "e_proj_w": replicated("e_proj.weight", torch.int8),
+                "e_proj_w_scale": replicated("e_proj.scale", torch.float32),
+                "e_proj_smooth": torch.ones((ranks, _DEEPSEEK_V4_HIDDEN_SIZE), dtype=torch.float32),
+                "h_proj_w": replicated("h_proj.weight", torch.int8),
+                "h_proj_w_scale": replicated("h_proj.scale", torch.float32),
+                "h_proj_smooth": torch.ones((ranks, _DEEPSEEK_V4_HIDDEN_SIZE), dtype=torch.float32),
+                "mtp_hc_head_fn": replicated("hc_head_fn", torch.float32),
+                "mtp_hc_head_scale": replicated("hc_head_scale", torch.float32),
+                "mtp_hc_head_base": replicated("hc_head_base", torch.float32),
+                "mtp_norm_w": replicated("norm.weight", torch.bfloat16),
+            }
+        )
+        return DeepSeekV4MtpWeights(tensors=tensors)
+
 
 def stack_deepseek_v4_layer_weights(
     per_layer: Sequence[DeepSeekV4PackedLayerWeights],
@@ -663,9 +773,10 @@ def pack_deepseek_v4_layer_weights(
     compress_ratio: int,
     include_tid2eid: bool,
     include_gate_bias: bool,
+    prefix: str | None = None,
 ) -> DeepSeekV4PackedLayerWeights:
     """Pack raw checkpoint tensors for one layer into rank-stacked kernel tensors."""
-    prefix = f"layers.{int(layer_id)}"
+    prefix = f"layers.{int(layer_id)}" if prefix is None else prefix
 
     def get(suffix: str) -> torch.Tensor:
         name = f"{prefix}.{suffix}"

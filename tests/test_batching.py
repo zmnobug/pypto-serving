@@ -40,7 +40,14 @@ from pypto_serving.model.qwen.npu_runner import (
 from pypto_serving.serving.engine.async_engine import ReplicaEngineCore, TokenOutput
 from pypto_serving.serving.engine.engine import LLMEngine
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
-from pypto_serving.serving.sched.scheduler import Request, ScheduledRequest
+from pypto_serving.serving.sched.scheduler import (
+    Request,
+    RequestStatus,
+    ScheduledRequest,
+    Scheduler,
+    SchedulerConfig,
+    SchedulerOutput,
+)
 from pypto_serving.serving.server.serving_worker import WorkerProcess
 from pypto_serving.worker.worker import WorkerTensor
 
@@ -56,6 +63,33 @@ class _Tokenizer:
 
     def decode(self, token_ids: list[int]) -> str:
         return " ".join(str(token_id) for token_id in token_ids)
+
+
+def test_scheduler_speculative_output_counts_only_tokens_retained_before_eos():
+    manager = KvCacheManager(num_blocks=4, block_size=2, enable_prefix_cache=False)
+    scheduler = Scheduler(SchedulerConfig(enable_prefix_cache=False), manager)
+    request = Request(
+        request_id="speculative",
+        prompt_token_ids=[1],
+        max_new_tokens=4,
+        eos_token_id=7,
+        num_computed_tokens=1,
+        status=RequestStatus.RUNNING,
+    )
+    scheduler.running.append(request)
+    scheduler.requests[request.request_id] = request
+    scheduled = SchedulerOutput(
+        scheduled_requests=[
+            ScheduledRequest(request=request, num_new_tokens=1, is_prefill=False)
+        ]
+    )
+
+    outputs = scheduler.update_from_output(scheduled, {request.request_id: [7, 8]})
+
+    assert request.output_token_ids == [7]
+    assert request.num_computed_tokens == 2
+    assert request.status is RequestStatus.FINISHED_EOS
+    assert [(output.new_token_id, output.finished) for output in outputs] == [(7, True)]
 
 
 def test_worker_step_error_queues_finished_ids_for_executor_release():

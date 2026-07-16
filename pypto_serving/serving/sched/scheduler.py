@@ -309,29 +309,43 @@ class Scheduler:
         return output
 
     def update_from_output(
-        self, scheduler_output: SchedulerOutput, new_token_ids: dict[str, int]
+        self,
+        scheduler_output: SchedulerOutput,
+        new_token_ids: dict[str, int | list[int]],
     ) -> list[RequestOutput]:
         """Update request states after model execution. Returns outputs for finished/streaming."""
         outputs: list[RequestOutput] = []
 
         for scheduled in scheduler_output.scheduled_requests:
             request = scheduled.request
-            request.num_computed_tokens += scheduled.num_new_tokens
-
-            self._cache_completed_blocks(request)
-
-            if request.is_prefill:
+            token_value = new_token_ids.get(request.request_id)
+            token_ids = (
+                []
+                if token_value is None
+                else [int(token_value)]
+                if isinstance(token_value, int)
+                else [int(token_id) for token_id in token_value]
+            )
+            if scheduled.is_prefill:
+                request.num_computed_tokens += scheduled.num_new_tokens
+                self._cache_completed_blocks(request)
                 if request.num_computed_tokens < request.num_prompt_tokens:
                     continue
-                token_id = new_token_ids.get(request.request_id)
-                if token_id is not None:
+                for token_id in token_ids:
                     request.output_token_ids.append(token_id)
                     outputs.append(RequestOutput(request_id=request.request_id, new_token_id=token_id))
+                    if self._check_finish(request) is not None:
+                        break
             else:
-                token_id = new_token_ids.get(request.request_id)
-                if token_id is not None:
+                retained_tokens = 0
+                for token_id in token_ids:
                     request.output_token_ids.append(token_id)
+                    retained_tokens += 1
                     outputs.append(RequestOutput(request_id=request.request_id, new_token_id=token_id))
+                    if self._check_finish(request) is not None:
+                        break
+                request.num_computed_tokens += retained_tokens
+                self._cache_completed_blocks(request)
 
         finished_ids: list[str] = []
         for request in self.running:
@@ -341,7 +355,7 @@ class Scheduler:
             if finish_reason is not None:
                 request.status = finish_reason
                 finished_ids.append(request.request_id)
-                for out in outputs:
+                for out in reversed(outputs):
                     if out.request_id == request.request_id:
                         out.finished = True
                         out.finish_reason = finish_reason.name

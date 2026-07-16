@@ -69,7 +69,11 @@ class TransformersTokenizerAdapter(TokenizerAdapter):
                 trust_remote_code=trust_remote_code,
                 use_fast=True,
             )
-        except (OSError, ValueError, AttributeError) as exc:
+        except Exception as exc:
+            if not isinstance(exc, (OSError, ValueError, AttributeError)) and (
+                type(exc).__name__ != "StrictDataclassFieldValidationError"
+            ):
+                raise
             logger.warning(
                 "AutoTokenizer.from_pretrained failed for %s: %s; falling back to local tokenizer.json",
                 model_path,
