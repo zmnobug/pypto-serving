@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
-from pypto.runtime import DeviceTensor
+from pypto.runtime import DeviceTensor, StackedDeviceTensor
 
 from pypto_serving.config.types import (
     DecodeBatch,
@@ -81,6 +81,18 @@ DEEPSEEK_V4_HC_EPS = 1e-6
 DEEPSEEK_V4_FWD_NUM_LAYERS = 43
 DEEPSEEK_V4_CSA_NUM_LAYERS = 21
 DEEPSEEK_V4_HCA_NUM_LAYERS = 20
+
+_RESIDENT_CACHE_TENSOR_NAMES = frozenset(
+    {
+        "kv_cache",
+        "cmp_kv",
+        "idx_kv_cache",
+        "idx_kv_scale",
+        "hca_compress_state",
+        "csa_compress_state",
+        "csa_inner_compress_state",
+    }
+)
 
 
 # Argument order for the packed all-43-layer ``l3_prefill_fwd`` kernel. This
@@ -853,9 +865,10 @@ class DeepSeekV4L3Callable:
 
 @dataclass
 class _StaticDeviceTensor:
-    """CPU tensor marker uploaded to the shared worker once."""
+    """Rank-stacked CPU tensor marker uploaded to every chip worker once."""
 
     tensor: torch.Tensor
+    cache_state: bool = False
 
 
 @dataclass
@@ -1106,7 +1119,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self.cache_manager = DeepSeekV4CacheManager(layout=compiled.layout)
         self.input_builder: DeepSeekV4InputBuilder | None = None
         self._l3_worker: Any | None = None
-        self._l3_static_tensors: dict[tuple[int, tuple[int, ...], torch.dtype], DeviceTensor] = {}
+        self._l3_static_tensors: dict[
+            tuple[int, tuple[int, ...], torch.dtype], StackedDeviceTensor
+        ] = {}
+        self._l3_cache_tensor_keys: set[tuple[int, tuple[int, ...], torch.dtype]] = set()
         self._decode_work_cache: DeepSeekV4LayerCache | None = None
         self._initialized_cache_requests: set[str] = set()
         self._global_weights: DeepSeekV4GlobalWeights | None = None
@@ -1116,6 +1132,8 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._prefill_fwd_buffers: _DeepSeekV4PrefillFwdSharedBuffers | None = None
         self._decode_buffers: _DeepSeekV4DecodeSharedBuffers | None = None
         self._stacked_weight_buffers: dict[str, torch.Tensor] | None = None
+        self._stacked_device_weights: dict[str, StackedDeviceTensor] | None = None
+        self._mtp_device_weights: dict[str, StackedDeviceTensor] | None = None
         self._hc_head_buffers: dict[str, torch.Tensor] | None = None
         self._decode_logits_buffer: torch.Tensor | None = None
         self._prefill_output_buffer: torch.Tensor | None = None
@@ -1160,6 +1178,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
                     100.0 * self._mtp_accepted_tokens / self._mtp_proposed_tokens,
                 )
             self._initialized_cache_requests.difference_update(request_ids)
+            # The host cache backing remains zeroed while kernels update the
+            # resident copies. Drop those device copies when their only
+            # supported serving request finishes, so a reused slot is uploaded
+            # from clean backing storage instead of inheriting stale KV/state.
+            if not self.cache_manager.active_slots:
+                self._invalidate_resident_cache_tensors()
             self._mtp_prefill_context = None
             self._mtp_draft_token_ids = None
             self._mtp_tail_token_id = None
@@ -1724,10 +1748,12 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._require_prefill_pre_hc_output_buffer(model.config.hidden_size)
         self._static_final_norm_weight_tensor()
         if self._stacked_weight_buffers is None:
-            self._stage_stacked_weights(self.load_stacked_layer_weights())
+            if self._stacked_device_weights is None:
+                self._stage_stacked_weights(self.load_stacked_layer_weights())
         self._hc_head_tensors()
         self._ensure_prefill_fwd_buffers(model.config.hidden_size)
         self._assert_l3_shared_buffers_preallocated()
+        self._materialize_resident_weights()
 
     def _assert_l3_shared_buffers_preallocated(self) -> None:
         missing = self._missing_l3_shared_buffers()
@@ -1746,7 +1772,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             "prefill_fwd_buffers": self._prefill_fwd_buffers,
             "decode_buffers": self._decode_buffers,
             "decode_work_cache": self._decode_work_cache,
-            "stacked_weight_buffers": self._stacked_weight_buffers,
+            "stacked_weights": self._stacked_weight_buffers or self._stacked_device_weights,
             "hc_head_buffers": self._hc_head_buffers,
             "prefill_output": self._prefill_output_buffer,
             "prefill_pre_hc_output": self._prefill_pre_hc_output_buffer,
@@ -1757,7 +1783,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             if value is None:
                 missing.append(name)
         if self._stacked_weight_buffers is not None and not self._stacked_weight_buffers:
-            missing.append("stacked_weight_buffers")
+            missing.append("stacked_weights")
         if self._hc_head_buffers is not None and not self._hc_head_buffers:
             missing.append("hc_head_buffers")
         return missing
@@ -1775,21 +1801,26 @@ class DeepSeekV4ModelRunner(ModelRunner):
         buffers = self._require_prefill_fwd_buffers()
         stacked = self._require_stacked_weights()
         hc_head = self._hc_head_tensors()
-        values = dict(stacked.tensors)
+        values = {
+            name: self._resident_stacked_arg(tensor)
+            for name, tensor in stacked.tensors.items()
+        }
         values.update(
             {
                 "x_hc": buffers.x_hc,
-                "freqs_cos": buffers.freqs_cos,
-                "freqs_sin": buffers.freqs_sin,
-                "hc_head_fn": hc_head["hc_head_fn"],
-                "hc_head_scale": hc_head["hc_head_scale"],
-                "hc_head_base": hc_head["hc_head_base"],
-                "final_norm_w": self._static_final_norm_weight_tensor(),
+                "freqs_cos": self._resident_stacked_arg(buffers.freqs_cos),
+                "freqs_sin": self._resident_stacked_arg(buffers.freqs_sin),
+                "hc_head_fn": self._resident_stacked_arg(hc_head["hc_head_fn"]),
+                "hc_head_scale": self._resident_stacked_arg(hc_head["hc_head_scale"]),
+                "hc_head_base": self._resident_stacked_arg(hc_head["hc_head_base"]),
+                "final_norm_w": self._resident_stacked_arg(self._static_final_norm_weight_tensor()),
                 "pre_hc_hidden_out": pre_hc_hidden_out,
                 "x_out": x_out,
             }
         )
         values.update(buffers.tensors)
+        for name in _RESIDENT_CACHE_TENSOR_NAMES:
+            values[name] = self._resident_stacked_arg(buffers.tensors[name], cache_state=True)
         return self._ordered_layer_args(values, _PREFILL_FWD_TENSOR_ORDER)
 
     def _decode_fwd_args(
@@ -1803,13 +1834,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
         cache = self._require_decode_work_cache()
         stacked = self._require_stacked_weights()
         hc_head = self._hc_head_tensors()
-        values = dict(stacked.tensors)
+        values = {
+            name: self._resident_stacked_arg(tensor)
+            for name, tensor in stacked.tensors.items()
+        }
         values.update(
             {
                 "x_hc": x_hc,
-                "freqs_cos": self._static_freqs_cos_tensor(),
-                "freqs_sin": self._static_freqs_sin_tensor(),
-                "kv_cache": cache.kv_cache,
+                "freqs_cos": self._resident_stacked_arg(self._static_freqs_cos_tensor()),
+                "freqs_sin": self._resident_stacked_arg(self._static_freqs_sin_tensor()),
+                "kv_cache": self._resident_stacked_arg(cache.kv_cache, cache_state=True),
                 "block_table": inputs.block_table,
                 "ori_slot_mapping": inputs.ori_slot_mapping,
                 "window_swa_indices": inputs.window_swa_indices,
@@ -1825,22 +1859,28 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "csa_inner_state_slot_mapping": inputs.csa_inner_state_slot_mapping,
                 "position_ids": inputs.position_ids,
                 "kv_seq_lens": inputs.kv_seq_lens,
-                "hca_compress_state": cache.hca_compress_state,
+                "hca_compress_state": self._resident_stacked_arg(
+                    cache.hca_compress_state, cache_state=True
+                ),
                 "hca_compress_state_block_table": inputs.hca_compress_state_block_table,
-                "csa_compress_state": cache.csa_compress_state,
+                "csa_compress_state": self._resident_stacked_arg(
+                    cache.csa_compress_state, cache_state=True
+                ),
                 "csa_compress_state_block_table": inputs.csa_compress_state_block_table,
-                "csa_inner_compress_state": cache.csa_inner_compress_state,
+                "csa_inner_compress_state": self._resident_stacked_arg(
+                    cache.csa_inner_compress_state, cache_state=True
+                ),
                 "csa_inner_compress_state_block_table": inputs.csa_inner_compress_state_block_table,
-                "cmp_kv": cache.cmp_kv,
+                "cmp_kv": self._resident_stacked_arg(cache.cmp_kv, cache_state=True),
                 "cmp_block_table": inputs.cmp_block_table,
-                "idx_kv_cache": cache.idx_kv_cache,
-                "idx_kv_scale": cache.idx_kv_scale,
+                "idx_kv_cache": self._resident_stacked_arg(cache.idx_kv_cache, cache_state=True),
+                "idx_kv_scale": self._resident_stacked_arg(cache.idx_kv_scale, cache_state=True),
                 "idx_block_table": inputs.idx_block_table,
                 "input_ids": inputs.input_ids,
-                "hc_head_fn": hc_head["hc_head_fn"],
-                "hc_head_scale": hc_head["hc_head_scale"],
-                "hc_head_base": hc_head["hc_head_base"],
-                "final_norm_w": self._static_final_norm_weight_tensor(),
+                "hc_head_fn": self._resident_stacked_arg(hc_head["hc_head_fn"]),
+                "hc_head_scale": self._resident_stacked_arg(hc_head["hc_head_scale"]),
+                "hc_head_base": self._resident_stacked_arg(hc_head["hc_head_base"]),
+                "final_norm_w": self._resident_stacked_arg(self._static_final_norm_weight_tensor()),
                 "pre_hc_hidden_out": pre_hc_hidden_out,
                 "x_out": x_out,
             }
@@ -1849,14 +1889,16 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
     def _mtp_prefill_args(self) -> tuple[Any, ...]:
         buffers = self._require_mtp_buffers()
-        values = dict(buffers.weights)
+        values = dict(self._mtp_device_weights or buffers.weights)
         values.update(
             {
                 "hidden_states": buffers.prefill_hidden_in,
                 "prev_hidden_states": buffers.prefill_prev_hidden_in,
-                "freqs_cos": self._static_freqs_cos_tensor(),
-                "freqs_sin": self._static_freqs_sin_tensor(),
-                "kv_cache": buffers.prefill_kv_cache,
+                "freqs_cos": self._resident_stacked_arg(self._static_freqs_cos_tensor()),
+                "freqs_sin": self._resident_stacked_arg(self._static_freqs_sin_tensor()),
+                "kv_cache": self._resident_stacked_arg(
+                    buffers.prefill_kv_cache, cache_state=True
+                ),
                 "ori_block_table": buffers.prefill_block_table,
                 "ori_slot_mapping": buffers.prefill_slot_mapping,
                 "position_ids": buffers.prefill_position_ids,
@@ -1869,15 +1911,17 @@ class DeepSeekV4ModelRunner(ModelRunner):
 
     def _mtp_decode_args(self) -> tuple[Any, ...]:
         buffers = self._require_mtp_buffers()
-        values = dict(buffers.weights)
+        values = dict(self._mtp_device_weights or buffers.weights)
         values.update(
             {
                 "hidden_states": buffers.decode_hidden_in,
                 "prev_pre_hc_hidden": buffers.decode_prev_hidden_in,
                 "position_ids": buffers.decode_position_ids,
-                "freqs_cos": self._static_freqs_cos_tensor(),
-                "freqs_sin": self._static_freqs_sin_tensor(),
-                "kv_cache": buffers.decode_kv_cache,
+                "freqs_cos": self._resident_stacked_arg(self._static_freqs_cos_tensor()),
+                "freqs_sin": self._resident_stacked_arg(self._static_freqs_sin_tensor()),
+                "kv_cache": self._resident_stacked_arg(
+                    buffers.decode_kv_cache, cache_state=True
+                ),
                 "swa_slot_mapping": buffers.decode_slot_mapping,
                 "swa_indices": buffers.decode_swa_indices,
                 "swa_lens": buffers.decode_swa_lens,
@@ -2101,9 +2145,10 @@ class DeepSeekV4ModelRunner(ModelRunner):
         self._mtp_tail_position = mtp_positions[-1:].clone()
 
     def _require_stacked_weights(self) -> DeepSeekV4StackedLayerWeights:
-        if self._stacked_weight_buffers is None:
+        tensors = self._stacked_device_weights or self._stacked_weight_buffers
+        if tensors is None:
             raise RuntimeError("DeepSeekV4 stacked decode weights were not staged")
-        return DeepSeekV4StackedLayerWeights(tensors=self._stacked_weight_buffers)
+        return DeepSeekV4StackedLayerWeights(tensors=tensors)
 
     def _ordered_layer_args(self, values: dict[str, Any], names: Sequence[str]) -> tuple[Any, ...]:
         missing = [name for name in names if name not in values]
@@ -2992,7 +3037,15 @@ class DeepSeekV4ModelRunner(ModelRunner):
     def _coerce_l3_arg(self, worker: Any, arg: Any, uploaded: list[DeviceTensor]) -> Any:
         if isinstance(arg, _StaticDeviceTensor):
             self._assert_l3_arg_shared(arg, name="static")
-            return arg.tensor
+            tensor = arg.tensor
+            key = (tensor.data_ptr(), tuple(tensor.shape), tensor.dtype)
+            cached = self._l3_static_tensors.get(key)
+            if cached is None:
+                cached = worker.alloc_stacked_tensor(tensor)
+                self._l3_static_tensors[key] = cached
+            if arg.cache_state:
+                self._l3_cache_tensor_keys.add(key)
+            return cached
         if isinstance(arg, _TransientDeviceTensor):
             tensor = arg.tensor
             self._assert_l3_arg_shared(arg, name="transient")
@@ -3005,6 +3058,76 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 f"the worker starts; got non-shared tensor shape={tuple(arg.shape)} dtype={arg.dtype}"
             )
         return arg
+
+    @staticmethod
+    def _resident_stacked_arg(
+        tensor: torch.Tensor | StackedDeviceTensor,
+        *,
+        cache_state: bool = False,
+    ) -> _StaticDeviceTensor | StackedDeviceTensor:
+        """Mark one ``[rank, ...]`` shared tensor for one-time shard upload."""
+        if isinstance(tensor, StackedDeviceTensor):
+            return tensor
+        if tensor.device.type != "cpu" or not tensor.is_contiguous() or not tensor.is_shared():
+            raise ValueError(
+                "DeepSeekV4 resident stacked tensors must be contiguous shared-memory CPU tensors"
+            )
+        return _StaticDeviceTensor(tensor=tensor, cache_state=cache_state)
+
+    @staticmethod
+    def _upload_weight_group(
+        worker: Any,
+        host_weights: dict[str, torch.Tensor],
+    ) -> dict[str, StackedDeviceTensor]:
+        """Upload a rank-stacked weight group, rolling back partial allocation."""
+        device_weights: dict[str, StackedDeviceTensor] = {}
+        try:
+            for name, tensor in host_weights.items():
+                device_weights[name] = worker.alloc_stacked_tensor(tensor)
+        except Exception:
+            for tensor in device_weights.values():
+                worker.free_stacked_tensor(tensor)
+            raise
+        return device_weights
+
+    def _materialize_resident_weights(self) -> None:
+        """Upload main/MTP weights once and release their shared Host backing."""
+        worker = self._shared_l3_worker()
+        if self._stacked_device_weights is None:
+            host_weights = self._stacked_weight_buffers
+            if not host_weights:
+                raise RuntimeError("DeepSeekV4 stacked Host weights are not staged")
+            host_bytes = sum(tensor.numel() * tensor.element_size() for tensor in host_weights.values())
+            self._stacked_device_weights = self._upload_weight_group(worker, host_weights)
+            self._stacked_weight_buffers = None
+            logger.info(
+                "DeepSeekV4 resident main weights uploaded; released_host_bytes=%d",
+                host_bytes,
+            )
+
+        buffers = self._mtp_buffers
+        if buffers is not None and self._mtp_device_weights is None:
+            if not buffers.weights:
+                raise RuntimeError("DeepSeekV4 MTP Host weights are not staged")
+            host_bytes = sum(tensor.numel() * tensor.element_size() for tensor in buffers.weights.values())
+            self._mtp_device_weights = self._upload_weight_group(worker, buffers.weights)
+            buffers.weights.clear()
+            logger.info(
+                "DeepSeekV4 resident MTP weights uploaded; released_host_bytes=%d",
+                host_bytes,
+            )
+
+    def _invalidate_resident_cache_tensors(self) -> None:
+        """Free resident KV/compressor state so the next request starts clean."""
+        worker = self._l3_worker
+        if worker is None:
+            self._l3_cache_tensor_keys.clear()
+            return
+        for key in tuple(self._l3_cache_tensor_keys):
+            tensor = self._l3_static_tensors.pop(key, None)
+            if tensor is not None:
+                worker.free_stacked_tensor(tensor)
+        self._l3_cache_tensor_keys.clear()
 
     def _shared_l3_worker(self) -> Any:
         worker = self._l3_worker
@@ -3125,25 +3248,28 @@ class DeepSeekV4ModelRunner(ModelRunner):
         if worker is None:
             return
         try:
-            for tensor in self._l3_static_tensors.values():
-                worker.free_tensor(tensor)
             worker.close()
         finally:
             self._l3_worker = None
             self._l3_static_tensors.clear()
+            self._l3_cache_tensor_keys.clear()
 
     def close(self) -> None:
         worker = self._l3_worker
         try:
             if worker is not None:
-                for tensor in self._l3_static_tensors.values():
-                    worker.free_tensor(tensor)
                 worker.close()
         finally:
             self._l3_worker = None
             self._decode_work_cache = None
+            self._stacked_weight_buffers = None
+            self._stacked_device_weights = None
+            self._mtp_device_weights = None
+            self._mtp_buffers = None
+            self._global_weights = None
             self._initialized_cache_requests.clear()
             self._l3_static_tensors.clear()
+            self._l3_cache_tensor_keys.clear()
 
     def _require_input_builder(self) -> DeepSeekV4InputBuilder:
         if self.input_builder is None:
