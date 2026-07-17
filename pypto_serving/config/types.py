@@ -207,7 +207,10 @@ class DecodeBatch:
 
     request_ids: list[str]
     token_ids: torch.Tensor
-    hidden_states: torch.Tensor
+    # Host-embedding executors (for example DeepSeek) consume hidden_states.
+    # Device-embedding executors (for example Qwen) gather embeddings from
+    # token_ids inside the decode kernel and leave this as None.
+    hidden_states: torch.Tensor | None
     seq_lens: torch.Tensor
     allow_device_greedy_sampling: bool = False
     kv_allocations: list[KvAllocation] = field(default_factory=list)
@@ -224,7 +227,7 @@ class DecodeBatch:
 class DecodeResult:
     """Outputs from one decode step."""
 
-    hidden_states: torch.Tensor
+    hidden_states: torch.Tensor | None
     # None on the device-greedy decode path: the host consumes sampled_token_ids and
     # the logits buffer stays device-resident (never copied back).
     logits: torch.Tensor | None

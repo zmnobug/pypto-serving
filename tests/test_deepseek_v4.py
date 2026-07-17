@@ -680,6 +680,21 @@ def test_deepseek_prepare_prefill_inputs_maps_chunk_metadata():
     ]
 
 
+def test_deepseek_prepare_decode_inputs_requires_hidden_states():
+    runner, model = _runner_for_prepared_inputs()
+
+    with pytest.raises(ValueError, match="DeepSeek V4 decode requires host hidden states"):
+        runner.prepare_decode_inputs(
+            model,
+            DecodeBatch(
+                request_ids=["req-a"],
+                token_ids=torch.tensor([[5]], dtype=torch.long),
+                hidden_states=None,
+                seq_lens=torch.tensor([128], dtype=torch.int32),
+            ),
+        )
+
+
 def test_deepseek_prepare_decode_inputs_builds_sliding_window_metadata():
     runner, model = _runner_for_prepared_inputs()
 

@@ -1349,8 +1349,17 @@ class DeepSeekV4ModelRunner(ModelRunner):
             ),
         )
 
+    @staticmethod
+    def _require_decode_hidden_states(batch: DecodeBatch) -> torch.Tensor:
+        """Return DeepSeek decode hidden states or reject a device-embedding batch."""
+        hidden_states = batch.hidden_states
+        if hidden_states is None:
+            raise ValueError("DeepSeek V4 decode requires host hidden states")
+        return hidden_states
+
     def prepare_decode_inputs(self, model: RuntimeModel, batch: DecodeBatch) -> DeepSeekV4PreparedDecodeInputs:
         """Build DeepSeekV4 decode host inputs for the current scheduler batch."""
+        hidden_states = self._require_decode_hidden_states(batch)
         builder = self._require_input_builder()
         layout = self._compiled.layout
         actual_batch = len(batch.request_ids)
@@ -1375,7 +1384,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
             vocab_size=model.config.vocab_size,
             prev_token_ids=prev_token_ids,
         )
-        decode_embeds = batch.hidden_states.to(torch.float32).cpu()
+        decode_embeds = hidden_states.to(torch.float32).cpu()
         prev_embeds = (
             batch.prev_hidden_states.to(torch.float32).cpu()
             if batch.prev_hidden_states is not None
@@ -1919,7 +1928,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         actual_batch = len(batch.request_ids)
         draft = draft_token_ids[:actual_batch].detach().cpu().to(torch.long)
         current = batch.token_ids[:actual_batch].detach().cpu().to(torch.long).reshape(-1)
-        current_hidden = batch.hidden_states[:actual_batch].detach().cpu()
+        current_hidden = self._require_decode_hidden_states(batch)[:actual_batch].detach().cpu()
         draft_hidden = self._embedding_rows(draft, current_hidden.dtype)
         return replace(
             batch,
@@ -1939,7 +1948,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
         buffers = self._require_mtp_buffers()
         n = context.actual_tokens
         first_token = batch.token_ids[0].detach().cpu().to(torch.long).reshape(1)
-        first_hidden = batch.hidden_states[0].detach().cpu().to(torch.bfloat16)
+        first_hidden = self._require_decode_hidden_states(batch)[0].detach().cpu().to(torch.bfloat16)
         buffers.prefill_hidden_in.zero_()
         buffers.prefill_hidden_in[:, : n - 1].copy_(context.x_hc[:, 1:n, 0].to(torch.bfloat16))
         buffers.prefill_hidden_in[:, n - 1].copy_(first_hidden)

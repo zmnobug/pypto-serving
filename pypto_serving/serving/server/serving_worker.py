@@ -338,12 +338,8 @@ class WorkerProcess:
 
             decode_token_tensor = torch.tensor(decode_tokens, dtype=torch.long, device=device)
             if self.executor.supports_device_embedding:
-                decode_embeddings = torch.zeros(
-                    (len(decode_tokens), self.model_record.config.hidden_size),
-                    dtype=runtime_model.embed_tokens.dtype,
-                    device=device,
-                )
-                prev_embeddings = torch.zeros_like(decode_embeddings)
+                decode_embeddings = None
+                prev_embeddings = None
             else:
                 decode_embeddings = self.executor.lookup_embeddings(runtime_model, decode_token_tensor)
                 prev_token_tensor = torch.tensor(prev_tokens, dtype=torch.long, device=device)
