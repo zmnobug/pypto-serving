@@ -82,17 +82,39 @@ DEEPSEEK_V4_FWD_NUM_LAYERS = 43
 DEEPSEEK_V4_CSA_NUM_LAYERS = 21
 DEEPSEEK_V4_HCA_NUM_LAYERS = 20
 
-_RESIDENT_CACHE_TENSOR_NAMES = frozenset(
-    {
-        "kv_cache",
-        "cmp_kv",
-        "idx_kv_cache",
-        "idx_kv_scale",
-        "hca_compress_state",
-        "csa_compress_state",
-        "csa_inner_compress_state",
-    }
-)
+# Policy values indicate whether a resident argument contains mutable request
+# cache state and therefore must be invalidated before its Host backing is
+# reused for a later request.
+_MAIN_STATIC_RESIDENT_POLICY = {
+    "freqs_cos": False,
+    "freqs_sin": False,
+    "hc_head_fn": False,
+    "hc_head_scale": False,
+    "hc_head_base": False,
+    "final_norm_w": False,
+}
+_MAIN_CACHE_RESIDENT_POLICY = {
+    "kv_cache": True,
+    "cmp_kv": True,
+    "idx_kv_cache": True,
+    "idx_kv_scale": True,
+    "hca_compress_state": True,
+    "csa_compress_state": True,
+    "csa_inner_compress_state": True,
+}
+_PREFILL_RESIDENT_POLICY = {
+    **_MAIN_STATIC_RESIDENT_POLICY,
+    **_MAIN_CACHE_RESIDENT_POLICY,
+}
+_DECODE_RESIDENT_POLICY = {
+    **_MAIN_STATIC_RESIDENT_POLICY,
+    **_MAIN_CACHE_RESIDENT_POLICY,
+}
+_MTP_RESIDENT_POLICY = {
+    "freqs_cos": False,
+    "freqs_sin": False,
+    "kv_cache": True,
+}
 
 
 # Argument order for the packed all-43-layer ``l3_prefill_fwd`` kernel. This
@@ -1801,26 +1823,22 @@ class DeepSeekV4ModelRunner(ModelRunner):
         buffers = self._require_prefill_fwd_buffers()
         stacked = self._require_stacked_weights()
         hc_head = self._hc_head_tensors()
-        values = {
-            name: self._resident_stacked_arg(tensor)
-            for name, tensor in stacked.tensors.items()
-        }
+        values = dict(stacked.tensors)
         values.update(
             {
                 "x_hc": buffers.x_hc,
-                "freqs_cos": self._resident_stacked_arg(buffers.freqs_cos),
-                "freqs_sin": self._resident_stacked_arg(buffers.freqs_sin),
-                "hc_head_fn": self._resident_stacked_arg(hc_head["hc_head_fn"]),
-                "hc_head_scale": self._resident_stacked_arg(hc_head["hc_head_scale"]),
-                "hc_head_base": self._resident_stacked_arg(hc_head["hc_head_base"]),
-                "final_norm_w": self._resident_stacked_arg(self._static_final_norm_weight_tensor()),
+                "freqs_cos": buffers.freqs_cos,
+                "freqs_sin": buffers.freqs_sin,
+                "hc_head_fn": hc_head["hc_head_fn"],
+                "hc_head_scale": hc_head["hc_head_scale"],
+                "hc_head_base": hc_head["hc_head_base"],
+                "final_norm_w": self._static_final_norm_weight_tensor(),
                 "pre_hc_hidden_out": pre_hc_hidden_out,
                 "x_out": x_out,
             }
         )
         values.update(buffers.tensors)
-        for name in _RESIDENT_CACHE_TENSOR_NAMES:
-            values[name] = self._resident_stacked_arg(buffers.tensors[name], cache_state=True)
+        values = self._mark_resident_args(values, _PREFILL_RESIDENT_POLICY)
         return self._ordered_layer_args(values, _PREFILL_FWD_TENSOR_ORDER)
 
     def _decode_fwd_args(
@@ -1834,16 +1852,13 @@ class DeepSeekV4ModelRunner(ModelRunner):
         cache = self._require_decode_work_cache()
         stacked = self._require_stacked_weights()
         hc_head = self._hc_head_tensors()
-        values = {
-            name: self._resident_stacked_arg(tensor)
-            for name, tensor in stacked.tensors.items()
-        }
+        values = dict(stacked.tensors)
         values.update(
             {
                 "x_hc": x_hc,
-                "freqs_cos": self._resident_stacked_arg(self._static_freqs_cos_tensor()),
-                "freqs_sin": self._resident_stacked_arg(self._static_freqs_sin_tensor()),
-                "kv_cache": self._resident_stacked_arg(cache.kv_cache, cache_state=True),
+                "freqs_cos": self._static_freqs_cos_tensor(),
+                "freqs_sin": self._static_freqs_sin_tensor(),
+                "kv_cache": cache.kv_cache,
                 "block_table": inputs.block_table,
                 "ori_slot_mapping": inputs.ori_slot_mapping,
                 "window_swa_indices": inputs.window_swa_indices,
@@ -1859,32 +1874,27 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "csa_inner_state_slot_mapping": inputs.csa_inner_state_slot_mapping,
                 "position_ids": inputs.position_ids,
                 "kv_seq_lens": inputs.kv_seq_lens,
-                "hca_compress_state": self._resident_stacked_arg(
-                    cache.hca_compress_state, cache_state=True
-                ),
+                "hca_compress_state": cache.hca_compress_state,
                 "hca_compress_state_block_table": inputs.hca_compress_state_block_table,
-                "csa_compress_state": self._resident_stacked_arg(
-                    cache.csa_compress_state, cache_state=True
-                ),
+                "csa_compress_state": cache.csa_compress_state,
                 "csa_compress_state_block_table": inputs.csa_compress_state_block_table,
-                "csa_inner_compress_state": self._resident_stacked_arg(
-                    cache.csa_inner_compress_state, cache_state=True
-                ),
+                "csa_inner_compress_state": cache.csa_inner_compress_state,
                 "csa_inner_compress_state_block_table": inputs.csa_inner_compress_state_block_table,
-                "cmp_kv": self._resident_stacked_arg(cache.cmp_kv, cache_state=True),
+                "cmp_kv": cache.cmp_kv,
                 "cmp_block_table": inputs.cmp_block_table,
-                "idx_kv_cache": self._resident_stacked_arg(cache.idx_kv_cache, cache_state=True),
-                "idx_kv_scale": self._resident_stacked_arg(cache.idx_kv_scale, cache_state=True),
+                "idx_kv_cache": cache.idx_kv_cache,
+                "idx_kv_scale": cache.idx_kv_scale,
                 "idx_block_table": inputs.idx_block_table,
                 "input_ids": inputs.input_ids,
-                "hc_head_fn": self._resident_stacked_arg(hc_head["hc_head_fn"]),
-                "hc_head_scale": self._resident_stacked_arg(hc_head["hc_head_scale"]),
-                "hc_head_base": self._resident_stacked_arg(hc_head["hc_head_base"]),
-                "final_norm_w": self._resident_stacked_arg(self._static_final_norm_weight_tensor()),
+                "hc_head_fn": hc_head["hc_head_fn"],
+                "hc_head_scale": hc_head["hc_head_scale"],
+                "hc_head_base": hc_head["hc_head_base"],
+                "final_norm_w": self._static_final_norm_weight_tensor(),
                 "pre_hc_hidden_out": pre_hc_hidden_out,
                 "x_out": x_out,
             }
         )
+        values = self._mark_resident_args(values, _DECODE_RESIDENT_POLICY)
         return self._ordered_layer_args(values, _DECODE_FWD_TENSOR_ORDER)
 
     def _mtp_prefill_args(self) -> tuple[Any, ...]:
@@ -1894,11 +1904,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
             {
                 "hidden_states": buffers.prefill_hidden_in,
                 "prev_hidden_states": buffers.prefill_prev_hidden_in,
-                "freqs_cos": self._resident_stacked_arg(self._static_freqs_cos_tensor()),
-                "freqs_sin": self._resident_stacked_arg(self._static_freqs_sin_tensor()),
-                "kv_cache": self._resident_stacked_arg(
-                    buffers.prefill_kv_cache, cache_state=True
-                ),
+                "freqs_cos": self._static_freqs_cos_tensor(),
+                "freqs_sin": self._static_freqs_sin_tensor(),
+                "kv_cache": buffers.prefill_kv_cache,
                 "ori_block_table": buffers.prefill_block_table,
                 "ori_slot_mapping": buffers.prefill_slot_mapping,
                 "position_ids": buffers.prefill_position_ids,
@@ -1907,6 +1915,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "pre_hc_hidden_out": buffers.prefill_pre_hc_out,
             }
         )
+        values = self._mark_resident_args(values, _MTP_RESIDENT_POLICY)
         return self._ordered_layer_args(values, _MTP_PREFILL_TENSOR_ORDER)
 
     def _mtp_decode_args(self) -> tuple[Any, ...]:
@@ -1917,11 +1926,9 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "hidden_states": buffers.decode_hidden_in,
                 "prev_pre_hc_hidden": buffers.decode_prev_hidden_in,
                 "position_ids": buffers.decode_position_ids,
-                "freqs_cos": self._resident_stacked_arg(self._static_freqs_cos_tensor()),
-                "freqs_sin": self._resident_stacked_arg(self._static_freqs_sin_tensor()),
-                "kv_cache": self._resident_stacked_arg(
-                    buffers.decode_kv_cache, cache_state=True
-                ),
+                "freqs_cos": self._static_freqs_cos_tensor(),
+                "freqs_sin": self._static_freqs_sin_tensor(),
+                "kv_cache": buffers.decode_kv_cache,
                 "swa_slot_mapping": buffers.decode_slot_mapping,
                 "swa_indices": buffers.decode_swa_indices,
                 "swa_lens": buffers.decode_swa_lens,
@@ -1930,6 +1937,7 @@ class DeepSeekV4ModelRunner(ModelRunner):
                 "next_pre_hc_hidden": buffers.decode_pre_hc_out,
             }
         )
+        values = self._mark_resident_args(values, _MTP_RESIDENT_POLICY)
         return self._ordered_layer_args(values, _MTP_DECODE_TENSOR_ORDER)
 
     def _require_mtp_buffers(self) -> _DeepSeekV4MtpSharedBuffers:
@@ -3060,19 +3068,30 @@ class DeepSeekV4ModelRunner(ModelRunner):
         return arg
 
     @staticmethod
-    def _resident_stacked_arg(
-        tensor: torch.Tensor | StackedDeviceTensor,
-        *,
-        cache_state: bool = False,
-    ) -> _StaticDeviceTensor | StackedDeviceTensor:
-        """Mark one ``[rank, ...]`` shared tensor for one-time shard upload."""
-        if isinstance(tensor, StackedDeviceTensor):
-            return tensor
-        if tensor.device.type != "cpu" or not tensor.is_contiguous() or not tensor.is_shared():
-            raise ValueError(
-                "DeepSeekV4 resident stacked tensors must be contiguous shared-memory CPU tensors"
-            )
-        return _StaticDeviceTensor(tensor=tensor, cache_state=cache_state)
+    def _mark_resident_args(
+        values: dict[str, Any],
+        policy: dict[str, bool],
+    ) -> dict[str, Any]:
+        """Mark policy-selected arguments for lazy one-time Device upload."""
+        missing = [name for name in policy if name not in values]
+        if missing:
+            raise KeyError(f"DeepSeekV4 resident argument policy is missing values: {missing}")
+        for name, cache_state in policy.items():
+            tensor = values[name]
+            if isinstance(tensor, StackedDeviceTensor):
+                continue
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"DeepSeekV4 resident argument {name!r} must be a torch.Tensor or "
+                    f"StackedDeviceTensor, got {type(tensor).__name__}"
+                )
+            if tensor.device.type != "cpu" or not tensor.is_contiguous() or not tensor.is_shared():
+                raise ValueError(
+                    f"DeepSeekV4 resident argument {name!r} must be a contiguous shared-memory "
+                    "CPU tensor"
+                )
+            values[name] = _StaticDeviceTensor(tensor=tensor, cache_state=cache_state)
+        return values
 
     @staticmethod
     def _upload_weight_group(
