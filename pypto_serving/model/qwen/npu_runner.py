@@ -121,18 +121,6 @@ class _PrefillInputs:
 
 
 @dataclass
-class _DecodeInputs:
-    """Active user rows prepared for decode."""
-
-    actual_batch: int
-    token_ids: torch.Tensor
-    hidden: torch.Tensor
-    seq_lens: torch.Tensor
-    block_table: torch.Tensor
-    slot_mapping: torch.Tensor
-
-
-@dataclass
 class _DecodeKernelInputs:
     """Fixed-batch tensors passed to the fused decode kernel."""
 
@@ -184,6 +172,11 @@ class Qwen314BModelRunner(ModelRunner):
         self._decode_next_hidden_dev_tensor: DeviceTensor | None = None
         self._static_args: _StaticKernelArgs | None = None
         self._pending_kv_cache_specs: dict[str, tuple[ModelConfig, RuntimeConfig]] = {}
+        # Page IDs currently materialized in each row of the persistent decode
+        # block-table buffer. A row is rewritten only when its page allocation
+        # changes (or when a different row-0 value must be used for padding).
+        self._decode_block_table_row_pages: list[list[int] | None] = []
+        self._decode_token_padding_initialized = False
         if compiled is not None:
             self._share_static_kernel_tensors()
             self._static_args = self._build_static_kernel_args()
@@ -455,9 +448,11 @@ class Qwen314BModelRunner(ModelRunner):
 
         # -- decode (full fixed batch, minimal seq) -------------------------
         compiled.decode_token_ids_buffer.zero_()
+        self._decode_token_padding_initialized = True
         compiled.decode_seq_lens_buffer.zero_()
         compiled.decode_block_table_buffer.fill_(0)     # all reads from page 0
         compiled.decode_slot_mapping_buffer.fill_(-1)   # all writes to page 0
+        self._decode_block_table_row_pages.clear()
 
         for b in range(batch):
             compiled.decode_seq_lens_buffer[b] = min(per_req + 1, max_seq)
@@ -634,15 +629,13 @@ class Qwen314BModelRunner(ModelRunner):
         """
         compiled = self._compiled
         model_id = model.config.model_id
-        decode_inputs = self._prepare_decode_inputs(model, batch)
+        kernel_inputs = self._prepare_decode_inputs(model, batch)
 
         kv_cache = self._kv_caches.get(model_id)
         if kv_cache is None:
             raise RuntimeError(f"KV cache for model {model_id!r} is not initialized")
         k_cache = kv_cache.key_pages
         v_cache = kv_cache.value_pages
-
-        kernel_inputs = self._pad_decode_inputs(model, decode_inputs)
 
         # Padded block_table / slot_mapping only ever reference row 0's
         # already-valid pages, so bound-check exactly what the kernel will read.
@@ -666,15 +659,13 @@ class Qwen314BModelRunner(ModelRunner):
             allow=batch.allow_device_greedy_sampling,
         )
         return DecodeResult(
-            hidden_states=decode_inputs.hidden.float(),
+            hidden_states=None,
             # Device-greedy path: the host consumes sampled_ids, never logits, so we
             # keep the logits buffer device-resident and skip its ~9.7MB D2H copy-back.
             logits=(
                 None
                 if device_greedy
-                else kernel_inputs.logits[: kernel_inputs.actual_batch, : model.config.vocab_size].to(
-                    decode_inputs.hidden.device
-                )
+                else kernel_inputs.logits[: kernel_inputs.actual_batch, : model.config.vocab_size].cpu()
             ),
             sampled_token_ids=sampled_ids,
             next_hidden_states=next_hidden,
@@ -810,66 +801,6 @@ class Qwen314BModelRunner(ModelRunner):
             next_hidden_arg,
         )
 
-    def _pad_decode_inputs(self, model: RuntimeModel, inputs: _DecodeInputs) -> _DecodeKernelInputs:
-        """Pad active decode rows to the fixed kernel batch.
-
-        The fused decode kernel computes all ``max_batch_size`` rows. Inactive
-        rows replicate row 0 so their KV writes are idempotent instead of
-        targeting unrelated pages.
-        """
-        compiled = self._compiled
-        actual_batch = inputs.actual_batch
-        kernel_batch = model.runtime.max_batch_size
-        max_blocks = self._max_blocks_per_seq(model)
-
-        if kernel_batch > compiled.decode_logits_buffer.shape[0]:
-            raise ValueError(
-                f"kernel batch {kernel_batch} exceeds logits buffer batch "
-                f"{compiled.decode_logits_buffer.shape[0]}"
-            )
-
-        token_ids = compiled.decode_token_ids_buffer
-        token_ids.zero_()
-        active_token_ids = inputs.token_ids.reshape(actual_batch, -1)
-        if active_token_ids.shape[1] != 1:
-            raise ValueError(
-                "decode token_ids must contain exactly one token per row, "
-                f"got shape {tuple(inputs.token_ids.shape)}"
-            )
-        width = 1
-        token_ids[:actual_batch, :width].copy_(active_token_ids[:, :width])
-        if actual_batch < kernel_batch:
-            token_ids[actual_batch:, :width].copy_(
-                active_token_ids[0:1, :width].expand(kernel_batch - actual_batch, width)
-            )
-
-        return _DecodeKernelInputs(
-            actual_batch=actual_batch,
-            token_ids=token_ids,
-            seq_lens=self._copy_replicated_rows(
-                compiled.decode_seq_lens_buffer,
-                inputs.seq_lens,
-                actual_batch,
-                kernel_batch,
-                rows_each=1,
-            ),
-            block_table=self._copy_replicated_rows(
-                compiled.decode_block_table_buffer,
-                inputs.block_table,
-                actual_batch,
-                kernel_batch,
-                rows_each=max_blocks,
-            ),
-            slot_mapping=self._copy_replicated_rows(
-                compiled.decode_slot_mapping_buffer,
-                inputs.slot_mapping,
-                actual_batch,
-                kernel_batch,
-                rows_each=1,
-            ),
-            logits=compiled.decode_logits_buffer,
-        )
-
     def _run_distributed_program(self, callable_spec: _L3Callable, *args: Any) -> Any:
         """Run a compiled HOST wrapper through the shared PyPTO L3 worker."""
         span_args = {
@@ -961,23 +892,6 @@ class Qwen314BModelRunner(ModelRunner):
             *static.decode_weights.values(),
         ):
             self._coerce_l3_arg(worker, arg)
-
-    @staticmethod
-    def _copy_replicated_rows(
-        dst: torch.Tensor,
-        active: torch.Tensor,
-        actual_batch: int,
-        kernel_batch: int,
-        *,
-        rows_each: int,
-    ) -> torch.Tensor:
-        """Copy active rows and fill inactive rows by replicating row 0."""
-        active_view = active.reshape(actual_batch, rows_each)
-        dst_view = dst.reshape(kernel_batch, rows_each)
-        dst_view[:actual_batch].copy_(active_view)
-        if actual_batch < kernel_batch:
-            dst_view[actual_batch:].copy_(active_view[0:1].expand(kernel_batch - actual_batch, rows_each))
-        return dst
 
     @staticmethod
     def _static_device_tensor(tensor: torch.Tensor) -> _StaticDeviceTensor:
@@ -1113,30 +1027,72 @@ class Qwen314BModelRunner(ModelRunner):
         self,
         model: RuntimeModel,
         batch: DecodeBatch,
-    ) -> _DecodeInputs:
-        """Pack active decode requests into fused decode-kernel inputs."""
+    ) -> _DecodeKernelInputs:
+        """Write active decode metadata directly into persistent kernel buffers.
+
+        The fused kernel has a fixed batch size. Active rows are written first,
+        and inactive rows replicate row 0 so their KV writes remain idempotent.
+        Block-table rows persist across calls and are rewritten only when their
+        page IDs change.
+        """
+        compiled = self._compiled
         batch_count = len(batch.kv_allocations) if batch.kv_allocations else int(batch.seq_lens.shape[0])
         actual_batch = self._validate_batch_size(model, batch_count)
-        hidden_size = model.config.hidden_size
+        kernel_batch = model.runtime.max_batch_size
         page_size = model.runtime.page_size
         max_blocks = self._max_blocks_per_seq(model)
 
-        hidden = torch.zeros((actual_batch, hidden_size), dtype=torch.bfloat16)
-        seq_lens = torch.empty((actual_batch,), dtype=torch.int32)
-        block_table = torch.full((actual_batch * max_blocks,), -1, dtype=torch.int32)
-        slot_mapping = torch.empty((actual_batch,), dtype=torch.int32)
+        if kernel_batch > compiled.decode_logits_buffer.shape[0]:
+            raise ValueError(
+                f"kernel batch {kernel_batch} exceeds logits buffer batch "
+                f"{compiled.decode_logits_buffer.shape[0]}"
+            )
+
+        token_ids = compiled.decode_token_ids_buffer
+        token_rows = token_ids.reshape(kernel_batch, -1)
+        active_token_rows = batch.token_ids.reshape(actual_batch, -1)
+        if active_token_rows.shape[1] != 1:
+            raise ValueError(
+                "decode token_ids must contain exactly one token per row, "
+                f"got shape {tuple(batch.token_ids.shape)}"
+            )
+        if token_rows.shape[1] < 1:
+            raise ValueError("compiled decode token buffer must have at least one column")
+        # The kernel ABI pads token rows to SAMPLED_IDS_PAD columns (8 for
+        # Qwen3-14B), but only column 0 carries the next token ID.
+        if not self._decode_token_padding_initialized:
+            token_rows[:, 1:].zero_()
+            self._decode_token_padding_initialized = True
+        token_rows[:actual_batch, :1].copy_(active_token_rows)
+
+        seq_lens = compiled.decode_seq_lens_buffer
+        seq_lens_flat = seq_lens.reshape(-1)
+        active_seq_lens = batch.seq_lens.reshape(-1)
+        if active_seq_lens.numel() < actual_batch:
+            raise ValueError(
+                f"decode seq_lens has {active_seq_lens.numel()} rows, expected {actual_batch}"
+            )
+        seq_lens_flat[:actual_batch].copy_(active_seq_lens[:actual_batch])
+        seq_len_values = seq_lens_flat[:actual_batch].tolist()
+
+        block_table = compiled.decode_block_table_buffer
+        block_table_rows = block_table.reshape(kernel_batch, max_blocks)
+        slot_mapping = compiled.decode_slot_mapping_buffer
+        slot_mapping_flat = slot_mapping.reshape(-1)
+        if len(self._decode_block_table_row_pages) != kernel_batch:
+            self._decode_block_table_row_pages = [None] * kernel_batch
+
+        first_page_ids: list[int] | None = None
 
         for batch_idx in range(actual_batch):
             alloc = batch.kv_allocations[batch_idx] if batch_idx < len(batch.kv_allocations) else None
-            seq_len = int(batch.seq_lens[batch_idx].item())
+            seq_len = int(seq_len_values[batch_idx])
             if seq_len <= 0:
                 raise ValueError("decode seq_lens must be positive")
             if seq_len > model.runtime.max_seq_len:
                 raise ValueError(
                     f"decode seq_len {seq_len} exceeds max_seq_len {model.runtime.max_seq_len}"
                 )
-            hidden[batch_idx, :] = batch.hidden_states[batch_idx].to(torch.bfloat16).cpu()
-            seq_lens[batch_idx] = seq_len
 
             if alloc is not None:
                 page_ids = alloc.page_ids
@@ -1144,21 +1100,59 @@ class Qwen314BModelRunner(ModelRunner):
                 page_ids = batch.block_ids[batch_idx]
             else:
                 page_ids = []
-            self._write_block_table_row(block_table, batch_idx, max_blocks, page_ids)
+            self._write_cached_decode_block_table_row(block_table_rows, batch_idx, page_ids)
+            if batch_idx == 0:
+                first_page_ids = page_ids
 
             tokens_used = seq_len - 1
             page_idx = tokens_used // page_size
             offset = tokens_used % page_size
-            slot_mapping[batch_idx] = page_ids[page_idx] * page_size + offset
+            if page_idx >= len(page_ids):
+                raise ValueError(
+                    f"page_ids list length {len(page_ids)} is too small for decode position {tokens_used}; "
+                    f"need at least {page_idx + 1} pages"
+                )
+            slot_mapping_flat[batch_idx] = page_ids[page_idx] * page_size + offset
 
-        return _DecodeInputs(
+        if actual_batch < kernel_batch:
+            inactive_rows = kernel_batch - actual_batch
+            token_rows[actual_batch:, :1].copy_(token_rows[0:1, :1].expand(inactive_rows, 1))
+            seq_lens_flat[actual_batch:].copy_(seq_lens_flat[0:1].expand(inactive_rows))
+            slot_mapping_flat[actual_batch:].copy_(slot_mapping_flat[0:1].expand(inactive_rows))
+            if first_page_ids is None:
+                raise RuntimeError("decode batch is missing row-0 page IDs")
+            for batch_idx in range(actual_batch, kernel_batch):
+                self._write_cached_decode_block_table_row(block_table_rows, batch_idx, first_page_ids)
+
+        return _DecodeKernelInputs(
             actual_batch=actual_batch,
-            token_ids=batch.token_ids.to(torch.int32).cpu(),
-            hidden=hidden,
+            token_ids=token_ids,
             seq_lens=seq_lens,
             block_table=block_table,
             slot_mapping=slot_mapping,
+            logits=compiled.decode_logits_buffer,
         )
+
+    def _write_cached_decode_block_table_row(
+        self,
+        block_table_rows: torch.Tensor,
+        batch_idx: int,
+        page_ids: list[int],
+    ) -> None:
+        """Materialize one persistent decode block-table row when it changes."""
+        if self._decode_block_table_row_pages[batch_idx] == page_ids:
+            return
+
+        row = block_table_rows[batch_idx]
+        if len(page_ids) > row.numel():
+            raise ValueError(
+                f"page_ids list length {len(page_ids)} exceeds block-table width {row.numel()}"
+            )
+
+        row.fill_(-1)
+        if page_ids:
+            row[: len(page_ids)].copy_(torch.tensor(page_ids, dtype=row.dtype))
+        self._decode_block_table_row_pages[batch_idx] = list(page_ids)
 
     @staticmethod
     def _compute_slot_mapping(

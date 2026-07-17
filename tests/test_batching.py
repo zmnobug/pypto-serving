@@ -166,6 +166,7 @@ def _compiled_kernels(
     decode_weights: dict[str, torch.Tensor] | None = None,
 ) -> _CompiledKernels:
     kernel_batch = model.runtime.max_batch_size
+    sampled_ids_width = 8
     max_seq = model.runtime.max_seq_len
     hidden_size = model.config.hidden_size
     intermediate_size = model.config.intermediate_size
@@ -211,14 +212,14 @@ def _compiled_kernels(
         prefill_block_table_buffer=torch.empty(kernel_batch * max_blocks, dtype=torch.int32),
         prefill_slot_mapping_buffer=torch.empty(kernel_batch * max_seq, dtype=torch.int32),
         prefill_logits_buffer=torch.empty(kernel_batch, model.config.vocab_size),
-        prefill_sampled_ids_buffer=torch.empty(kernel_batch, 1, dtype=torch.int32),
+        prefill_sampled_ids_buffer=torch.empty(kernel_batch, sampled_ids_width, dtype=torch.int32),
         prefill_next_hidden_buffer=torch.empty(kernel_batch, hidden_size, dtype=torch.bfloat16),
         decode_seq_lens_buffer=torch.zeros(kernel_batch, dtype=torch.int32),
         decode_block_table_buffer=torch.zeros(kernel_batch * max_blocks, dtype=torch.int32),
         decode_slot_mapping_buffer=torch.zeros(kernel_batch, dtype=torch.int32),
         decode_logits_buffer=torch.zeros(kernel_batch, model.config.vocab_size),
-        decode_token_ids_buffer=torch.empty(kernel_batch, 1, dtype=torch.int32),
-        decode_sampled_ids_buffer=torch.empty(kernel_batch, 1, dtype=torch.int32),
+        decode_token_ids_buffer=torch.empty(kernel_batch, sampled_ids_width, dtype=torch.int32),
+        decode_sampled_ids_buffer=torch.empty(kernel_batch, sampled_ids_width, dtype=torch.int32),
         decode_next_hidden_buffer=torch.empty(kernel_batch, hidden_size, dtype=torch.bfloat16),
     )
 
@@ -334,33 +335,70 @@ def test_compute_slot_mapping_rejects_insufficient_pages():
         ModelRunner._compute_slot_mapping([0], 2, 2, start_pos=1)
 
 
-def test_decode_inputs_use_actual_user_batch_without_padding_lanes():
-    model = _model(max_batch_size=1)
+def test_prepare_decode_inputs_writes_compiled_buffers_and_replicates_padding():
+    model = _model(max_batch_size=2)
     manager = KvCacheManager()
     manager.register_model(model.config.model_id, model.config, model.runtime)
-    runner = ModelRunner(
-        compiled=None,  # type: ignore[arg-type]
-    )
+    compiled = _compiled_kernels(model)
+    runner = ModelRunner(compiled=compiled)
     alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 1)
-    hidden_states = torch.ones(1, model.config.hidden_size)
-
     prepared = runner._prepare_decode_inputs(
         model,
         DecodeBatch(
             request_ids=[alloc.request_id],
-            token_ids=torch.zeros(1, 1, dtype=torch.long),
-            hidden_states=hidden_states,
+            token_ids=torch.tensor([[7]], dtype=torch.long),
+            hidden_states=None,
             seq_lens=torch.tensor([1], dtype=torch.int32),
             kv_allocations=[alloc],
         ),
     )
 
     assert prepared.actual_batch == 1
-    assert prepared.hidden.shape == (1, model.config.hidden_size)
-    assert prepared.seq_lens.tolist() == [1]
-    assert prepared.block_table.shape == (2,)
-    assert prepared.block_table[0].item() == alloc.page_ids[0]
-    assert prepared.slot_mapping.tolist() == [manager.slot_mapping_for_request(alloc)]
+    assert prepared.token_ids is compiled.decode_token_ids_buffer
+    assert prepared.seq_lens is compiled.decode_seq_lens_buffer
+    assert prepared.block_table is compiled.decode_block_table_buffer
+    assert prepared.slot_mapping is compiled.decode_slot_mapping_buffer
+    assert prepared.logits is compiled.decode_logits_buffer
+    assert prepared.token_ids[:, :1].tolist() == [[7], [7]]
+    assert torch.count_nonzero(prepared.token_ids[:, 1:]).item() == 0
+    assert prepared.seq_lens.tolist() == [1, 1]
+    assert prepared.block_table.reshape(2, 2).tolist() == [
+        [alloc.page_ids[0], -1],
+        [alloc.page_ids[0], -1],
+    ]
+    expected_slot = manager.slot_mapping_for_request(alloc)
+    assert prepared.slot_mapping.tolist() == [expected_slot, expected_slot]
+
+
+def test_prepare_decode_inputs_caches_block_table_until_pages_change():
+    model = _model(max_batch_size=1)
+    manager = KvCacheManager()
+    manager.register_model(model.config.model_id, model.config, model.runtime)
+    runner = ModelRunner(compiled=_compiled_kernels(model))
+    alloc = manager.allocate_for_prompt(model.config.model_id, "req-0", 1)
+
+    def prepare(seq_len: int):
+        return runner._prepare_decode_inputs(
+            model,
+            DecodeBatch(
+                request_ids=[alloc.request_id],
+                token_ids=torch.tensor([[7]], dtype=torch.long),
+                hidden_states=None,
+                seq_lens=torch.tensor([seq_len], dtype=torch.int32),
+                kv_allocations=[alloc],
+            ),
+        )
+
+    prepared = prepare(1)
+    cached_pages = runner._decode_block_table_row_pages[0]
+    prepare(2)
+    assert runner._decode_block_table_row_pages[0] is cached_pages
+
+    alloc.tokens_used = alloc.tokens_capacity
+    manager.ensure_one_more_slot(alloc)
+    prepared = prepare(model.runtime.page_size + 1)
+    assert runner._decode_block_table_row_pages[0] is not cached_pages
+    assert prepared.block_table.tolist() == alloc.page_ids
 
 
 def test_decode_kernel_inputs_reject_multi_token_rows():
@@ -368,15 +406,14 @@ def test_decode_kernel_inputs_reject_multi_token_rows():
     runner = ModelRunner(compiled=_compiled_kernels(model))
 
     with pytest.raises(ValueError, match="exactly one token per row"):
-        runner._pad_decode_inputs(
+        runner._prepare_decode_inputs(
             model,
-            SimpleNamespace(
-                actual_batch=1,
+            DecodeBatch(
+                request_ids=["req-0"],
                 token_ids=torch.tensor([[3, 4]], dtype=torch.int32),
-                hidden=torch.ones(1, model.config.hidden_size, dtype=torch.bfloat16),
+                hidden_states=None,
                 seq_lens=torch.tensor([1], dtype=torch.int32),
-                block_table=torch.zeros(2, dtype=torch.int32),
-                slot_mapping=torch.zeros(1, dtype=torch.int32),
+                block_ids=[[0]],
             ),
         )
 
@@ -436,7 +473,7 @@ def test_engine_uses_device_sampled_prefill_token_when_available():
     assert sampler.sample_calls == 0
 
 
-def test_engine_uses_zero_decode_placeholder_when_executor_embeds_on_device():
+def test_engine_omits_decode_hidden_when_executor_embeds_on_device():
     model = _model(max_batch_size=1, eos_token_id=0)
     model.embed_tokens = torch.arange(model.config.vocab_size * model.config.hidden_size, dtype=torch.float32).view(
         model.config.vocab_size,
@@ -464,7 +501,7 @@ def test_engine_uses_zero_decode_placeholder_when_executor_embeds_on_device():
     assert result.token_ids == [3, 0]
     assert executor.lookup_calls == 0
     assert executor.decode_calls == 1
-    assert torch.equal(executor.decode_hidden_seen[0], torch.zeros_like(model.embed_tokens[3]))
+    assert executor.decode_hidden_seen[0] is None
     assert sampler.sample_calls == 0
 
 
@@ -501,7 +538,7 @@ def test_engine_skips_decode_host_embedding_when_executor_embeds_on_device():
     assert result.token_ids == [3, 0]
     assert executor.lookup_calls == 0
     assert executor.decode_calls == 1
-    assert torch.equal(executor.decode_hidden_seen[0], torch.zeros_like(model.embed_tokens[3]))
+    assert executor.decode_hidden_seen[0] is None
     assert sampler.sample_calls == 0
 
 
@@ -574,7 +611,7 @@ def test_serving_worker_skips_decode_host_embedding_when_executor_embeds_on_devi
 
     assert new_tokens == {"decode": 0}
     assert executor.decode_calls == 1
-    assert torch.equal(executor.decode_hidden_seen[0], torch.zeros(model.config.hidden_size))
+    assert executor.decode_hidden_seen[0] is None
 
 
 def test_pypto_executor_uses_cached_kernel_weights_after_registration(monkeypatch):
@@ -800,7 +837,7 @@ class _DeviceSamplingExecutor(ModelExecutor):
         self.prefill_calls = 0
         self.decode_calls = 0
         self.lookup_calls = 0
-        self.decode_hidden_seen: list[torch.Tensor] = []
+        self.decode_hidden_seen: list[torch.Tensor | None] = []
 
     @property
     def supports_device_sampling(self) -> bool:
@@ -827,7 +864,8 @@ class _DeviceSamplingExecutor(ModelExecutor):
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         self.decode_calls += 1
-        self.decode_hidden_seen.append(batch.hidden_states[0].detach().clone())
+        hidden = batch.hidden_states
+        self.decode_hidden_seen.append(None if hidden is None else hidden[0].detach().clone())
         token = torch.tensor([self.second_token], dtype=torch.int64)
         return DecodeResult(
             hidden_states=batch.hidden_states,

@@ -389,7 +389,10 @@ class LLMEngine:
                     self._kv_cache_manager.ensure_one_more_slot(alloc)
                     request.seq_len += 1
                     decode_token = torch.tensor([current_token], dtype=torch.long, device=runtime_model.runtime.device)
-                    decode_embeddings = self._executor.lookup_embeddings(runtime_model, decode_token)
+                    decode_embeddings = self._decode_embeddings_from_cache_or_lookup(
+                        runtime_model,
+                        decode_token,
+                    )
                     decode_result = self._executor.run_decode(
                         runtime_model,
                         DecodeBatch(
@@ -447,14 +450,10 @@ class LLMEngine:
         self,
         runtime_model,
         decode_token_tensor: torch.Tensor,
-    ) -> torch.Tensor:
-        """Build decode hidden states; device-embedding executors only need a placeholder."""
+    ) -> torch.Tensor | None:
+        """Build decode hidden states only when the executor consumes them."""
         if self._executor.supports_device_embedding:
-            return torch.zeros(
-                (decode_token_tensor.shape[0], runtime_model.config.hidden_size),
-                dtype=runtime_model.embed_tokens.dtype,
-                device=decode_token_tensor.device,
-            )
+            return None
         return self._executor.lookup_embeddings(runtime_model, decode_token_tensor)
 
     @staticmethod
