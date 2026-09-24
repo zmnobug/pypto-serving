@@ -38,6 +38,10 @@ VARIANTS = {
     "output512": {"max_tokens": 512, "thinking": False, "include_readme": False},
     "thinking": {"max_tokens": 1024, "thinking": True, "include_readme": False},
     "thinking1536": {"max_tokens": 1536, "thinking": True, "include_readme": False},
+    "thinking2048": {"max_tokens": 2048, "thinking": True, "include_readme": False},
+    "thinking2560": {"max_tokens": 2560, "thinking": True, "include_readme": False},
+    "thinking2560_grounded": {"max_tokens": 2560, "thinking": True, "include_readme": False,
+                              "context_files": ["README.md", "report.py", "cli.py"]},
     "requirements": {"max_tokens": 1024, "thinking": False, "include_readme": True},
 }
 
@@ -110,13 +114,15 @@ def main():
     os.environ["MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT"] = "1"
     os.environ["NO_PROXY"] = ",".join(filter(None, [os.environ.get("NO_PROXY"), "127.0.0.1", "localhost"]))
     os.environ["no_proxy"] = os.environ["NO_PROXY"]
-    config = coding_config()
+    context_files = variant.get("context_files", [])
+    config = coding_config(compact=bool(context_files))
     verify_command = shlex.join([sys.executable, str(source_dir / "repair_demo.py"), "check", "."])
     required, protected = ["report.py", "cli.py"], ["README.md", "test_report.py"]
     environment = LoggedEnvironment(
         cwd=str(workspace), timeout=30, env=shell_environment(config["environment"]["env"]),
         verify_command=verify_command, require_changes=required, protected_files=protected,
         verification_dir=str(run_dir),
+        edit_feedback=bool(context_files),
     )
     system_template = config["agent"]["system_template"] + (
         "\nCompletion is checked independently. Required changed files: " + str(required)
@@ -126,6 +132,7 @@ def main():
     )
     model = TimedModel(
         tokenizer_path=args.tokenizer_path, context_limit=4096, model_name=f"openai/{args.model}",
+        workspace=workspace, context_files=context_files,
         action_regex=r"```bash\s*\n(.*?)\n```", cost_tracking="ignore_errors",
         observation_template=config["model"]["observation_template"],
         format_error_template=config["model"]["format_error_template"],
@@ -180,6 +187,8 @@ def main():
         "max_prompt_tokens": max((r["usage"]["prompt_tokens"] for r in responses), default=0),
         "length_responses": sum(r["choices"][0]["finish_reason"] == "length" for r in responses),
         "trimmed_requests": sum(bool(e["dropped_message_indices"] or e["shortened_message_indices"]) for e in events),
+        "recovery_requests": sum(e.get("recovery_without_thinking", False) for e in events),
+        "output_reserves": [e["output_reserve"] for e in events],
         "counts_match": len(events) == len(responses) and all(
             e["prompt_tokens"] == r["usage"]["prompt_tokens"] for e, r in zip(events, responses)),
         "public_passed": sum(line.startswith("test_") and line.endswith(" ... ok") for line in public.splitlines()),

@@ -43,8 +43,15 @@ Only when you have enough evidence to answer, submit your answer with:
 ```bash
 printf '%s\\n' 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT' 'Your answer here'
 ```
-Quote the answer as a shell literal. For greetings and general questions, submit
-directly without inspecting files. For file-specific questions, read the requested
+Quote the answer as a shell literal. For greetings and general questions, use the
+same completion command without inspecting files. Never answer in plain text,
+even for a greeting. The following example shows the command format; adapt the
+answer to the actual user message and translate it into the user's language.
+For example, when the user says Hello, respond with:
+```bash
+printf '%s\\n' 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT' 'Hello! How can I help?'
+```
+For file-specific questions, read the requested
 file first. Commands run in separate shells in {{cwd}}; directory changes do not
 persist. The user reviews commands before execution. Do not claim to have run a
 command before seeing its result.
@@ -65,6 +72,8 @@ def main() -> int:
     parser.add_argument("--verify-command", default="", help="Command that must pass before completion")
     parser.add_argument("--require-change", action="append", default=[], help="File that must change; repeatable")
     parser.add_argument("--protect", action="append", default=[], help="File that must stay unchanged; repeatable")
+    parser.add_argument("--context-file", action="append", default=[],
+                        help="Refresh and preserve this workspace file in every request; repeatable")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/mini_swe_agent_interactive"))
     args = parser.parse_args()
     if args.workspace is not None and not args.workspace.is_dir():
@@ -92,12 +101,13 @@ def main() -> int:
         return 130
     if not task:
         return 0
-    config = coding_config()
+    config = coding_config(compact=bool(args.context_file) and args.profile == "coding")
     environment = VerifiedEnvironment(
         cwd=str(workspace), timeout=30,
         env=shell_environment(config["environment"]["env"]),
         verify_command=args.verify_command, require_changes=args.require_change,
         protected_files=args.protect, verification_dir=str(run_dir),
+        edit_feedback=bool(args.context_file),
     )
     system_template = config["agent"]["system_template"] if args.profile == "coding" else CHAT_SYSTEM_TEMPLATE
     if args.verify_command:
@@ -109,6 +119,7 @@ def main() -> int:
         )
     model = BudgetedTextModel(
         tokenizer_path=args.tokenizer_path, context_limit=args.context_limit,
+        workspace=workspace, context_files=args.context_file,
         model_name=f"openai/{args.model}",
         action_regex=r"```bash\s*\n(.*?)\n```",
         cost_tracking="ignore_errors",

@@ -47,10 +47,14 @@ def main():
     parser.add_argument("--serving-bin", default="/data/zhaomin/.conda/envs/zm_pypto/bin/pypto-serving")
     parser.add_argument("--agent-python", default="/data/zhaomin/agent/.venvs/mini-swe-agent/bin/python")
     parser.add_argument("--model-path", default="/data/models/Qwen3-14B")
+    parser.add_argument("--repeats", type=int, default=1, help="Fresh workspaces per variant")
     parser.add_argument("--variants", nargs="+",
-                        choices=("baseline", "output512", "thinking", "thinking1536", "requirements"),
+                        choices=("baseline", "output512", "thinking", "thinking1536",
+                                 "thinking2048", "thinking2560", "thinking2560_grounded", "requirements"),
                         default=["baseline", "output512", "thinking", "requirements"])
     args = parser.parse_args()
+    if args.repeats <= 0:
+        parser.error("--repeats must be positive")
     if len(args.variants) != len(set(args.variants)):
         parser.error("--variants must not contain duplicates; use a fresh suite for repeats")
     root = args.output_dir.resolve()
@@ -58,8 +62,9 @@ def main():
     state_file = root / "suite.json"
     if state_file.exists():
         parser.error("Use a new output directory for each suite")
+    plan = [(variant, repeat + 1) for repeat in range(args.repeats) for variant in args.variants]
     state = {"status": "starting", "device": args.device, "port": args.port,
-             "order": args.variants, "runs": []}
+             "order": args.variants, "repeats": args.repeats, "runs": []}
 
     def save():
         temporary = root / "suite.json.tmp"
@@ -104,17 +109,18 @@ def main():
             if time.monotonic() >= deadline:
                 raise TimeoutError("Server did not become ready within 240 seconds")
             time.sleep(2)
-        for variant in state["order"]:
+        for variant, repeat in plan:
+            label = f"{variant}_repeat{repeat}" if args.repeats > 1 else variant
             state["status"] = "running"
-            state["current_variant"] = variant
+            state["current_variant"] = label
             save()
             print("Starting", variant, flush=True)
-            folder = root / variant
+            folder = root / label
             folder.mkdir()
             command = [args.agent_python, str(implementation / "experiment.py"), "--variant", variant,
                        "--api-base", f"http://127.0.0.1:{args.port}/v1", "--tokenizer-path", args.model_path,
                        "--output-dir", str(folder)]
-            with (root / (variant + ".log")).open("w") as log:
+            with (root / (label + ".log")).open("w") as log:
                 child = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                          start_new_session=True)
             try:
@@ -126,6 +132,7 @@ def main():
             if len(summaries) != 1:
                 raise RuntimeError(f"Missing experiment summary for {variant}, exit={code}")
             result = json.loads(summaries[0].read_text())
+            result["repeat"] = repeat
             state["runs"].append(result)
             save()
             print(variant, "accepted=", result["accepted"], "responses=", result["responses"], flush=True)
