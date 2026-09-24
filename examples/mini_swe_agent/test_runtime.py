@@ -100,6 +100,38 @@ class VerificationTests(unittest.TestCase):
         self.assertIn("cat <<'EOF'", config["agent"]["instance_template"])
         self.assertNotIn("mswea_bash_command", json.dumps(config))
 
+    def feedback_environment(self):
+        (self.root / "module.py").write_text("result = {'value': 0}\n")
+        return VerifiedEnvironment(
+            cwd=str(self.root), env=shell_environment(), verify_command="true",
+            require_changes=["module.py"], edit_feedback=True,
+        )
+
+    def test_duplicate_key_feedback_reports_actual_edit_without_changing_it(self):
+        env = self.feedback_environment()
+        source = "result = {'value': 1, 'value': 0}\n"
+        command = "printf %s " + shlex.quote(source) + " > module.py"
+        output = env.execute({"command": command})
+        self.assertEqual(output["returncode"], 0)
+        self.assertIn("duplicate dictionary key 'value'", output["output"])
+        self.assertEqual((self.root / "module.py").read_text(), source)
+
+    def test_empty_ranges_get_real_file_size_feedback(self):
+        env = self.feedback_environment()
+        env.execute({"command": "sed -n '100,110p' module.py"})
+        output = env.execute({"command": "sed -n '200,210p' module.py"})
+        self.assertIn("No progress", output["output"])
+        self.assertTrue(output["extra"]["stalled"])
+        self.assertIn("module.py: 1 lines", output["output"])
+        self.assertEqual(output["returncode"], 0)
+
+    def test_syntax_error_feedback_does_not_replace_test_verification(self):
+        env = self.feedback_environment()
+        output = env.execute({"command": "printf 'def broken(' > module.py"})
+        self.assertIn("Edit check: module.py:1", output["output"])
+        self.assertEqual(output["returncode"], 0)
+        self.assertFalse(env.verifications)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Use upstream coding prompts and verify completion against local evidence."""
 
+import ast
 import hashlib
 import json
 import os
@@ -19,7 +20,7 @@ from minisweagent.environments.local import LocalEnvironment, LocalEnvironmentCo
 from minisweagent.exceptions import Submitted
 
 
-def coding_config() -> dict:
+def coding_config(*, compact: bool = False) -> dict:
     config = get_config_from_spec(builtin_config_dir / "default.yaml")
     for section, key in (("agent", "system_template"), ("agent", "instance_template"),
                          ("model", "format_error_template")):
@@ -38,6 +39,29 @@ def coding_config() -> dict:
         "assert text.count(old) == 1, 'Expected exactly one target; inspect the file again'\n"
         "p.write_text(text.replace(old, new))\nPY\n```\n"
     )
+    if compact:
+        config["agent"]["system_template"] = (
+            "You repair code using a local shell. Reply in the user's language. "
+            "Produce exactly one bash code block with a real command per turn. "
+            "Keep reasoning brief and focus on the next action, not a plan for every possible case. "
+            "Read the supplied requirements and current source. Run the tests to reproduce, edit, "
+            "then rerun them. Do not guess missing code, functions or requirements. "
+            "Current workspace snapshots are refreshed each turn; use them even if old history is removed. "
+            "Each command starts a new shell in {{cwd}}. "
+            "For edits, you may rewrite a small file, insert at a known position, or use literal Python "
+            "replacements with an assertion that the target occurs once. "
+            "Do not use sed -i for source edits: code brackets are regex operators. For example:\n"
+            "```bash\npython - <<'PY'\nfrom pathlib import Path\np = Path('module.py')\n"
+            "s = p.read_text()\nold = 'return old_value'\nnew = 'return new_value'\n"
+            "assert s.count(old) == 1\np.write_text(s.replace(old, new))\nPY\n```\n"
+            "Replace the original expression; do not append a competing definition or duplicate dict key. "
+            "After editing inspect the changed code. Empty output or unchanged files is not progress; "
+            "check actual line counts instead of requesting ever higher empty ranges. "
+            "Only finish after validation, with one bash block containing "
+            "printf '%s\\n' 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT' 'Brief result'. "
+            "Never print RUN_SHELL_COMMAND wrappers.\n"
+        )
+        config["agent"]["instance_template"] = "{{task}}"
     return config
 
 
@@ -55,6 +79,7 @@ class VerifiedEnvironmentConfig(LocalEnvironmentConfig):
     protected_files: list[str] = []
     verification_dir: str = ""
     verification_timeout: int = 60
+    edit_feedback: bool = False
 
 
 class VerifiedEnvironment(LocalEnvironment):
@@ -73,6 +98,9 @@ class VerifiedEnvironment(LocalEnvironment):
             self.paths[name] = path
         self.initial = self._snapshot()
         self.verifications: list[dict] = []
+        self._last_attempt = None
+        self._same_attempts = 0
+        self._empty_observations = 0
 
     def _snapshot(self) -> dict:
         return {name: hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
@@ -99,6 +127,50 @@ class VerifiedEnvironment(LocalEnvironment):
                 "extra": {"verification": verification},
             }
         after = self._snapshot()
+        if self.config.edit_feedback:
+            raw_output = output["output"]
+            signature = (action.get("command", ""), output["returncode"], raw_output, after)
+            self._same_attempts = self._same_attempts + 1 if signature == self._last_attempt else 1
+            self._last_attempt = signature
+            self._empty_observations = (
+                self._empty_observations + 1 if before == after and not raw_output.strip() else 0
+            )
+            if self._same_attempts >= 3 or self._empty_observations >= 2:
+                output.setdefault("extra", {})["stalled"] = True
+                sizes = ", ".join(
+                    f"{name}: {len(path.read_text().splitlines())} lines"
+                    for name, path in self.paths.items() if path.is_file()
+                )
+                output["output"] += (
+                    "\n[No progress: repeated identical results or empty output without file changes. "
+                    "Inspect the current source and choose a different action; do not assume missing lines exist. "
+                    "Replacing an absent substring cannot insert text: use an existing anchor or explicit insertion. "
+                    + sizes + "]\n"
+                )
+            for name, path in self.paths.items():
+                if before[name] == after[name] or path.suffix != ".py" or not path.is_file():
+                    continue
+                try:
+                    tree = ast.parse(path.read_text())
+                except SyntaxError as error:
+                    output["output"] += f"\n[Edit check: {name}:{error.lineno}: {error.msg}]\n"
+                    continue
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Dict):
+                        continue
+                    keys = set()
+                    for key in node.keys:
+                        try:
+                            value = ast.literal_eval(key)
+                            hash(value)
+                        except (ValueError, TypeError):
+                            continue
+                        if value in keys:
+                            output["output"] += (
+                                f"\n[Edit check: {name}:{key.lineno}: duplicate dictionary key {value!r}; "
+                                "the later value overrides the earlier one. Replace the original entry.]\n"
+                            )
+                        keys.add(value)
         if self.paths:
             changed = [name for name in self.paths if before[name] != after[name]]
             output["output"] += "\n[Tracked files changed by this command: " + (", ".join(changed) or "none") + "]\n"
