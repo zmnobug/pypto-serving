@@ -118,6 +118,18 @@ def _load_pypto_lib_qwen14b_module(module_name: str, kernel_dir: Path) -> object
     return module
 
 
+def _validate_kernel_context(max_seq_len: int, prefill: object, decode: object) -> None:
+    """Check both kernels; the legacy decode-only override cannot expand prefill."""
+    for name, kernel in (("prefill", prefill), ("decode", decode)):
+        capacity = int(kernel.MAX_SEQ)
+        if max_seq_len > capacity:
+            raise ValueError(
+                f"max_model_len {max_seq_len} exceeds {name} kernel MAX_SEQ {capacity}. "
+                "Set PTO2_QWEN_MAX_SEQ before starting the worker to compile both kernels "
+                "with the required capacity; remove any smaller PTO2_MANUAL_MAX_SEQ override."
+            )
+
+
 class Qwen314BPyptoExecutor(CorePyptoExecutor):
     """PyPTO executor that compiles and registers the Qwen3-14B kernels."""
 
@@ -190,15 +202,16 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         self._validate_supported_shape(model)
         kernel_batch = model.runtime.max_batch_size
 
-        kernel_max_seq = int(getattr(qwen3_decode_fwd, "MAX_SEQ", 4096))
-        if model.runtime.max_seq_len > kernel_max_seq:
-            raise ValueError(
-                f"max_model_len {model.runtime.max_seq_len} exceeds the kernel's "
-                f"compile-time MAX_SEQ {kernel_max_seq} (config.py). The decode/prefill "
-                "kernels precompute MAX_CTX_BLOCKS, NUM_PAGES, and rope table sizes from "
-                "MAX_SEQ; a larger runtime value silently produces wrong attention and "
-                "out-of-bounds rope reads. Rebuild the kernel with a larger MAX_SEQ."
-            )
+        _validate_kernel_context(model.runtime.max_seq_len, qwen3_prefill_fwd, qwen3_decode_fwd)
+        # Context changes must never reuse a smaller-context compiled artifact.
+        context_tag = f"ctx{int(qwen3_prefill_fwd.MAX_SEQ)}_{int(qwen3_decode_fwd.MAX_SEQ)}"
+        self._compiler = KernelCompiler(
+            run_config=build_pypto_run_config(
+                platform=self._platform, device_ids=self._device_ids,
+                pypto_build_dir=self._pypto_build_dir,
+            ),
+            cache_dir=Path(self._pypto_build_dir) / context_tag,
+        )
 
         decode_batch_pad, decode_batch_is_dynamic = _kernel_batch_pad(qwen3_decode_fwd)
         if decode_batch_is_dynamic:

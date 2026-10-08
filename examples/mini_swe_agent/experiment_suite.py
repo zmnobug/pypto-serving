@@ -47,12 +47,20 @@ def main():
     parser.add_argument("--serving-bin", default="/data/zhaomin/.conda/envs/zm_pypto/bin/pypto-serving")
     parser.add_argument("--agent-python", default="/data/zhaomin/agent/.venvs/mini-swe-agent/bin/python")
     parser.add_argument("--model-path", default="/data/models/Qwen3-14B")
+    parser.add_argument("--context-limit", type=int, default=4096)
+    parser.add_argument("--request-timeout", type=float, default=120)
+    parser.add_argument("--wall-time", type=float, default=600)
+    parser.add_argument("--capacity-probe", action="store_true")
     parser.add_argument("--repeats", type=int, default=1, help="Fresh workspaces per variant")
     parser.add_argument("--variants", nargs="+",
                         choices=("baseline", "output512", "thinking", "thinking1536",
-                                 "thinking2048", "thinking2560", "thinking2560_grounded", "requirements"),
+                                 "thinking2048", "thinking2560", "thinking2560_grounded", "thinking8192", "requirements"),
                         default=["baseline", "output512", "thinking", "requirements"])
     args = parser.parse_args()
+    if args.context_limit <= 0 or args.request_timeout <= 0 or args.wall_time <= 0:
+        parser.error("Context limit and timeouts must be positive")
+    if "thinking8192" in args.variants and args.context_limit <= 8192:
+        parser.error("thinking8192 needs --context-limit greater than 8192")
     if args.repeats <= 0:
         parser.error("--repeats must be positive")
     if len(args.variants) != len(set(args.variants)):
@@ -87,15 +95,17 @@ def main():
                         ignore=shutil.ignore_patterns("__pycache__"))
         env = dict(os.environ)
         env["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+        env["PTO2_QWEN_MAX_SEQ"] = str(max(4096, args.context_limit))
+        env.pop("PTO2_MANUAL_MAX_SEQ", None)
         command = [args.serving_bin, "--model", args.model_path, "--served-model-name", "qwen3-agent",
                    "--backend", "npu", "--platform", "a2a3", "--device", str(args.device),
-                   "--max-model-len", "4096", "--max-num-seqs", "16", "--host", "127.0.0.1",
+                   "--max-model-len", str(args.context_limit), "--max-num-seqs", "16", "--host", "127.0.0.1",
                    "--port", str(args.port)]
         state["server_command"] = command
         with (root / "server.log").open("w") as log:
             server = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                       start_new_session=True)
-        deadline = time.monotonic() + 240
+        deadline = time.monotonic() + 600
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         while True:
             if server.poll() is not None:
@@ -107,8 +117,16 @@ def main():
             except OSError:
                 pass
             if time.monotonic() >= deadline:
-                raise TimeoutError("Server did not become ready within 240 seconds")
+                raise TimeoutError("Server did not become ready within 600 seconds")
             time.sleep(2)
+        if args.capacity_probe:
+            from capacity_probe import probe_capacity
+            state["capacity_probe"] = probe_capacity(
+                api_base=f"http://127.0.0.1:{args.port}/v1", tokenizer_path=Path(args.model_path),
+                context_limit=args.context_limit, output_dir=root / "capacity_probe",
+                timeout=args.request_timeout,
+            )
+            save()
         for variant, repeat in plan:
             label = f"{variant}_repeat{repeat}" if args.repeats > 1 else variant
             state["status"] = "running"
@@ -119,12 +137,13 @@ def main():
             folder.mkdir()
             command = [args.agent_python, str(implementation / "experiment.py"), "--variant", variant,
                        "--api-base", f"http://127.0.0.1:{args.port}/v1", "--tokenizer-path", args.model_path,
-                       "--output-dir", str(folder)]
+                       "--output-dir", str(folder), "--context-limit", str(args.context_limit),
+                       "--request-timeout", str(args.request_timeout), "--wall-time", str(args.wall_time)]
             with (root / (label + ".log")).open("w") as log:
                 child = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                          start_new_session=True)
             try:
-                code = child.wait(timeout=750)
+                code = child.wait(timeout=args.wall_time + args.request_timeout + 90)
             finally:
                 stop_process_group(child)
                 child = None

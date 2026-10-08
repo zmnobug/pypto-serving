@@ -42,6 +42,8 @@ VARIANTS = {
     "thinking2560": {"max_tokens": 2560, "thinking": True, "include_readme": False},
     "thinking2560_grounded": {"max_tokens": 2560, "thinking": True, "include_readme": False,
                               "context_files": ["README.md", "report.py", "cli.py"]},
+    "thinking8192": {"max_tokens": 8192, "thinking": True, "include_readme": False,
+                     "context_files": ["README.md", "report.py", "cli.py"]},
     "requirements": {"max_tokens": 1024, "thinking": False, "include_readme": True},
 }
 
@@ -82,9 +84,16 @@ def main():
     parser.add_argument("--model", default="qwen3-agent")
     parser.add_argument("--tokenizer-path", type=Path, default=Path("/data/models/Qwen3-14B"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/mini_swe_agent_experiments"))
+    parser.add_argument("--context-limit", type=int, default=4096)
+    parser.add_argument("--request-timeout", type=float, default=120)
+    parser.add_argument("--wall-time", type=float, default=600)
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--prepare-only", action="store_true", help="Validate the initial request without inference")
     args = parser.parse_args()
+    if args.context_limit <= VARIANTS[args.variant]["max_tokens"]:
+        parser.error("--context-limit must exceed the configured output allowance")
+    if args.request_timeout <= 0 or args.wall_time <= 0:
+        parser.error("Timeouts must be positive")
     if args.steps <= 0:
         parser.error("--steps must be positive")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -104,7 +113,8 @@ def main():
         shutil.copy2(path, snapshot / path.name)
     manifest = {
         "variant": args.variant, "settings": variant, "steps": args.steps,
-        "context_limit": 4096, "temperature": 0.0, "api_base": args.api_base,
+        "context_limit": args.context_limit,
+        "request_timeout": args.request_timeout, "wall_time": args.wall_time, "temperature": 0.0, "api_base": args.api_base,
         "model": args.model, "operator_hints": False, "agent": "DefaultAgent",
         "fixture_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                            for p in workspace.iterdir() if p.is_file()},
@@ -131,20 +141,20 @@ def main():
         + ". Failed verification is returned as an observation; continue fixing the task.\n"
     )
     model = TimedModel(
-        tokenizer_path=args.tokenizer_path, context_limit=4096, model_name=f"openai/{args.model}",
+        tokenizer_path=args.tokenizer_path, context_limit=args.context_limit, model_name=f"openai/{args.model}",
         workspace=workspace, context_files=context_files,
-        action_regex=r"```bash\s*\n(.*?)\n```", cost_tracking="ignore_errors",
+        action_regex=r"```bash\s*\n(.*?)\n```", allow_multiple_actions=True, verified_batch_completion=True, cost_tracking="ignore_errors",
         observation_template=config["model"]["observation_template"],
         format_error_template=config["model"]["format_error_template"],
         model_kwargs={"api_base": args.api_base, "api_key": "local-placeholder", "temperature": 0.0,
-                      "max_tokens": variant["max_tokens"], "stream": False, "timeout": 120,
+                      "max_tokens": variant["max_tokens"], "stream": False, "timeout": args.request_timeout,
                       "num_retries": 0,
                       "extra_body": {"chat_template_kwargs": {"enable_thinking": variant["thinking"]}}},
     )
     agent = DefaultAgent(
         model, environment, system_template=system_template,
         instance_template=config["agent"]["instance_template"], step_limit=args.steps,
-        wall_time_limit_seconds=600, cost_limit=0, max_consecutive_format_errors=2,
+        wall_time_limit_seconds=args.wall_time, cost_limit=0, max_consecutive_format_errors=2,
         output_path=run_dir / "trajectory.json",
     )
     print("RUN_DIR", run_dir, flush=True)
@@ -188,6 +198,7 @@ def main():
         "length_responses": sum(r["choices"][0]["finish_reason"] == "length" for r in responses),
         "trimmed_requests": sum(bool(e["dropped_message_indices"] or e["shortened_message_indices"]) for e in events),
         "recovery_requests": sum(e.get("recovery_without_thinking", False) for e in events),
+        "all_requests_thinking": bool(events) and all(e["enable_thinking"] for e in events),
         "output_reserves": [e["output_reserve"] for e in events],
         "counts_match": len(events) == len(responses) and all(
             e["prompt_tokens"] == r["usage"]["prompt_tokens"] for e, r in zip(events, responses)),

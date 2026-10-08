@@ -146,7 +146,22 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(query.call_args.kwargs["max_tokens"], event["output_reserve"])
         self.assertEqual(self.model.config.model_kwargs["max_tokens"], 1500)
 
-    def test_truncated_thinking_fallback_persists_until_new_user_task(self):
+    def test_thinking_reservation_is_not_silently_reduced_for_large_evidence(self):
+        folder = Path(self.temporary.name)
+        (folder / "source.py").write_text("value = 1\n" * 120)
+        self.model.workspace = folder
+        self.model.context_files = ["source.py"]
+        self.model.context_limit = 2000
+        self.model.config.model_kwargs.update({
+            "max_tokens": 1500, "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+        })
+        with self.assertRaises(ContextBudgetExceeded):
+            self.model._prepare_messages_for_api([
+                {"role": "system", "content": "rules"}, {"role": "user", "content": "fix source"},
+            ])
+        self.assertTrue(self.model.counter.enable_thinking)
+
+    def test_truncated_thinking_stays_enabled_across_retries_and_new_tasks(self):
         folder = Path(self.temporary.name)
         (folder / "source.py").write_text("value = 1\n")
         self.model.workspace = folder
@@ -163,17 +178,16 @@ class ContextTests(unittest.TestCase):
         prepared = self.model._prepare_messages_for_api(messages)
         with patch("smoke.CompleteTextModel._query") as query:
             self.model._query(prepared)
-        self.assertFalse(query.call_args.kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"])
-        self.assertEqual(query.call_args.kwargs["max_tokens"], 1024)
-        self.assertTrue(self.model.context_events[-1]["recovery_without_thinking"])
+        self.assertTrue(query.call_args.kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"])
+        self.assertEqual(query.call_args.kwargs["max_tokens"], 2560)
+        self.assertFalse(self.model.context_events[-1]["recovery_without_thinking"])
         messages.extend([
             {"role": "assistant", "content": "```bash\ncat source.py\n```",
              "extra": {"response": {"choices": [{"finish_reason": "stop"}]}}},
             {"role": "user", "content": "value = 1"},
         ])
         self.model._prepare_messages_for_api(messages)
-        self.assertFalse(self.model.counter.enable_thinking)
-        self.assertEqual(self.model.context_events[-1]["recovery_reason"], "truncated_thinking")
+        self.assertTrue(self.model.counter.enable_thinking)
         messages.append({"role": "user", "content": "Now solve a new task",
                          "extra": {"interrupt_type": "UserNewTask"}})
         self.model._prepare_messages_for_api(messages)
@@ -181,7 +195,7 @@ class ContextTests(unittest.TestCase):
         self.assertFalse(self.model.context_events[-1]["recovery_without_thinking"])
         self.assertTrue(self.model.config.model_kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"])
 
-    def test_stalled_tool_results_activate_fallback_without_generation_truncation(self):
+    def test_stalled_tool_results_restart_history_without_disabling_thinking(self):
         folder = Path(self.temporary.name)
         (folder / "source.py").write_text("value = 1\n")
         self.model.workspace = folder
@@ -199,9 +213,32 @@ class ContextTests(unittest.TestCase):
         ]
         self.model._prepare_messages_for_api(messages)
         event = self.model.context_events[-1]
-        self.assertFalse(event["enable_thinking"])
-        self.assertEqual(event["recovery_reason"], "no_progress")
-        self.assertEqual(event["output_reserve"], 1024)
+        self.assertTrue(event["enable_thinking"])
+        self.assertTrue(event["history_restarted"])
+        self.assertEqual(event["output_reserve"], 2560)
+
+    def test_failed_submission_does_not_hide_an_earlier_stalled_action(self):
+        folder = Path(self.temporary.name)
+        (folder / "source.py").write_text("value = 1\n")
+        self.model.workspace = folder
+        self.model.context_files = ["source.py"]
+        self.model.context_limit = 4096
+        self.model.config.model_kwargs.update({
+            "max_tokens": 2560, "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+        })
+        messages = self.messages()[:2] + [
+            {"role": "assistant", "content": "BAD_REPEAT_COMMAND", "extra": {
+                "response": {"choices": [{"finish_reason": "stop"}]} }},
+            {"role": "user", "content": "No change", "extra": {"raw_output": "", "stalled": True}},
+            {"role": "user", "content": "Rejected", "extra": {"raw_output": "check failed", "verification": {
+                "passed": False, "output": "NameError: missing import", "reasons": [],
+            }}},
+        ]
+        prepared = self.model._prepare_messages_for_api(messages)
+        self.assertTrue(self.model.context_events[-1]["history_restarted"])
+        self.assertTrue(self.model.context_events[-1]["enable_thinking"])
+        self.assertNotIn("BAD_REPEAT_COMMAND", "\n".join(m["content"] for m in prepared))
+        self.assertIn("NameError: missing import", "\n".join(m["content"] for m in prepared))
 
     def test_stalled_history_is_removed_but_failed_acceptance_is_retained(self):
         folder = Path(self.temporary.name)
@@ -236,6 +273,64 @@ class ContextTests(unittest.TestCase):
                          "extra": {"interrupt_type": "UserNewTask"}})
         self.model._prepare_messages_for_api(messages)
         self.assertFalse(self.model.context_events[-1]["verification_evidence_retained"])
+
+    def test_verification_is_bound_to_the_checked_source_snapshot(self):
+        from runtime import VerifiedEnvironment
+
+        folder = Path(self.temporary.name)
+        source = folder / "source.py"
+        source.write_text("value = 1\n")
+        env = VerifiedEnvironment(cwd=str(folder), require_changes=["source.py"],
+                                  verify_command="test \"$(cat source.py)\" = 'value = 2' "
+                                                 "|| { echo OLD_FAILURE; exit 1; }")
+        failed = env.verify()
+        self.assertFalse(failed["passed"])
+        self.model.workspace = folder
+        self.model.context_files = ["source.py"]
+        self.model.context_limit = 2000
+        messages = self.messages()[:2] + [
+            {"role": "assistant", "content": "submit"},
+            {"role": "user", "content": failed["output"],
+             "extra": {"raw_output": failed["output"], "verification": failed}},
+        ]
+        original = copy.deepcopy(messages)
+        prepared = self.model._prepare_messages_for_api(messages)
+        self.assertIn("OLD_FAILURE", str(prepared))
+        self.assertFalse(self.model.context_events[-1]["verification_stale"])
+        source.write_text("value = 2\n")
+        prepared = self.model._prepare_messages_for_api(messages)
+        context = "\n".join(m["content"] for m in prepared).split("\nVerification command:")[0]
+        self.assertNotIn("OLD_FAILURE", context)
+        self.assertIn("older source snapshot", str(prepared))
+        self.assertIn("Verification command:", str(prepared))
+        self.assertTrue(self.model.context_events[-1]["verification_stale"])
+        self.assertEqual(messages, original)
+        # Invalidating an old result never accepts completion by itself.
+        self.assertFalse(failed["passed"])
+        self.assertTrue(env.verify()["passed"])
+
+    def test_truncated_reply_restarts_from_source_without_lowering_thinking_budget(self):
+        folder = Path(self.temporary.name)
+        (folder / "source.py").write_text("value = 1\n")
+        self.model.workspace = folder
+        self.model.context_files = ["source.py"]
+        self.model.context_limit = 1000
+        self.model.config.model_kwargs.update({
+            "max_tokens": 500, "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+        })
+        messages = self.messages()[:2] + [{
+            "role": "user", "content": "<think>" + "UNFINISHED_REASONING " * 2000,
+            "extra": {"response": {"choices": [{"finish_reason": "length"}]}},
+        }]
+        original = copy.deepcopy(messages)
+        prepared = self.model._prepare_messages_for_api(messages)
+        self.assertNotIn("UNFINISHED_REASONING", str(prepared))
+        self.assertIn("value = 1", str(prepared))
+        event = self.model.context_events[-1]
+        self.assertTrue(event["enable_thinking"])
+        self.assertEqual(event["output_reserve"], 500)
+        self.assertEqual(event["history_restart_reason"], "truncated_generation")
+        self.assertEqual(messages, original)
 
 
 if __name__ == "__main__":

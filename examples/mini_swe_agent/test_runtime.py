@@ -132,6 +132,22 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(output["returncode"], 0)
         self.assertFalse(env.verifications)
 
+    def test_alternating_failed_commands_detect_stall_and_edits_reset_it(self):
+        env = self.feedback_environment()
+        first = {"command": "echo first failure >&2; exit 1"}
+        second = {"command": "echo second failure >&2; exit 1"}
+        for _ in range(2):
+            for action in (first, second):
+                output = env.execute(action)
+                self.assertFalse(output.get("extra", {}).get("stalled", False))
+        output = env.execute(first)
+        self.assertEqual(output["returncode"], 1)
+        self.assertTrue(output["extra"]["stalled"])
+        env.execute({"command": "printf 'result = 1\\n' > module.py"})
+        for action in (first, second):
+            output = env.execute(action)
+            self.assertFalse(output.get("extra", {}).get("stalled", False))
+
 
 if __name__ == "__main__":
     unittest.main()

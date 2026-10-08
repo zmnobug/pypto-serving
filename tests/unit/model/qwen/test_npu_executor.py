@@ -70,3 +70,15 @@ def test_qwen_compile_threads_use_cache_to_compiler():
     assert callable_spec == "compiled"
     assert captured["use_cache"] is True
     assert captured["name"] == "fake"
+
+
+def test_context_validation_rejects_decode_only_expansion():
+    from types import SimpleNamespace
+    import pytest
+    from pypto_serving.model.qwen.npu_executor import _validate_kernel_context
+
+    with pytest.raises(ValueError, match="prefill kernel MAX_SEQ 4096"):
+        _validate_kernel_context(16384, SimpleNamespace(MAX_SEQ=4096), SimpleNamespace(MAX_SEQ=16384))
+    with pytest.raises(ValueError, match="decode kernel MAX_SEQ 4096"):
+        _validate_kernel_context(16384, SimpleNamespace(MAX_SEQ=16384), SimpleNamespace(MAX_SEQ=4096))
+    _validate_kernel_context(16384, SimpleNamespace(MAX_SEQ=16384), SimpleNamespace(MAX_SEQ=16384))

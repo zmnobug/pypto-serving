@@ -69,17 +69,14 @@ class BudgetedTextModel(CompleteTextModel):
             raise ValueError("Context files require an explicit workspace")
         self.context_events: list[dict] = []
         self._request_max_tokens = self.config.model_kwargs["max_tokens"]
-        self._recover_without_thinking = False
-        self._recovery_reason = ""
         self._task_marker = None
         self._history_restart_at = 0
 
     def _query(self, messages, **kwargs):
         overrides = {"max_tokens": self._request_max_tokens}
-        if self._recover_without_thinking:
-            body = dict(self.config.model_kwargs.get("extra_body", {}))
-            body["chat_template_kwargs"] = dict(body.get("chat_template_kwargs", {}), enable_thinking=False)
-            overrides["extra_body"] = body
+        # Preserve the user's thinking setting on every request, including retries.
+        body = dict(self.config.model_kwargs.get("extra_body", {}))
+        overrides["extra_body"] = body
         return super()._query(messages, **(kwargs | overrides))
 
     def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
@@ -87,29 +84,23 @@ class BudgetedTextModel(CompleteTextModel):
         thinking = self.config.model_kwargs.get("extra_body", {}).get("chat_template_kwargs", {}).get(
             "enable_thinking", False
         )
-        # A failed reasoning mode should not consume the remaining task budget.
-        # Keep the fallback until a new user task, recording every actual setting.
         task_start = max((i for i, m in enumerate(messages)
                           if i == 1 or m.get("extra", {}).get("interrupt_type") == "UserNewTask"), default=0)
         task_marker = (task_start, messages[task_start].get("content", "") if messages else "")
         if task_marker != self._task_marker:
-            self._recovery_reason = ""
             self._history_restart_at = 0
             self._task_marker = task_marker
         current_task = messages[task_start + 1:]
+        # A reply can execute several actions. Inspect every observation since
+        # that reply; a final failed submission must not hide an earlier stall.
+        reply_index = max((i for i, m in enumerate(current_task)
+                           if m.get("role") == "assistant" or "response" in m.get("extra", {})), default=-1)
+        turn_stalled = any(m.get("extra", {}).get("stalled", False)
+                           for m in current_task[reply_index + 1:])
         latest_response = next((m["extra"]["response"] for m in reversed(current_task)
                                 if isinstance(m.get("extra", {}).get("response"), dict)), None)
-        latest_observation = next((m.get("extra", {}) for m in reversed(current_task)
-                                   if "raw_output" in m.get("extra", {})), {})
-        if self.context_files and thinking and not self._recovery_reason:
-            if latest_response and latest_response["choices"][0]["finish_reason"] == "length":
-                self._recovery_reason = "truncated_thinking"
-            elif latest_observation.get("stalled"):
-                self._recovery_reason = "no_progress"
-        self._recover_without_thinking = bool(self._recovery_reason)
-        self.counter.enable_thinking = thinking and not self._recover_without_thinking
-        if self._recover_without_thinking:
-            max_tokens = min(max_tokens, 1024)
+        truncated = bool(latest_response and latest_response["choices"][0]["finish_reason"] == "length")
+        self.counter.enable_thinking = thinking
         budget = self.context_limit - max_tokens
         evidence, evidence_hashes = (workspace_context(self.workspace, self.context_files)
                                      if self.context_files else ("", {}))
@@ -125,7 +116,7 @@ class BudgetedTextModel(CompleteTextModel):
                 groups[-1].append(index)
         selected = set(range(len(messages)))
         shortened = {}
-        restart_history = bool(self.context_files and latest_observation.get("stalled"))
+        restart_history = bool(self.context_files and (turn_stalled or truncated))
         if restart_history:
             # Do not keep presenting the same unsuccessful action as an example.
             self._history_restart_at = len(messages)
@@ -133,8 +124,27 @@ class BudgetedTextModel(CompleteTextModel):
             selected = pinned | set(range(self._history_restart_at, len(messages)))
         verification = next((m["extra"]["verification"] for m in reversed(current_task)
                              if "verification" in m.get("extra", {})), None)
+
+        def is_stale(check):
+            checked_files = check.get("current_files", {})
+            return any(name in checked_files and digest != checked_files[name]
+                       for name, digest in evidence_hashes.items())
+
+        stale_notice = (
+            "This verification tested an older source snapshot. Files have changed since then; "
+            "its failures do not describe the current code. Rerun verification before further edits. "
+            "The original report remains in the trajectory."
+        )
+        stale_observations = {
+            i: stale_notice for i, message in enumerate(messages)
+            if self.context_files and "verification" in message.get("extra", {})
+            and is_stale(message["extra"]["verification"])
+        }
+        verification_stale = bool(verification and is_stale(verification))
         verification_evidence = ""
-        if self.context_files and verification and not verification.get("passed"):
+        if self.context_files and verification_stale:
+            verification_evidence = stale_notice + "\nVerification command: " + verification.get("command", "")
+        elif self.context_files and verification and not verification.get("passed"):
             output = verification.get("output", "")
             try:
                 report = json.loads(output)
@@ -151,19 +161,26 @@ class BudgetedTextModel(CompleteTextModel):
             )
 
         def prepare():
-            candidates = [dict(messages[i], content=shortened.get(i, messages[i].get("content", "")))
+            candidates = [dict(messages[i], content=stale_observations.get(
+                i, shortened.get(i, messages[i].get("content", ""))))
                           for i in sorted(selected)]
             if evidence:
                 candidates.insert(2, {"role": "user", "content": evidence})
             if verification_evidence:
                 candidates.append({"role": "user", "content": verification_evidence})
             if restart_history:
-                candidates.append({"role": "user", "content": (
+                restart_notice = (
+                    "The previous generation reached its output limit; no command from it was executed. "
+                    "Previous commands have been removed from this request. Thinking remains enabled. "
+                    "Use the current source above and choose one next action. If you already edited the "
+                    "source after a failed check, rerun verification instead of assuming the old error persists."
+                ) if truncated else (
                     "Repeated actions made no progress. Previous commands have been removed from this request. "
                     "Start again from the current source and requirements above. Choose a different edit. "
                     "You may rewrite a small source file completely while preserving its public interface "
                     "and unrelated behavior. Do not modify tests or requirements."
-                )})
+                )
+                candidates.append({"role": "user", "content": restart_notice})
             return super(BudgetedTextModel, self)._prepare_messages_for_api(candidates)
 
         prepared = prepare()
@@ -174,8 +191,8 @@ class BudgetedTextModel(CompleteTextModel):
             selected.difference_update(group)
             prepared = prepare()
             prompt_tokens = self.counter.count(prepared)
-        if self.context_files and prompt_tokens > budget:
-            # Current evidence outranks a fixed maximum output reservation. Keep
+        if self.context_files and not thinking and prompt_tokens > budget:
+            # Non-thinking requests can trade output space for evidence. Keep
             # at least 1024 output tokens (or the smaller configured maximum).
             budget = self.context_limit - min(max_tokens, 1024)
         # Never shorten the task or user's follow-up instructions. If a single
@@ -211,19 +228,20 @@ class BudgetedTextModel(CompleteTextModel):
             "prompt_tokens": prompt_tokens,
             "output_reserve": self._request_max_tokens,
             "enable_thinking": self.counter.enable_thinking,
-            "recovery_without_thinking": self._recover_without_thinking,
-            "recovery_reason": self._recovery_reason,
+            "recovery_without_thinking": False,
             "history_restarted": restart_history,
+            "history_restart_reason": "truncated_generation" if restart_history and truncated else
+                                      "stalled" if restart_history else "",
             "verification_evidence_retained": bool(verification_evidence),
+            "verification_stale": verification_stale,
+            "stale_verification_indices": sorted(stale_observations),
             "dropped_message_indices": sorted(set(range(len(messages))) - selected),
             "shortened_message_indices": sorted(shortened),
             "messages_sent": prepared,
             "context_file_hashes": evidence_hashes,
         }
         self.context_events.append(event)
-        if self._recover_without_thinking:
-            print(f"Context: {self._recovery_reason}; thinking disabled until the next user task.", flush=True)
-        elif self._request_max_tokens < self.config.model_kwargs["max_tokens"]:
+        if self._request_max_tokens < self.config.model_kwargs["max_tokens"]:
             print(f"Context: preserving current evidence; output allowance is {self._request_max_tokens} tokens.",
                   flush=True)
         if event["dropped_message_indices"] or shortened:

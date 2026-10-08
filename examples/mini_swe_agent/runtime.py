@@ -42,7 +42,8 @@ def coding_config(*, compact: bool = False) -> dict:
     if compact:
         config["agent"]["system_template"] = (
             "You repair code using a local shell. Reply in the user's language. "
-            "Produce exactly one bash code block with a real command per turn. "
+            "Prefer one bash code block with a real command per turn. Independent commands may use "
+            "multiple bash blocks; they run sequentially in separate shells. Completion must be last. "
             "Keep reasoning brief and focus on the next action, not a plan for every possible case. "
             "Read the supplied requirements and current source. Run the tests to reproduce, edit, "
             "then rerun them. Do not guess missing code, functions or requirements. "
@@ -98,8 +99,7 @@ class VerifiedEnvironment(LocalEnvironment):
             self.paths[name] = path
         self.initial = self._snapshot()
         self.verifications: list[dict] = []
-        self._last_attempt = None
-        self._same_attempts = 0
+        self._attempts_since_change: dict[str, tuple[tuple, int]] = {}
         self._empty_observations = 0
 
     def _snapshot(self) -> dict:
@@ -129,13 +129,19 @@ class VerifiedEnvironment(LocalEnvironment):
         after = self._snapshot()
         if self.config.edit_feedback:
             raw_output = output["output"]
-            signature = (action.get("command", ""), output["returncode"], raw_output, after)
-            self._same_attempts = self._same_attempts + 1 if signature == self._last_attempt else 1
-            self._last_attempt = signature
+            # A reply can alternate several failing commands. Count each one
+            # until tracked source changes, rather than only adjacent repeats.
+            if before != after:
+                self._attempts_since_change.clear()
+            command = action.get("command", "")
+            signature = (output["returncode"], raw_output, after)
+            previous, count = self._attempts_since_change.get(command, (None, 0))
+            same_attempts = count + 1 if signature == previous else 1
+            self._attempts_since_change[command] = (signature, same_attempts)
             self._empty_observations = (
                 self._empty_observations + 1 if before == after and not raw_output.strip() else 0
             )
-            if self._same_attempts >= 3 or self._empty_observations >= 2:
+            if same_attempts >= 3 or self._empty_observations >= 2:
                 output.setdefault("extra", {})["stalled"] = True
                 sizes = ", ".join(
                     f"{name}: {len(path.read_text().splitlines())} lines"

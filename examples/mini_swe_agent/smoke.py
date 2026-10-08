@@ -14,6 +14,7 @@ import argparse
 import importlib.metadata
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import shlex
@@ -43,6 +44,21 @@ Replace THE_EXACT_FILE_CONTENT with the observed single line. Do not guess the f
 class CompleteTextModel(LitellmTextbasedModel):
     """Reject incomplete generations and unsupported printed action wrappers."""
 
+    def __init__(self, *, allow_multiple_actions: bool = False, verified_batch_completion: bool = False,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.allow_multiple_actions = allow_multiple_actions
+        self.verified_batch_completion = verified_batch_completion
+
+    def serialize(self):
+        data = super().serialize()
+        data.setdefault("info", {})["text_action_policy"] = {
+            "allow_multiple_actions": self.allow_multiple_actions,
+            "parse_final_answer_only": True,
+            "verified_batch_completion": self.verified_batch_completion,
+        }
+        return data
+
     def _parse_actions(self, response) -> list[dict]:
         choice = response.choices[0]
         # LiteLLM normalizes unknown reasons (including aborted) to stop.
@@ -54,29 +70,55 @@ class CompleteTextModel(LitellmTextbasedModel):
                 "content": f"Generation ended with {reason!r}; no command was executed. Retry concisely.",
                 "extra": {"interrupt_type": "FormatError", "finish_reason": reason},
             })
-        actions = super()._parse_actions(response)
-        command = actions[0]["command"]
-        try:
-            words = shlex.split(command)
-        except ValueError:
-            # This check recognizes a specific wrapper, not general shell syntax.
-            return actions
-        is_wrapper = (
-            len(words) >= 3 and words[0] == "printf" and words[2] == "RUN_SHELL_COMMAND"
-        ) or (
-            len(words) >= 2 and words[0] == "echo" and words[1] == "RUN_SHELL_COMMAND"
-        )
-        if is_wrapper:
-            raise FormatError({
-                "role": "user",
-                "content": (
-                    "Nothing was executed. RUN_SHELL_COMMAND is not a supported protocol. "
-                    "Your command would only print text, not run the printed command. "
-                    "Put the actual shell command directly in one bash code block, for example "
-                    "cat /path/to/README.md. Wait for real file contents before summarizing."
-                ),
-                "extra": {"interrupt_type": "FormatError", "rejected_command": command},
-            })
+        content = choice.message.content or ""
+        # Qwen's text API includes reasoning in content. Never execute examples
+        # or discarded commands inside its leading reasoning section.
+        if content.lstrip().startswith("<think>"):
+            _, end, content = content.partition("</think>")
+            if not end:
+                raise FormatError({
+                    "role": "user", "content": "Unclosed thinking section; no command executed.",
+                    "extra": {"interrupt_type": "FormatError"},
+                })
+        final_response = response.model_copy(deep=True)
+        final_response.choices[0].message.content = content
+        commands = [c.strip() for c in re.findall(self.config.action_regex, content, re.DOTALL)]
+        if self.allow_multiple_actions and len(commands) > 1:
+            premature_finish = any(FINISH_MARKER in c for c in commands[:-1])
+            unverified_finish = FINISH_MARKER in commands[-1] and not self.verified_batch_completion
+            if any(not c for c in commands) or premature_finish or unverified_finish:
+                raise FormatError({
+                    "role": "user", "content": "Completion must be last and needs configured verification "
+                                              "when combined with other actions. Otherwise submit it alone. "
+                                              "No command executed; omit empty action blocks.",
+                    "extra": {"interrupt_type": "FormatError"},
+                })
+            actions = [{"command": c} for c in commands]
+        else:
+            actions = super()._parse_actions(final_response)
+        for action in actions:
+            command = action["command"]
+            try:
+                words = shlex.split(command)
+            except ValueError:
+                # This check recognizes a specific wrapper, not general shell syntax.
+                continue
+            is_wrapper = (
+                len(words) >= 3 and words[0] == "printf" and words[2] == "RUN_SHELL_COMMAND"
+            ) or (
+                len(words) >= 2 and words[0] == "echo" and words[1] == "RUN_SHELL_COMMAND"
+            )
+            if is_wrapper:
+                raise FormatError({
+                    "role": "user",
+                    "content": (
+                        "Nothing was executed. RUN_SHELL_COMMAND is not a supported protocol. "
+                        "Your command would only print text, not run the printed command. "
+                        "Put the actual shell command directly in one bash code block, for example "
+                        "cat /path/to/README.md. Wait for real file contents before summarizing."
+                    ),
+                    "extra": {"interrupt_type": "FormatError", "rejected_command": command},
+                })
         return actions
 
 
