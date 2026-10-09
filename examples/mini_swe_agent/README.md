@@ -107,14 +107,62 @@ In HTTP mode, also start Serving with `--max-model-len 16384`. In either mode, p
 --context-limit 16384 --max-tokens 8192 --thinking --request-timeout 600
 ```
 
-The 16K context and 8K output reserve were verified for an HTTP multi-file repair task with thinking enabled throughout. Direct mode has only been verified on a real NPU at 4K with thinking disabled, for a file-reading smoke task and an interactive greeting. Its 16K thinking path still needs an end-to-end test. Increasing Agent limits alone does not increase the engine's actual capacity.
+The 16K context and 8K output reserve have been verified for a multi-file repair task with thinking enabled throughout on both HTTP and direct mode. Increasing Agent limits alone does not increase the engine's actual capacity. The repair task can finish without actually crossing 4K, so use the capacity probe below to test that boundary separately.
+
+## Reproducible comparison
+
+Reserve an NPU device with `task-submit` or the local device lock before running these commands. Run HTTP and direct cases sequentially on the same device and with the same model and context settings. Each repair run creates a fresh fixture and checks both the public and independent tests:
+
+```bash
+export PTO2_QWEN_MAX_SEQ=16384
+DEVICE_ID=0
+bash examples/mini_swe_agent/run_direct.sh --experiment \
+  --device "$DEVICE_ID" --variant thinking8192 \
+  --context-limit 16384 --request-timeout 600 --wall-time 1800 \
+  --output-dir outputs/direct_repair
+```
+
+For HTTP, use `experiment_suite.py` to start and stop a local Serving process and run the same repair variant:
+
+```bash
+PTO2_QWEN_MAX_SEQ=16384 /data/zhaomin/.conda/envs/zm_pypto/bin/python \
+  examples/mini_swe_agent/experiment_suite.py \
+  --device "$DEVICE_ID" --context-limit 16384 \
+  --variants thinking8192 --repeats 1 \
+  --request-timeout 600 --wall-time 1800 \
+  --output-dir outputs/http_repair
+```
+
+The direct run writes `summary.json` inside its variant directory; the HTTP suite writes `suite.json`. Compare acceptance, independent tests, calls, tokens, and truncation before comparing task duration. Different action paths can dominate end-to-end time even with the same transport and model settings.
+
+To verify the direct engine's 16K capacity independently of Agent behavior, run:
+
+```bash
+bash examples/mini_swe_agent/run_direct.sh --capacity-probe \
+  --device "$DEVICE_ID" --context-limit 16384 \
+  --output-dir outputs/direct_capacity
+```
+
+The probe requests a short prompt, one crossing 4K, and one near the 16K limit, all with thinking enabled. To measure only warm fixed-request latency through each transport on the same device, run:
+
+```bash
+bash examples/mini_swe_agent/run_direct.sh --latency-probe \
+  --device "$DEVICE_ID" --context-limit 16384 \
+  --warmups 2 --samples 10 --order direct,http \
+  --output-dir outputs/transport_latency
+```
+
+The latency probe loads each mode in turn, records startup separately, and saves per-request times and token counts in `summary.json`. It uses a short, non-thinking response to focus on request-path overhead; it does not measure full Agent task performance.
 
 ## Results and checks
 
+- In two fresh 16K, full-thinking repair runs per transport, both HTTP and direct completed one run and timed out on the other. These small samples do not establish a task-success advantage for either path.
+- Direct generation passed the thinking-enabled capacity probe with 4,092 and 15,360 prompt tokens. The latter request used 15,558 tokens including output.
+- On this host, a fixed 19-input-token, 2-output-token request finished normally in both modes. After two warmups, ten measured requests had median latencies of 98.545 ms direct and 98.552 ms HTTP. This does not show a meaningful speedup from removing the local HTTP hop; it does not predict long-generation or concurrent-load performance.
 - HTTP: use `/health` to check the server. For a `task-submit` launch, use `task-submit --status TASK_ID` to check the job.
 - Direct: there is no HTTP health endpoint. The engine runs for the lifetime of the Agent process; inspect its terminal output or job status.
 - Session output: inspect the printed `trajectory.json` path and any verification records in the same directory.
 - The context limit must exceed the output allowance. Incomplete generations are not executed as actions.
 - Run the focused CPU tests with `LITELLM_LOCAL_MODEL_COST_MAP=True /data/zhaomin/agent/.venvs/mini-swe-agent/bin/python -m unittest discover -s examples/mini_swe_agent -p 'test_*.py' -q`.
 
-This demo has exercised local shell commands for file reading, code editing, test execution, and task submission. Browser automation, database access, web search, Git operations, and native function calling have not been validated. HTTP and direct mode have not yet been compared under identical workloads, so no speedup is claimed.
+This demo has exercised local shell commands for file reading, code editing, test execution, and task submission. Browser automation, database access, web search, Git operations, and native function calling have not been validated. Direct mode exposes the engine in the Agent process; queue-aware decisions and automatic capacity discovery remain future work.

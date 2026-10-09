@@ -13,4 +13,19 @@ export PTOAS_ROOT="/usr/local/bin/ptoas-bin"
 export LITELLM_LOCAL_MODEL_COST_MAP=True
 export MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT=1
 
-exec "$serving_python" "$script_dir/interactive.py" --transport direct "$@"
+entry="$script_dir/interactive.py"
+transport_args=(--transport direct)
+if [[ "${1:-}" == "--experiment" ]]; then
+    entry="$script_dir/experiment.py"
+    shift
+elif [[ "${1:-}" == "--capacity-probe" ]]; then
+    entry="$script_dir/direct_capacity_probe.py"
+    transport_args=()
+    shift
+elif [[ "${1:-}" == "--latency-probe" ]]; then
+    entry="$script_dir/transport_latency.py"
+    transport_args=()
+    shift
+fi
+
+exec "$serving_python" "$entry" "${transport_args[@]}" "$@"

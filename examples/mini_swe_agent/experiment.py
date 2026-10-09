@@ -9,6 +9,7 @@
 """Run a bounded, unattended repair experiment on a fresh fixture copy."""
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -23,6 +24,7 @@ import time
 from minisweagent.agents.default import DefaultAgent
 
 from budget import BudgetedTextModel
+from direct_engine import DirectEngineTextModel, EngineHost
 from repair_demo import FIXTURE, run_tests
 from runtime import VerifiedEnvironment, coding_config, shell_environment
 
@@ -48,7 +50,7 @@ VARIANTS = {
 }
 
 
-class TimedModel(BudgetedTextModel):
+class TimedQueries:
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.query_seconds = []
@@ -59,6 +61,14 @@ class TimedModel(BudgetedTextModel):
             return super().query(messages)
         finally:
             self.query_seconds.append(time.monotonic() - started)
+
+
+class TimedModel(TimedQueries, BudgetedTextModel):
+    pass
+
+
+class TimedDirectModel(TimedQueries, DirectEngineTextModel):
+    pass
 
 
 class LoggedEnvironment(VerifiedEnvironment):
@@ -80,9 +90,14 @@ class LoggedEnvironment(VerifiedEnvironment):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--variant", choices=VARIANTS, required=True)
+    parser.add_argument("--transport", choices=("http", "direct"), default="http")
     parser.add_argument("--api-base", default="http://127.0.0.1:8901/v1")
     parser.add_argument("--model", default="qwen3-agent")
     parser.add_argument("--tokenizer-path", type=Path, default=Path("/data/models/Qwen3-14B"))
+    parser.add_argument("--model-path", type=Path, help="Model directory in direct mode; defaults to --tokenizer-path")
+    parser.add_argument("--platform", default="a2a3", help="NPU platform in direct mode")
+    parser.add_argument("--device", type=int, help="Reserved NPU device in direct mode")
+    parser.add_argument("--use-compile-cache", action="store_true", help="Reuse compiled kernels in direct mode")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/mini_swe_agent_experiments"))
     parser.add_argument("--context-limit", type=int, default=4096)
     parser.add_argument("--request-timeout", type=float, default=120)
@@ -96,6 +111,11 @@ def main():
         parser.error("Timeouts must be positive")
     if args.steps <= 0:
         parser.error("--steps must be positive")
+    if args.transport == "direct" and args.device is None and not args.prepare_only:
+        parser.error("--device is required for direct generation")
+    model_path = args.model_path or args.tokenizer_path
+    if args.transport == "direct" and model_path.resolve() != args.tokenizer_path.resolve():
+        parser.error("--model-path and --tokenizer-path must match in direct mode")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     run_dir = Path(tempfile.mkdtemp(prefix=args.variant + "_", dir=args.output_dir.resolve()))
     workspace = run_dir / "workspace"
@@ -114,7 +134,9 @@ def main():
     manifest = {
         "variant": args.variant, "settings": variant, "steps": args.steps,
         "context_limit": args.context_limit,
-        "request_timeout": args.request_timeout, "wall_time": args.wall_time, "temperature": 0.0, "api_base": args.api_base,
+        "request_timeout": args.request_timeout, "wall_time": args.wall_time, "temperature": 0.0,
+        "transport": args.transport, "api_base": args.api_base if args.transport == "http" else None,
+        "model_path": str(model_path), "device": args.device if args.transport == "direct" else None,
         "model": args.model, "operator_hints": False, "agent": "DefaultAgent",
         "fixture_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                            for p in workspace.iterdir() if p.is_file()},
@@ -140,40 +162,62 @@ def main():
         + ". Run this verification command exactly:\n" + verify_command
         + "\nFailed verification is returned as an observation; continue fixing the task.\n"
     )
-    model = TimedModel(
-        tokenizer_path=args.tokenizer_path, context_limit=args.context_limit, model_name=f"openai/{args.model}",
-        workspace=workspace, context_files=context_files,
-        action_regex=r"```bash\s*\n(.*?)\n```", allow_multiple_actions=True, verified_batch_completion=True, cost_tracking="ignore_errors",
-        observation_template=config["model"]["observation_template"],
-        format_error_template=config["model"]["format_error_template"],
-        model_kwargs={"api_base": args.api_base, "api_key": "local-placeholder", "temperature": 0.0,
-                      "max_tokens": variant["max_tokens"], "stream": False, "timeout": args.request_timeout,
-                      "num_retries": 0,
-                      "extra_body": {"chat_template_kwargs": {"enable_thinking": variant["thinking"]}}},
-    )
-    agent = DefaultAgent(
-        model, environment, system_template=system_template,
-        instance_template=config["agent"]["instance_template"], step_limit=args.steps,
-        wall_time_limit_seconds=args.wall_time, cost_limit=0, max_consecutive_format_errors=2,
-        output_path=run_dir / "trajectory.json",
-    )
     print("RUN_DIR", run_dir, flush=True)
-    if args.prepare_only:
-        agent.extra_template_vars["task"] = task
-        messages = [
-            {"role": "system", "content": agent._render_template(system_template)},
-            {"role": "user", "content": agent._render_template(config["agent"]["instance_template"])},
+    host = nullcontext(None)
+    if args.transport == "direct" and not args.prepare_only:
+        from pypto_serving.cli.main import build_parser, build_serving_engine_config
+
+        engine_args = [
+            "--model", str(model_path), "--served-model-name", args.model,
+            "--platform", args.platform, "--device", str(args.device),
+            "--max-model-len", str(args.context_limit),
         ]
-        model._prepare_messages_for_api(messages)
-        (run_dir / "dry_run.json").write_text(json.dumps(model.context_events[-1], indent=2))
-        print("Prepared only; no model request or Agent action executed.", flush=True)
-        return 0
-    started = time.monotonic()
-    try:
-        result = agent.run(task)
-    except Exception as error:
-        result = {"exit_status": type(error).__name__, "error": str(error)}
-    elapsed = time.monotonic() - started
+        if args.use_compile_cache:
+            engine_args.append("--use-compile-cache")
+        host = EngineHost(build_serving_engine_config(build_parser().parse_args(engine_args)))
+    total_started = time.monotonic()
+    with host as running_host:
+        engine_start_seconds = time.monotonic() - total_started if running_host else None
+        model_kwargs = {
+            "temperature": 0.0, "max_tokens": variant["max_tokens"], "stream": False,
+            "timeout": args.request_timeout, "num_retries": 0,
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": variant["thinking"]}},
+        }
+        if args.transport == "http":
+            model_kwargs.update({"api_base": args.api_base, "api_key": "local-placeholder"})
+        model_class = TimedDirectModel if running_host else TimedModel
+        model = model_class(
+            tokenizer_path=args.tokenizer_path, context_limit=args.context_limit,
+            model_name=f"openai/{args.model}", workspace=workspace, context_files=context_files,
+            action_regex=r"```bash\s*\n(.*?)\n```", allow_multiple_actions=True,
+            verified_batch_completion=True, cost_tracking="ignore_errors",
+            observation_template=config["model"]["observation_template"],
+            format_error_template=config["model"]["format_error_template"], model_kwargs=model_kwargs,
+            **({"engine": running_host.engine, "loop": running_host.loop} if running_host else {}),
+        )
+        agent = DefaultAgent(
+            model, environment, system_template=system_template,
+            instance_template=config["agent"]["instance_template"], step_limit=args.steps,
+            wall_time_limit_seconds=args.wall_time, cost_limit=0, max_consecutive_format_errors=2,
+            output_path=run_dir / "trajectory.json",
+        )
+        if args.prepare_only:
+            agent.extra_template_vars["task"] = task
+            messages = [
+                {"role": "system", "content": agent._render_template(system_template)},
+                {"role": "user", "content": agent._render_template(config["agent"]["instance_template"])},
+            ]
+            model._prepare_messages_for_api(messages)
+            (run_dir / "dry_run.json").write_text(json.dumps(model.context_events[-1], indent=2))
+            print("Prepared only; no model request or Agent action executed.", flush=True)
+            return 0
+        started = time.monotonic()
+        try:
+            result = agent.run(task)
+        except Exception as error:
+            result = {"exit_status": type(error).__name__, "error": str(error)}
+        elapsed = time.monotonic() - started
+    total_seconds = time.monotonic() - total_started
     try:
         check = subprocess.run([sys.executable, str(source_dir / "repair_demo.py"), "check", str(workspace)],
                                text=True, capture_output=True, timeout=90)
@@ -189,7 +233,8 @@ def main():
         **manifest, "run_dir": str(run_dir), "result": result,
         "passed": verification.get("passed", False),
         "accepted": result.get("exit_status") == "Submitted" and verification.get("passed", False),
-        "elapsed_seconds": elapsed, "model_seconds": sum(model.query_seconds),
+        "elapsed_seconds": elapsed, "engine_start_seconds": engine_start_seconds,
+        "total_seconds_before_final_check": total_seconds, "model_seconds": sum(model.query_seconds),
         "command_seconds_including_gate": sum(environment.command_seconds),
         "calls_attempted": agent.n_calls, "responses": len(responses),
         "input_tokens": sum(r["usage"]["prompt_tokens"] for r in responses),

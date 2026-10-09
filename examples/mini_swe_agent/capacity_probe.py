@@ -6,24 +6,28 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Check short and long-context HTTP inference before running Agent experiments."""
+"""Check short and long-context inference before running Agent experiments."""
 
 import json
 from pathlib import Path
 import re
 import time
+from typing import Callable
 import urllib.request
 
 from budget import LocalTextCounter
 
 
-def probe_capacity(*, api_base: str, tokenizer_path: Path, context_limit: int,
-                   output_dir: Path, timeout: float) -> list[dict]:
+def probe_capacity(*, api_base: str | None, tokenizer_path: Path, context_limit: int,
+                   output_dir: Path, timeout: float,
+                   generate: Callable[[dict], dict] | None = None) -> list[dict]:
     if context_limit < 8192:
         raise ValueError("The long-context probe requires at least 8192 tokens")
+    if generate is None and not api_base:
+        raise ValueError("An API base or direct generation callback is required")
     output_dir.mkdir(parents=True, exist_ok=False)
     counter = LocalTextCounter(tokenizer_path, enable_thinking=True)
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({})) if generate is None else None
     results = []
     for name, target in (("short", 0), ("cross_4096", 4090), ("long", context_limit - 1024)):
         code = "731942"
@@ -48,12 +52,15 @@ def probe_capacity(*, api_base: str, tokenizer_path: Path, context_limit: int,
         body = {"model": "qwen3-agent", "messages": messages, "max_tokens": 512,
                 "temperature": 0, "stream": False, "chat_template_kwargs": {"enable_thinking": True}}
         (output_dir / f"{name}_request.json").write_text(json.dumps(body, indent=2))
-        request = urllib.request.Request(api_base + "/chat/completions",
-                                         data=json.dumps(body).encode(),
-                                         headers={"Content-Type": "application/json"})
         started = time.monotonic()
-        with opener.open(request, timeout=timeout) as response:
-            data = json.loads(response.read())
+        if generate is None:
+            request = urllib.request.Request(api_base + "/chat/completions",
+                                             data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"})
+            with opener.open(request, timeout=timeout) as response:
+                data = json.loads(response.read())
+        else:
+            data = generate(body)
         (output_dir / f"{name}_response.json").write_text(json.dumps(data, indent=2))
         choice = data["choices"][0]
         answer = re.sub(r"<think>.*?</think>", "", choice["message"].get("content") or "", flags=re.S).strip()
