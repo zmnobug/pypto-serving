@@ -137,8 +137,8 @@ def main():
     system_template = config["agent"]["system_template"] + (
         "\nCompletion is checked independently. Required changed files: " + str(required)
         + ". Protected files: " + str(protected)
-        + ". The verification command must pass: " + verify_command
-        + ". Failed verification is returned as an observation; continue fixing the task.\n"
+        + ". Run this verification command exactly:\n" + verify_command
+        + "\nFailed verification is returned as an observation; continue fixing the task.\n"
     )
     model = TimedModel(
         tokenizer_path=args.tokenizer_path, context_limit=args.context_limit, model_name=f"openai/{args.model}",
