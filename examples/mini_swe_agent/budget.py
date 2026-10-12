@@ -9,7 +9,9 @@
 """Fit text-action history to the local Qwen chat template and token budget."""
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
+import time
 
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from tokenizers import Tokenizer
@@ -55,7 +57,9 @@ class LocalTextCounter:
 
 class BudgetedTextModel(CompleteTextModel):
     def __init__(self, *, tokenizer_path: Path, context_limit: int,
-                 workspace: Path | None = None, context_files: list[str] | None = None, **kwargs):
+                 workspace: Path | None = None, context_files: list[str] | None = None,
+                 transport: str = "http", session_id: str | None = None,
+                 serving_snapshot=None, **kwargs):
         super().__init__(**kwargs)
         thinking = self.config.model_kwargs.get("extra_body", {}).get("chat_template_kwargs", {}).get(
             "enable_thinking", False
@@ -68,6 +72,10 @@ class BudgetedTextModel(CompleteTextModel):
         if self.context_files and self.workspace is None:
             raise ValueError("Context files require an explicit workspace")
         self.context_events: list[dict] = []
+        self.request_events: list[dict] = []
+        self.transport = transport
+        self.session_id = session_id
+        self.serving_snapshot = serving_snapshot
         self._request_max_tokens = self.config.model_kwargs["max_tokens"]
         self._task_marker = None
         self._history_restart_at = 0
@@ -77,7 +85,65 @@ class BudgetedTextModel(CompleteTextModel):
         # Preserve the user's thinking setting on every request, including retries.
         body = dict(self.config.model_kwargs.get("extra_body", {}))
         overrides["extra_body"] = body
-        return super()._query(messages, **(kwargs | overrides))
+        return self._observe_request(
+            lambda: super(BudgetedTextModel, self)._query(messages, **(kwargs | overrides))
+        )
+
+    def _observe_request(self, generate, *, request_id=None):
+        sampling_seconds = 0.0
+
+        def snapshot():
+            nonlocal sampling_seconds
+            if self.serving_snapshot is None:
+                return None
+            started = time.monotonic()
+            try:
+                return self.serving_snapshot()
+            except Exception as error:
+                return {"error": type(error).__name__, "message": str(error)}
+            finally:
+                sampling_seconds += time.monotonic() - started
+
+        before = snapshot()
+        started_at = datetime.now(timezone.utc).isoformat()
+        started = time.monotonic()
+        response = None
+        failure = None
+        try:
+            response = generate()
+            return response
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            duration = time.monotonic() - started
+            after = snapshot()
+            context_index = len(self.context_events) - 1 if self.context_events else None
+            context = self.context_events[context_index] if context_index is not None else {}
+            usage = getattr(response, "usage", None)
+            choices = getattr(response, "choices", None)
+            self.request_events.append({
+                "index": len(self.request_events),
+                "session_id": self.session_id,
+                "transport": self.transport,
+                "request_id": getattr(response, "id", None) or request_id,
+                "context_event_index": context_index,
+                "started_at": started_at,
+                "duration_seconds": duration,
+                "serving_sampling_seconds": sampling_seconds,
+                "status": "error" if failure else "success",
+                "error_type": type(failure).__name__ if failure else None,
+                "error_message": str(failure) if failure else None,
+                "prompt_tokens_estimated": context.get("prompt_tokens"),
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "output_tokens": getattr(usage, "completion_tokens", None),
+                "output_reserve": self._request_max_tokens,
+                "enable_thinking": self.config.model_kwargs.get("extra_body", {}).get(
+                    "chat_template_kwargs", {}).get("enable_thinking", False),
+                "finish_reason": choices[0].finish_reason if choices else None,
+                "serving_before": before,
+                "serving_after": after,
+            })
 
     def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
         max_tokens = self.config.model_kwargs["max_tokens"]
@@ -257,4 +323,5 @@ class BudgetedTextModel(CompleteTextModel):
             "workspace": str(self.workspace) if self.workspace is not None else None,
             "requests": self.context_events,
         }
+        data["info"]["serving_observations"] = self.request_events
         return data

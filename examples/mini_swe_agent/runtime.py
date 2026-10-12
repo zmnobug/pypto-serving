@@ -19,6 +19,8 @@ from minisweagent.config import builtin_config_dir, get_config_from_spec
 from minisweagent.environments.local import LocalEnvironment, LocalEnvironmentConfig
 from minisweagent.exceptions import Submitted
 
+from failure_signals import verification_signature
+
 
 def coding_config(*, compact: bool = False) -> dict:
     config = get_config_from_spec(builtin_config_dir / "default.yaml")
@@ -81,6 +83,7 @@ class VerifiedEnvironmentConfig(LocalEnvironmentConfig):
     verification_dir: str = ""
     verification_timeout: int = 60
     edit_feedback: bool = False
+    repeat_check_feedback: bool = False
 
 
 class VerifiedEnvironment(LocalEnvironment):
@@ -101,6 +104,35 @@ class VerifiedEnvironment(LocalEnvironment):
         self.verifications: list[dict] = []
         self._attempts_since_change: dict[str, tuple[tuple, int]] = {}
         self._empty_observations = 0
+        self._last_failure_signature = None
+        self._same_failure_count = 0
+
+    def _record_check_result(self, verification: dict) -> None:
+        if not self.config.repeat_check_feedback:
+            return
+        if verification["passed"]:
+            self._last_failure_signature = None
+            self._same_failure_count = 0
+            return
+        signature = verification_signature(verification)
+        self._same_failure_count = self._same_failure_count + 1 if signature == (
+            self._last_failure_signature
+        ) else 1
+        self._last_failure_signature = signature
+        verification["failure_signature"] = signature
+        verification["repeat_failure_count"] = self._same_failure_count
+
+    def _repeat_failure_notice(self, verification: dict) -> str:
+        if verification.get("repeat_failure_count", 0) < 2:
+            return ""
+        failed_tests = verification["failure_signature"]["public_failures"]
+        tests = ", ".join(failed_tests) if failed_tests else "the same verification check"
+        return (
+            f"\n[The same failure has occurred {verification['repeat_failure_count']} times: {tests}. "
+            "Stop guessing edits. Reproduce the failing command directly and inspect its stderr "
+            "and the current source before editing again. If the test reports CalledProcessError, "
+            "its traceback does not show the child process error.]\n"
+        )
 
     def _snapshot(self) -> dict:
         return {name: hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
@@ -122,11 +154,19 @@ class VerifiedEnvironment(LocalEnvironment):
             return {
                 "returncode": 1,
                 "output": "Completion rejected. Fix the remaining issues and rerun tests.\n"
-                          + "\n".join(verification["reasons"]) + "\n" + verification["output"],
+                          + "\n".join(verification["reasons"]) + "\n" + verification["output"]
+                          + self._repeat_failure_notice(verification),
                 "exception_info": "",
                 "extra": {"verification": verification},
             }
         after = self._snapshot()
+        if self.config.repeat_check_feedback and action.get("command") == self.config.verify_command:
+            check = {"passed": output["returncode"] == 0, "output": output["output"],
+                     "reasons": [f"Verification command failed with exit code {output['returncode']}."]
+                     if output["returncode"] else []}
+            self._record_check_result(check)
+            output["output"] += self._repeat_failure_notice(check)
+            output.setdefault("extra", {})["repeat_failure_count"] = check.get("repeat_failure_count", 0)
         if self.config.edit_feedback:
             raw_output = output["output"]
             # A reply can alternate several failing commands. Count each one
@@ -214,6 +254,7 @@ class VerifiedEnvironment(LocalEnvironment):
             "returncode": output["returncode"], "output": output["output"],
             "reasons": reasons, "initial_files": self.initial, "current_files": after,
         }
+        self._record_check_result(verification)
         self.verifications.append(verification)
         if self.config.verification_dir:
             folder = Path(self.config.verification_dir)

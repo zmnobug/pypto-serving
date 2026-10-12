@@ -76,7 +76,7 @@ class DirectEngineTests(unittest.TestCase):
         self.engine = FakeEngine()
         self.model = DirectEngineTextModel(
             engine=self.engine, loop=self.loop, generate_config_factory=SimpleNamespace,
-            tokenizer_path=folder, context_limit=100,
+            tokenizer_path=folder, context_limit=100, transport="direct",
             model_name="openai/qwen3-agent", action_regex=r"```bash\s*\n(.*?)\n```",
             cost_tracking="ignore_errors",
             model_kwargs={"max_tokens": 20, "temperature": 0.0, "timeout": 5,
@@ -102,7 +102,10 @@ class DirectEngineTests(unittest.TestCase):
         self.assertFalse(config.stream)
         self.assertEqual(response.usage.prompt_tokens, 19)
         self.assertEqual(response.usage.completion_tokens, 7)
+        self.assertEqual(response.id, "direct-1")
         self.assertEqual(response.choices[0].finish_reason, "stop")
+        self.assertEqual(self.model.request_events[0]["request_id"], "direct-1")
+        self.assertEqual(self.model.request_events[0]["transport"], "direct")
         self.assertEqual(self.model._parse_actions(response), [{"command": "cat input.txt"}])
 
     def test_length_response_is_recorded_and_never_executed(self):
@@ -160,6 +163,8 @@ class DirectEngineTests(unittest.TestCase):
         with self.assertRaisesRegex(TimeoutError, "timed out"):
             self.model._query([{"role": "user", "content": "Read input.txt"}])
         self.assertTrue(cancelled.wait(1))
+        self.assertEqual(self.model.request_events[0]["error_type"], "TimeoutError")
+        self.assertEqual(self.model.request_events[0]["request_id"], "direct-1")
 
     def test_engine_error_is_reported_as_generation_failure(self):
         async def failed_request(_request_id, _prompt, _config):

@@ -10,6 +10,7 @@
 
 import argparse
 from contextlib import nullcontext
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -22,9 +23,11 @@ import tempfile
 import time
 
 from minisweagent.agents.default import DefaultAgent
+from minisweagent.exceptions import Submitted
 
 from budget import BudgetedTextModel
 from direct_engine import DirectEngineTextModel, EngineHost
+from observability import direct_snapshot_reader, http_snapshot_reader
 from repair_demo import FIXTURE, run_tests
 from runtime import VerifiedEnvironment, coding_config, shell_environment
 
@@ -71,20 +74,54 @@ class TimedDirectModel(TimedQueries, DirectEngineTextModel):
     pass
 
 
+def response_ids_match(request_events: list[dict], responses: list[dict]) -> bool:
+    successful = [event for event in request_events if event["status"] == "success"]
+    return len(successful) == len(responses) and all(
+        event["request_id"] == response.get("id")
+        for event, response in zip(successful, responses)
+    )
+
+
 class LoggedEnvironment(VerifiedEnvironment):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.command_seconds = []
+        self.action_events = []
 
     def execute(self, action, **kwargs):
         print("ACTION", action["command"], flush=True)
+        started_at = datetime.now(timezone.utc).isoformat()
         started = time.monotonic()
+        before = self._snapshot()
+        verification_count = len(self.verifications)
+        result = None
+        failure = None
         try:
             result = super().execute(action, **kwargs)
             print("RESULT", result["returncode"], result["output"][-1800:], flush=True)
             return result
+        except BaseException as error:
+            failure = error
+            raise
         finally:
-            self.command_seconds.append(time.monotonic() - started)
+            duration = time.monotonic() - started
+            self.command_seconds.append(duration)
+            after = self._snapshot()
+            extra = result.get("extra", {}) if result else {}
+            self.action_events.append({
+                "index": len(self.action_events), "started_at": started_at,
+                "command": action["command"], "duration_seconds": duration,
+                "returncode": result["returncode"] if result else None,
+                "error_type": type(failure).__name__ if failure else None,
+                "submitted": isinstance(failure, Submitted),
+                "changed_files": [name for name in before if before[name] != after[name]],
+                "stalled": bool(extra.get("stalled")),
+                "repeat_failure_count": extra.get("repeat_failure_count") or (
+                    extra.get("verification") or {}
+                ).get("repeat_failure_count"),
+                "verification_passed": self.verifications[-1]["passed"]
+                if len(self.verifications) > verification_count else None,
+            })
 
 
 def main():
@@ -104,6 +141,9 @@ def main():
     parser.add_argument("--wall-time", type=float, default=600)
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--prepare-only", action="store_true", help="Validate the initial request without inference")
+    parser.add_argument("--no-serving-metrics", action="store_true", help="Keep request events but skip metrics sampling")
+    parser.add_argument("--repeat-check-feedback", action="store_true",
+                        help="Ask for direct error evidence after the same completion check fails twice")
     args = parser.parse_args()
     if args.context_limit <= VARIANTS[args.variant]["max_tokens"]:
         parser.error("--context-limit must exceed the configured output allowance")
@@ -138,6 +178,9 @@ def main():
         "transport": args.transport, "api_base": args.api_base if args.transport == "http" else None,
         "model_path": str(model_path), "device": args.device if args.transport == "direct" else None,
         "model": args.model, "operator_hints": False, "agent": "DefaultAgent",
+        "request_observability": True,
+        "serving_metrics_enabled": not args.no_serving_metrics,
+        "repeat_check_feedback": args.repeat_check_feedback,
         "fixture_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                            for p in workspace.iterdir() if p.is_file()},
     }
@@ -155,6 +198,7 @@ def main():
         verify_command=verify_command, require_changes=required, protected_files=protected,
         verification_dir=str(run_dir),
         edit_feedback=bool(context_files),
+        repeat_check_feedback=args.repeat_check_feedback,
     )
     system_template = config["agent"]["system_template"] + (
         "\nCompletion is checked independently. Required changed files: " + str(required)
@@ -186,8 +230,12 @@ def main():
         if args.transport == "http":
             model_kwargs.update({"api_base": args.api_base, "api_key": "local-placeholder"})
         model_class = TimedDirectModel if running_host else TimedModel
+        snapshot_reader = None if args.no_serving_metrics else (
+            direct_snapshot_reader(running_host.engine) if running_host else http_snapshot_reader(args.api_base)
+        )
         model = model_class(
             tokenizer_path=args.tokenizer_path, context_limit=args.context_limit,
+            transport=args.transport, session_id=run_dir.name, serving_snapshot=snapshot_reader,
             model_name=f"openai/{args.model}", workspace=workspace, context_files=context_files,
             action_regex=r"```bash\s*\n(.*?)\n```", allow_multiple_actions=True,
             verified_batch_completion=True, cost_tracking="ignore_errors",
@@ -227,6 +275,8 @@ def main():
         verification = {"passed": False, "error": str(error)}
     responses = [m["extra"]["response"] for m in agent.messages if "response" in m.get("extra", {})]
     events = model.context_events
+    (run_dir / "request_events.json").write_text(json.dumps(model.request_events, indent=2))
+    (run_dir / "action_events.json").write_text(json.dumps(environment.action_events, indent=2))
     public = verification.get("public", {}).get("output", "")
     extra = verification.get("independent", {}).get("output", "")
     summary = {
@@ -235,6 +285,18 @@ def main():
         "accepted": result.get("exit_status") == "Submitted" and verification.get("passed", False),
         "elapsed_seconds": elapsed, "engine_start_seconds": engine_start_seconds,
         "total_seconds_before_final_check": total_seconds, "model_seconds": sum(model.query_seconds),
+        "inference_seconds": sum(event["duration_seconds"] for event in model.request_events),
+        "serving_sampling_seconds": sum(event["serving_sampling_seconds"] for event in model.request_events),
+        "request_events_file": "request_events.json", "action_events_file": "action_events.json",
+        "request_events": len(model.request_events), "action_events": len(environment.action_events),
+        "request_errors": sum(event["status"] == "error" for event in model.request_events),
+        "feedback_triggers": sum((event["repeat_failure_count"] or 0) >= 2
+                                 for event in environment.action_events),
+        "response_ids_match": response_ids_match(model.request_events, responses),
+        "serving_sample_errors": sum(
+            isinstance(event[key], dict) and "error" in event[key]
+            for event in model.request_events for key in ("serving_before", "serving_after")
+        ),
         "command_seconds_including_gate": sum(environment.command_seconds),
         "calls_attempted": agent.n_calls, "responses": len(responses),
         "input_tokens": sum(r["usage"]["prompt_tokens"] for r in responses),

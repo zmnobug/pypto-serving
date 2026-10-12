@@ -10,6 +10,7 @@
 
 import argparse
 from contextlib import nullcontext
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -19,6 +20,7 @@ from minisweagent.agents.interactive import InteractiveAgent
 
 from budget import BudgetedTextModel, ContextBudgetExceeded
 from direct_engine import DirectGenerationError
+from observability import direct_snapshot_reader, http_snapshot_reader
 from runtime import VerifiedEnvironment, coding_config, shell_environment
 
 
@@ -77,6 +79,9 @@ def main() -> int:
     parser.add_argument("--tokenizer-path", type=Path, help="Defaults to --model-path in direct mode")
     parser.add_argument("--context-limit", type=int, default=4096)
     parser.add_argument("--request-timeout", type=float, default=600, help="Model request timeout in seconds")
+    parser.add_argument("--no-serving-metrics", action="store_true", help="Keep request events but skip metrics sampling")
+    parser.add_argument("--repeat-check-feedback", action="store_true",
+                        help="Ask for direct error evidence after the same completion check fails twice")
     parser.add_argument("--verify-command", default="", help="Command that must pass before completion")
     parser.add_argument("--require-change", action="append", default=[], help="File that must change; repeatable")
     parser.add_argument("--protect", action="append", default=[], help="File that must stay unchanged; repeatable")
@@ -120,6 +125,7 @@ def main() -> int:
         verify_command=args.verify_command, require_changes=args.require_change,
         protected_files=args.protect, verification_dir=str(run_dir),
         edit_feedback=bool(args.context_file),
+        repeat_check_feedback=args.repeat_check_feedback,
     )
     system_template = config["agent"]["system_template"] if args.profile == "coding" else CHAT_SYSTEM_TEMPLATE
     if args.verify_command:
@@ -154,8 +160,12 @@ def main() -> int:
         model_kwargs.update({"api_base": args.api_base, "api_key": "local-placeholder"})
 
     with host as running_host:
+        snapshot_reader = None if args.no_serving_metrics else (
+            direct_snapshot_reader(running_host.engine) if running_host else http_snapshot_reader(args.api_base)
+        )
         model = model_class(
             tokenizer_path=args.tokenizer_path, context_limit=args.context_limit,
+            transport=args.transport, session_id=run_dir.name, serving_snapshot=snapshot_reader,
             workspace=workspace, context_files=args.context_file,
             model_name=f"openai/{args.model}",
             action_regex=r"```bash\s*\n(.*?)\n```",
@@ -189,6 +199,8 @@ def main() -> int:
             print(f"Model request failed ({type(error).__name__}). Check model availability and context capacity.")
             print(f"The task is not complete. Saved trajectory: {run_dir / 'trajectory.json'}")
             return 1
+        finally:
+            (run_dir / "request_events.json").write_text(json.dumps(model.request_events, indent=2))
     print(f"Session ended: {result.get('exit_status')}")
     return 0 if result.get("exit_status") == "Submitted" else 1
 

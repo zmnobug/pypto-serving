@@ -16,9 +16,11 @@ import unittest
 from unittest.mock import patch
 
 from tokenizers import Tokenizer, models, pre_tokenizers
+from litellm import ModelResponse
 
 from budget import BudgetedTextModel, ContextBudgetExceeded
 from context import workspace_context
+from smoke import CompleteTextModel
 
 
 class ContextTests(unittest.TestCase):
@@ -44,6 +46,44 @@ class ContextTests(unittest.TestCase):
                 {"role": "user", "content": "observed " * 20, "extra": {"raw_output": "observed " * 20}},
             ])
         return result
+
+    def test_http_request_observation_keeps_response_and_serving_state(self):
+        observations = iter([
+            {"server_id": "s1", "replicas": [{"engine": 0, "gauges": {"waiting": 1}}]},
+            {"server_id": "s1", "replicas": [{"engine": 0, "gauges": {"waiting": 0}}]},
+        ])
+        self.model.serving_snapshot = lambda: next(observations)
+        self.model.session_id = "session-1"
+        response = ModelResponse(
+            id="chatcmpl-1", choices=[{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                                       "finish_reason": "stop"}],
+            usage={"prompt_tokens": 12, "completion_tokens": 2, "total_tokens": 14},
+        )
+        self.model._prepare_messages_for_api(self.messages()[:2])
+        with patch.object(CompleteTextModel, "_query", return_value=response):
+            self.assertIs(self.model._query([{"role": "user", "content": "hello"}]), response)
+        event = self.model.request_events[0]
+        self.assertEqual((event["session_id"], event["transport"], event["request_id"]),
+                         ("session-1", "http", "chatcmpl-1"))
+        self.assertEqual((event["prompt_tokens"], event["output_tokens"], event["finish_reason"]),
+                         (12, 2, "stop"))
+        self.assertEqual(event["context_event_index"], 0)
+        self.assertEqual(event["serving_before"]["replicas"][0]["gauges"]["waiting"], 1)
+        self.assertEqual(event["serving_after"]["replicas"][0]["gauges"]["waiting"], 0)
+        self.assertEqual(self.model.serialize()["info"]["serving_observations"], [event])
+
+    def test_metrics_failure_does_not_block_inference_or_hide_request_error(self):
+        def unavailable():
+            raise OSError("metrics unavailable")
+
+        self.model.serving_snapshot = unavailable
+        with patch.object(CompleteTextModel, "_query", side_effect=TimeoutError("model timeout")):
+            with self.assertRaises(TimeoutError):
+                self.model._query([{"role": "user", "content": "hello"}])
+        event = self.model.request_events[0]
+        self.assertEqual((event["status"], event["error_type"]), ("error", "TimeoutError"))
+        self.assertEqual(event["serving_before"]["error"], "OSError")
+        self.assertEqual(event["serving_after"]["error"], "OSError")
 
     def test_discards_old_pairs_and_preserves_task_and_latest_evidence(self):
         messages = self.messages()

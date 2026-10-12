@@ -73,6 +73,7 @@ class DirectEngineTextModel(BudgetedTextModel):
     """Preserve the existing Agent parser and budget while replacing inference."""
 
     def __init__(self, *, engine, loop, generate_config_factory=None, **kwargs):
+        kwargs.setdefault("transport", "direct")
         super().__init__(**kwargs)
         self.engine = engine
         self.loop = loop
@@ -81,7 +82,7 @@ class DirectEngineTextModel(BudgetedTextModel):
     def _calculate_cost(self, _response):
         return {"cost": 0.0}
 
-    async def _generate(self, messages, *, max_tokens, temperature, thinking):
+    async def _generate(self, messages, *, request_id, max_tokens, temperature, thinking):
         config_factory = self.generate_config_factory
         if config_factory is None:
             from pypto_serving.config.types import GenerateConfig
@@ -91,7 +92,6 @@ class DirectEngineTextModel(BudgetedTextModel):
             [{"role": message["role"], "content": message.get("content", "")} for message in messages],
             tokenize=False, add_generation_prompt=True, enable_thinking=thinking,
         )
-        request_id = self.engine.generate_request_id()
         config = config_factory(max_new_tokens=max_tokens, temperature=temperature, stream=False)
         final = None
         try:
@@ -106,6 +106,7 @@ class DirectEngineTextModel(BudgetedTextModel):
         if reason == "eos":
             reason = "stop"
         return ModelResponse(
+            id=request_id,
             model=self.config.model_name.removeprefix("openai/"),
             choices=[{"index": 0, "message": {"role": "assistant", "content": final.text},
                       "finish_reason": reason,
@@ -116,10 +117,16 @@ class DirectEngineTextModel(BudgetedTextModel):
         )
 
     def _query(self, messages, **kwargs):
+        request_id = self.engine.generate_request_id()
+        return self._observe_request(
+            lambda: self._query_engine(messages, request_id=request_id, **kwargs), request_id=request_id
+        )
+
+    def _query_engine(self, messages, *, request_id, **kwargs):
         options = self.config.model_kwargs | kwargs
         thinking = options.get("extra_body", {}).get("chat_template_kwargs", {}).get("enable_thinking", False)
         future = asyncio.run_coroutine_threadsafe(self._generate(
-            messages, max_tokens=self._request_max_tokens,
+            messages, request_id=request_id, max_tokens=self._request_max_tokens,
             temperature=options.get("temperature", 0.0), thinking=thinking,
         ), self.loop)
         try:

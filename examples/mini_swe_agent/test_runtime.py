@@ -17,6 +17,7 @@ import unittest
 
 from minisweagent.exceptions import Submitted
 
+from experiment import LoggedEnvironment
 from runtime import VerifiedEnvironment, coding_config, shell_environment
 
 
@@ -45,6 +46,64 @@ class VerificationTests(unittest.TestCase):
         self.assertIn("AssertionError", output["output"])
         record = json.loads((self.root / "audit/verification_1.json").read_text())
         self.assertFalse(record["passed"])
+
+    def test_repeated_check_feedback_requires_opt_in_and_resets_after_success(self):
+        default_first = self.env.execute(COMPLETE)
+        default_second = self.env.execute(COMPLETE)
+        self.assertNotIn("Stop guessing edits", default_first["output"])
+        self.assertNotIn("Stop guessing edits", default_second["output"])
+
+        env = VerifiedEnvironment(
+            cwd=str(self.root), env=shell_environment(),
+            verify_command=self.env.config.verify_command,
+            require_changes=["source.txt"], protected_files=["test.txt"],
+            repeat_check_feedback=True,
+        )
+        first = env.execute(COMPLETE)
+        second = env.execute(COMPLETE)
+        self.assertNotIn("Stop guessing edits", first["output"])
+        self.assertIn("Stop guessing edits", second["output"])
+        self.assertEqual(second["extra"]["verification"]["repeat_failure_count"], 2)
+        env.execute({"command": "printf fixed > source.txt"})
+        with self.assertRaises(Submitted):
+            env.execute(COMPLETE)
+        self.assertEqual(env._same_failure_count, 0)
+
+    def test_explicit_and_completion_checks_share_failure_count(self):
+        env = VerifiedEnvironment(
+            cwd=str(self.root), env=shell_environment(),
+            verify_command=self.env.config.verify_command,
+            require_changes=["source.txt"], repeat_check_feedback=True,
+        )
+        first = env.execute({"command": env.config.verify_command})
+        self.assertNotIn("Stop guessing edits", first["output"])
+        second = env.execute(COMPLETE)
+        self.assertIn("Stop guessing edits", second["output"])
+        self.assertEqual(second["extra"]["verification"]["repeat_failure_count"], 2)
+
+    def test_experiment_action_event_keeps_repeated_completion_count(self):
+        env = LoggedEnvironment(
+            cwd=str(self.root), env=shell_environment(),
+            verify_command=self.env.config.verify_command,
+            require_changes=["source.txt"], repeat_check_feedback=True,
+        )
+        env.execute(COMPLETE)
+        env.execute(COMPLETE)
+        self.assertEqual([event["repeat_failure_count"] for event in env.action_events], [1, 2])
+
+    def test_experiment_actions_record_edits_and_completion_checks(self):
+        env = LoggedEnvironment(
+            cwd=str(self.root), env=shell_environment(),
+            verify_command=self.env.config.verify_command,
+            require_changes=["source.txt"], protected_files=["test.txt"],
+            verification_dir=str(self.root / "observed_audit"),
+        )
+        env.execute({"command": "printf fixed > source.txt"})
+        with self.assertRaises(Submitted):
+            env.execute(COMPLETE)
+        self.assertEqual(env.action_events[0]["changed_files"], ["source.txt"])
+        self.assertEqual(env.action_events[1]["verification_passed"], True)
+        self.assertTrue(env.action_events[1]["submitted"])
 
     def test_actual_fix_passes_but_later_regression_is_rechecked(self):
         output = self.env.execute({"command": "printf fixed > source.txt"})

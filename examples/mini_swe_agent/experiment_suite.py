@@ -51,6 +51,8 @@ def main():
     parser.add_argument("--request-timeout", type=float, default=120)
     parser.add_argument("--wall-time", type=float, default=600)
     parser.add_argument("--capacity-probe", action="store_true")
+    parser.add_argument("--repeat-check-feedback", action="store_true",
+                        help="Enable repeated-check recovery feedback in every Agent run")
     parser.add_argument("--repeats", type=int, default=1, help="Fresh workspaces per variant")
     parser.add_argument("--variants", nargs="+",
                         choices=("baseline", "output512", "thinking", "thinking1536",
@@ -139,6 +141,8 @@ def main():
                        "--api-base", f"http://127.0.0.1:{args.port}/v1", "--tokenizer-path", args.model_path,
                        "--output-dir", str(folder), "--context-limit", str(args.context_limit),
                        "--request-timeout", str(args.request_timeout), "--wall-time", str(args.wall_time)]
+            if args.repeat_check_feedback:
+                command.append("--repeat-check-feedback")
             with (root / (label + ".log")).open("w") as log:
                 child = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                          start_new_session=True)
