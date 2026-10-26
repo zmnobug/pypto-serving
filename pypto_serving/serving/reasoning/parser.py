@@ -33,7 +33,7 @@ class OutputParserSpec:
     tool_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.parser_id not in ("deepseek_v4", "deepseek_v41"):
+        if self.parser_id not in ("deepseek_v4", "deepseek_v41", "qwen3"):
             raise ValueError(f"unsupported output parser {self.parser_id!r}")
         if self.initial_state not in ("content", "reasoning"):
             raise ValueError("output parser initial_state must be content or reasoning")
@@ -45,7 +45,7 @@ class OutputParserSpec:
 
 def supports_tool_calls(parser_id: str | None) -> bool:
     """Report model parser capabilities before starting a request."""
-    return parser_id == "deepseek_v4"
+    return parser_id in ("deepseek_v4", "qwen3")
 
 
 @dataclass(frozen=True)
@@ -388,4 +388,8 @@ def create_output_parser(spec: OutputParserSpec | None, tokenizer) -> OutputPars
 
             return DeepSeekV4ToolParser(tokenizer, spec)
         return DeepSeekV4ReasoningParser(tokenizer, spec)
+    if spec.parser_id == "qwen3":
+        from .qwen3_tools import Qwen3ToolParser
+
+        return Qwen3ToolParser(tokenizer, spec)
     raise ValueError(f"unsupported output parser {spec.parser_id!r}")

@@ -1,0 +1,133 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Parse Qwen3's token-delimited JSON function calls."""
+
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import replace
+from typing import Sequence
+
+from .parser import (
+    DeepSeekV4ReasoningParser,
+    OutputParserSpec,
+    ParsedDelta,
+    ParsedToolCall,
+    ToolCallDelta,
+    _DROP_TERMINAL,
+    _END_TERMINAL,
+    _Segment,
+    _START_TERMINAL,
+    _TextSegment,
+)
+
+
+TOOL_START = "<tool_call>"
+TOOL_END = "</tool_call>"
+
+
+class Qwen3ToolParser(DeepSeekV4ReasoningParser):
+    """Hold each JSON object until its closing terminal, then publish one call."""
+
+    def __init__(self, tokenizer, spec: OutputParserSpec) -> None:
+        super().__init__(tokenizer, spec)
+        self._publish_tools = spec.tool_choice != "none"
+        self._reset()
+
+    def _extra_terminals(self, vocab: dict[str, int]) -> dict[int, str]:
+        terminals = {}
+        for text, kind in ((TOOL_START, "tool_start"), (TOOL_END, "tool_end")):
+            token_id = self._require_terminal(vocab, text)
+            terminals[token_id] = kind
+        if len(terminals) != 2:
+            raise ValueError("Qwen3 tool terminals must use distinct token IDs")
+        return terminals
+
+    def _reset(self) -> None:
+        super()._reset()
+        self._inside_tool = False
+        self._body_parts: list[str] = []
+        self._in_string = False
+        self._escaped = False
+        self._calls: list[ParsedToolCall] = []
+
+    def _consume(self, segments: Sequence[_Segment]) -> ParsedDelta:
+        reasoning: list[str] = []
+        content: list[str] = []
+        deltas: list[ToolCallDelta] = []
+        for segment in segments:
+            if isinstance(segment, _TextSegment):
+                if self._inside_tool:
+                    self._append_body(segment.text)
+                elif self._state == "reasoning":
+                    if self._include_reasoning:
+                        reasoning.append(segment.text)
+                else:
+                    content.append(segment.text)
+                continue
+
+            if self._inside_tool:
+                if segment.kind == "tool_end" and not self._in_string:
+                    self._close_tool(deltas)
+                else:
+                    self._append_body(segment.text)
+            elif segment.kind == "tool_start":
+                self._inside_tool = True
+                self._state = "content"
+            elif segment.kind == "tool_end":
+                raise ValueError("unexpected Qwen3 tool-call end")
+            elif segment.kind == _START_TERMINAL:
+                self._state = "reasoning"
+            elif segment.kind == _END_TERMINAL:
+                self._state = "content"
+            elif segment.kind != _DROP_TERMINAL:
+                raise ValueError(f"unexpected Qwen3 terminal {segment.kind!r}")
+        return ParsedDelta(
+            reasoning="".join(reasoning), content="".join(content),
+            tool_call_deltas=tuple(deltas),
+        )
+
+    def _append_body(self, text: str) -> None:
+        self._body_parts.append(text)
+        for char in text:
+            if self._escaped:
+                self._escaped = False
+            elif char == "\\" and self._in_string:
+                self._escaped = True
+            elif char == '"':
+                self._in_string = not self._in_string
+
+    def _close_tool(self, deltas: list[ToolCallDelta]) -> None:
+        try:
+            payload = json.loads("".join(self._body_parts))
+            if not isinstance(payload, dict):
+                raise ValueError("Qwen3 tool call must be a JSON object")
+            name, arguments = payload.get("name"), payload.get("arguments")
+            if not isinstance(name, str) or not name or not isinstance(arguments, dict):
+                raise ValueError("Qwen3 tool call requires a name and object arguments")
+            encoded = json.dumps(arguments, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise ValueError(f"invalid Qwen3 tool call: {exc}") from exc
+        if self._publish_tools:
+            call = ParsedToolCall(id="call_" + uuid.uuid4().hex, name=name, arguments=encoded)
+            deltas.append(ToolCallDelta(
+                index=len(self._calls), id=call.id, name=name, arguments=encoded,
+            ))
+            self._calls.append(call)
+        self._inside_tool = False
+        self._body_parts.clear()
+        self._in_string = False
+        self._escaped = False
+
+    def finish(self, *, truncated: bool = False) -> ParsedDelta:
+        tail = super().finish(truncated=truncated)
+        if self._inside_tool and not truncated:
+            raise ValueError("generation ended inside an incomplete Qwen3 tool call")
+        return replace(tail, tool_calls=tuple(self._calls))

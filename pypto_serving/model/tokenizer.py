@@ -197,16 +197,28 @@ class DeepSeekV4TokenizerAdapter(TransformersTokenizerAdapter):
         return "deepseek_v4"
 
 
+@dataclass
+class Qwen3TokenizerAdapter(TransformersTokenizerAdapter):
+    """Qwen3 chat output uses thinking and JSON tool-call terminals."""
+
+    @property
+    def output_parser_id(self) -> str | None:
+        return "qwen3"
+
+
 def load_tokenizer(model_dir: str | Path, *, trust_remote_code: bool = False) -> TokenizerAdapter:
     """Load a local tokenizer and select any model-specific chat encoding."""
     model_path = Path(model_dir)
-    family = detect_model_family(read_model_config(model_path))
+    model_config = read_model_config(model_path)
+    family = detect_model_family(model_config)
     if family == "deepseek_v41":
         from .deepseek_v41.encoding import DeepSeekV41TokenizerAdapter
 
         adapter_cls = DeepSeekV41TokenizerAdapter
     elif family == "deepseek_v4":
         adapter_cls = DeepSeekV4TokenizerAdapter
+    elif model_config.get("model_type") == "qwen3":
+        adapter_cls = Qwen3TokenizerAdapter
     else:
         adapter_cls = TransformersTokenizerAdapter
     if (model_path / "tokenizer.json").exists():
