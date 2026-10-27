@@ -81,6 +81,23 @@ def test_tool_only_calls_keep_template_separator_out_of_content(chunk_size):
     assert len(outputs[-1].tool_calls) == 2
 
 
+@pytest.mark.parametrize("chunk_size", [1, 7, 100000])
+def test_trailing_whitespace_after_tool_is_not_content(chunk_size):
+    text = TOOL_START + '{"name":"lookup","arguments":{}}' + TOOL_END + "\n<eos>"
+    tokenizer = QwenToolTokenizer()
+    ids = tokenizer.encode(text)
+    parser = _parser()
+    outputs = [
+        parser.feed(tokenizer.decode(ids[i:i + chunk_size], skip_special_tokens=False), ids[i:i + chunk_size])
+        for i in range(0, len(ids), chunk_size)
+    ]
+    outputs.append(parser.finish())
+
+    assert "".join(output.content for output in outputs) == ""
+    assert len(outputs[-1].tool_calls) == 1
+    assert _parser().parse_complete(text, ids).content == ""
+
+
 def test_none_hides_tool_calls_without_hiding_answer():
     text = "before" + TOOL_START + '{"name":"lookup","arguments":{}}' + TOOL_END + "after"
     parsed = _parser(choice="none").parse_complete(text, QwenToolTokenizer().encode(text))
@@ -92,9 +109,18 @@ def test_none_hides_tool_calls_without_hiding_answer():
     "\n  answer",
     TOOL_START + '{"name":"lookup","arguments":{}}' + TOOL_END + "\n  answer",
 ])
-def test_answer_whitespace_is_preserved(text):
-    parsed = _parser().parse_complete(text, QwenToolTokenizer().encode(text))
-    assert parsed.content == "\n  answer"
+@pytest.mark.parametrize("chunk_size", [1, 7, 100000])
+def test_answer_whitespace_is_preserved(text, chunk_size):
+    tokenizer = QwenToolTokenizer()
+    ids = tokenizer.encode(text)
+    parser = _parser()
+    outputs = [
+        parser.feed(tokenizer.decode(ids[i:i + chunk_size], skip_special_tokens=False), ids[i:i + chunk_size])
+        for i in range(0, len(ids), chunk_size)
+    ]
+    outputs.append(parser.finish())
+    assert "".join(output.content for output in outputs) == "\n  answer"
+    assert _parser().parse_complete(text, ids).content == "\n  answer"
 
 
 @pytest.mark.parametrize("body", [

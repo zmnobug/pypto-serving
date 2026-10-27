@@ -155,7 +155,7 @@ class Qwen3ToolParser(DeepSeekV4ReasoningParser):
         tail = super().finish(truncated=truncated)
         if self._inside_tool and not truncated:
             raise ValueError("generation ended inside an incomplete Qwen3 tool call")
-        content = tail.content + self._pending_whitespace
+        content = tail.content + ("" if self._after_tool else self._pending_whitespace)
         self._pending_whitespace = ""
         self._after_tool = False
         return replace(tail, content=content, tool_calls=tuple(self._calls))
