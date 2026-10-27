@@ -8,11 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Qwen3 tool calls through the Chat HTTP and engine delivery path."""
 
+import asyncio
 import json
 
 import pytest
 from fastapi.testclient import TestClient
 
+from pypto_serving.serving.server.server import ChatCompletionRequest
 from pypto_serving.serving.reasoning.qwen3_tools import TOOL_END, TOOL_START
 from tests.unit.serving.reasoning.test_qwen3_tools import QwenToolTokenizer
 from tests.unit.serving.server.test_tool_calls import TOOLS, _assert_released, _collect_chat, _replay_server
@@ -29,6 +31,65 @@ class _QwenChatTokenizer(QwenToolTokenizer):
     def apply_chat_template(self, messages, **kwargs):
         self.prompts.append((messages, kwargs))
         return "Question"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_direct_delivery_suppresses_whitespace_between_calls(stream):
+    call = TOOL_START + '{"name":"lookup","arguments":{}}' + TOOL_END
+    server = _replay_server(("plan</think>\n\n" + call + "\n" + call + "<eos>", "FINISHED_EOS"),
+                            chunk_size=1, tokenizer=_QwenChatTokenizer())
+    request = ChatCompletionRequest.model_validate({
+        "messages": [{"role": "user", "content": "Question"}],
+        "tools": TOOLS, "stream": stream, "reasoning_effort": "high",
+    })
+
+    async def run():
+        response = await server._chat_completions(request)
+        if not stream:
+            message = json.loads(response.body)["choices"][0]["message"]
+            assert message["content"] is None
+            assert message["reasoning"] == "plan"
+            assert len(message["tool_calls"]) == 2
+        else:
+            events = [
+                json.loads(chunk[6:]) async for chunk in response.body_iterator
+                if chunk != "data: [DONE]\n\n"
+            ]
+            choices = [event["choices"][0] for event in events if event.get("choices")]
+            assert "".join(choice["delta"]["content"] or "" for choice in choices) == ""
+            assert "".join(choice["delta"]["reasoning"] or "" for choice in choices) == "plan"
+            assert sum(len(choice["delta"].get("tool_calls") or ()) for choice in choices) == 2
+            assert choices[-1]["finish_reason"] == "tool_calls"
+
+    asyncio.run(run())
+    _assert_released(server, 1)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_direct_delivery_rejects_invalid_function_name(stream):
+    call = TOOL_START + '{"name":"weather.get","arguments":{}}' + TOOL_END + "<eos>"
+    server = _replay_server((call, "FINISHED_EOS"), tokenizer=_QwenChatTokenizer())
+    request = ChatCompletionRequest.model_validate({
+        "messages": [{"role": "user", "content": "Question"}],
+        "tools": TOOLS, "stream": stream,
+    })
+
+    async def run():
+        if not stream:
+            with pytest.raises(ValueError, match="Qwen3 tool call requires"):
+                await server._chat_completions(request)
+        else:
+            response = await server._chat_completions(request)
+            events = [
+                json.loads(chunk[6:]) async for chunk in response.body_iterator
+                if chunk != "data: [DONE]\n\n"
+            ]
+            assert any("Qwen3 tool call requires" in event.get("error", {}).get("message", "")
+                       for event in events)
+            assert not any(event.get("usage") for event in events)
+
+    asyncio.run(run())
+    _assert_released(server, 1)
 
 
 @pytest.mark.parametrize("stream", [False, True])

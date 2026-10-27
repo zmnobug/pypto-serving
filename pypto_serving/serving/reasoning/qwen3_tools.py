@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import replace
 from typing import Sequence
@@ -31,6 +32,7 @@ from .parser import (
 
 TOOL_START = "<tool_call>"
 TOOL_END = "</tool_call>"
+_FUNCTION_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 class Qwen3ToolParser(DeepSeekV4ReasoningParser):
@@ -57,6 +59,9 @@ class Qwen3ToolParser(DeepSeekV4ReasoningParser):
         self._in_string = False
         self._escaped = False
         self._calls: list[ParsedToolCall] = []
+        self._has_content = False
+        self._after_tool = False
+        self._pending_whitespace = ""
 
     def _consume(self, segments: Sequence[_Segment]) -> ParsedDelta:
         reasoning: list[str] = []
@@ -70,7 +75,14 @@ class Qwen3ToolParser(DeepSeekV4ReasoningParser):
                     if self._include_reasoning:
                         reasoning.append(segment.text)
                 else:
-                    content.append(segment.text)
+                    # Wait for the next terminal before deciding whether whitespace separates calls.
+                    if (self._after_tool or not self._has_content) and segment.text.isspace():
+                        self._pending_whitespace += segment.text
+                    else:
+                        content.append(self._pending_whitespace + segment.text)
+                        self._pending_whitespace = ""
+                        self._after_tool = False
+                        self._has_content = True
                 continue
 
             if self._inside_tool:
@@ -81,11 +93,19 @@ class Qwen3ToolParser(DeepSeekV4ReasoningParser):
             elif segment.kind == "tool_start":
                 self._inside_tool = True
                 self._state = "content"
+                self._after_tool = False
+                self._pending_whitespace = ""
             elif segment.kind == "tool_end":
                 raise ValueError("unexpected Qwen3 tool-call end")
             elif segment.kind == _START_TERMINAL:
+                content.append(self._pending_whitespace)
+                self._pending_whitespace = ""
+                self._after_tool = False
                 self._state = "reasoning"
             elif segment.kind == _END_TERMINAL:
+                content.append(self._pending_whitespace)
+                self._pending_whitespace = ""
+                self._after_tool = False
                 self._state = "content"
             elif segment.kind != _DROP_TERMINAL:
                 raise ValueError(f"unexpected Qwen3 terminal {segment.kind!r}")
@@ -110,7 +130,11 @@ class Qwen3ToolParser(DeepSeekV4ReasoningParser):
             if not isinstance(payload, dict):
                 raise ValueError("Qwen3 tool call must be a JSON object")
             name, arguments = payload.get("name"), payload.get("arguments")
-            if not isinstance(name, str) or not name or not isinstance(arguments, dict):
+            if (
+                not isinstance(name, str)
+                or not _FUNCTION_NAME.fullmatch(name)
+                or not isinstance(arguments, dict)
+            ):
                 raise ValueError("Qwen3 tool call requires a name and object arguments")
             encoded = json.dumps(arguments, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         except (json.JSONDecodeError, RecursionError) as exc:
@@ -122,6 +146,7 @@ class Qwen3ToolParser(DeepSeekV4ReasoningParser):
             ))
             self._calls.append(call)
         self._inside_tool = False
+        self._after_tool = True
         self._body_parts.clear()
         self._in_string = False
         self._escaped = False
@@ -130,4 +155,7 @@ class Qwen3ToolParser(DeepSeekV4ReasoningParser):
         tail = super().finish(truncated=truncated)
         if self._inside_tool and not truncated:
             raise ValueError("generation ended inside an incomplete Qwen3 tool call")
-        return replace(tail, tool_calls=tuple(self._calls))
+        content = tail.content + self._pending_whitespace
+        self._pending_whitespace = ""
+        self._after_tool = False
+        return replace(tail, content=content, tool_calls=tuple(self._calls))

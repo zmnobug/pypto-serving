@@ -37,7 +37,7 @@ def test_stream_and_complete_match_for_multiple_json_calls(chunk_size):
     text = (
         "plan</think>Before "
         + TOOL_START + json.dumps({"name": "lookup", "arguments": arguments}, ensure_ascii=False) + TOOL_END
-        + TOOL_START + '{"name":"lookup","arguments":{"city":"Berlin"}}' + TOOL_END
+        + "\n" + TOOL_START + '{"name":"lookup","arguments":{"city":"Berlin"}}' + TOOL_END
         + " after<eos>"
     )
     tokenizer = QwenToolTokenizer()
@@ -62,6 +62,25 @@ def test_stream_and_complete_match_for_multiple_json_calls(chunk_size):
     assert all(call.complete for call in outputs[-1].tool_calls)
 
 
+@pytest.mark.parametrize("chunk_size", [1, 7, 100000])
+def test_tool_only_calls_keep_template_separator_out_of_content(chunk_size):
+    text = (
+        "plan</think>\n\n" + TOOL_START + '{"name":"lookup","arguments":{}}' + TOOL_END
+        + "\n" + TOOL_START + '{"name":"lookup","arguments":{}}' + TOOL_END + "<eos>"
+    )
+    tokenizer = QwenToolTokenizer()
+    ids = tokenizer.encode(text)
+    parser = _parser(thinking=True)
+    outputs = [
+        parser.feed(tokenizer.decode(ids[i:i + chunk_size], skip_special_tokens=False), ids[i:i + chunk_size])
+        for i in range(0, len(ids), chunk_size)
+    ]
+    outputs.append(parser.finish())
+    assert "".join(output.reasoning for output in outputs) == "plan"
+    assert "".join(output.content for output in outputs) == ""
+    assert len(outputs[-1].tool_calls) == 2
+
+
 def test_none_hides_tool_calls_without_hiding_answer():
     text = "before" + TOOL_START + '{"name":"lookup","arguments":{}}' + TOOL_END + "after"
     parsed = _parser(choice="none").parse_complete(text, QwenToolTokenizer().encode(text))
@@ -69,10 +88,21 @@ def test_none_hides_tool_calls_without_hiding_answer():
     assert parsed.tool_calls == ()
 
 
+@pytest.mark.parametrize("text", [
+    "\n  answer",
+    TOOL_START + '{"name":"lookup","arguments":{}}' + TOOL_END + "\n  answer",
+])
+def test_answer_whitespace_is_preserved(text):
+    parsed = _parser().parse_complete(text, QwenToolTokenizer().encode(text))
+    assert parsed.content == "\n  answer"
+
+
 @pytest.mark.parametrize("body", [
     '{"name":"lookup","arguments":[]}',
     '{"name":"lookup","arguments":{broken}}',
     '{"name":1,"arguments":{}}',
+    '{"name":"weather.get","arguments":{}}',
+    '{"name":"' + "x" * 65 + '","arguments":{}}',
 ])
 def test_invalid_complete_call_fails_locally(body):
     text = TOOL_START + body + TOOL_END

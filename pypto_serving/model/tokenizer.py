@@ -201,6 +201,18 @@ class DeepSeekV4TokenizerAdapter(TransformersTokenizerAdapter):
 class Qwen3TokenizerAdapter(TransformersTokenizerAdapter):
     """Qwen3 chat output uses thinking and JSON tool-call terminals."""
 
+    def apply_chat_template(self, messages: list[dict[str, object]], **kwargs) -> str:
+        """Pass saved assistant reasoning under the checkpoint template's field name."""
+        template_messages = []
+        for message in messages:
+            if message.get("role") == "assistant" and isinstance(message.get("reasoning"), str):
+                converted = dict(message)
+                converted["reasoning_content"] = converted.pop("reasoning")
+                template_messages.append(converted)
+            else:
+                template_messages.append(message)
+        return super().apply_chat_template(template_messages, **kwargs)
+
     @property
     def output_parser_id(self) -> str | None:
         return "qwen3"
