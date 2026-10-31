@@ -16,18 +16,15 @@ import uuid
 from dataclasses import replace
 from typing import Sequence
 
-from .parser import (
-    DeepSeekV4ReasoningParser,
-    OutputParserSpec,
-    ParsedDelta,
-    ParsedToolCall,
-    ToolCallDelta,
-    _DROP_TERMINAL,
-    _END_TERMINAL,
-    _Segment,
-    _START_TERMINAL,
-    _TextSegment,
+from pypto_serving.serving.reasoning.base import (
+    DROP_TERMINAL,
+    END_TERMINAL,
+    START_TERMINAL,
+    Segment,
+    TextSegment,
+    TokenReasoningParser,
 )
+from pypto_serving.serving.reasoning.types import OutputParserSpec, ParsedDelta, ParsedToolCall, ToolCallDelta
 
 
 TOOL_START = "<tool_call>"
@@ -35,7 +32,7 @@ TOOL_END = "</tool_call>"
 _FUNCTION_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
-class Qwen3ToolParser(DeepSeekV4ReasoningParser):
+class Qwen3ToolParser(TokenReasoningParser):
     """Hold each JSON object until its closing terminal, then publish one call."""
 
     def __init__(self, tokenizer, spec: OutputParserSpec) -> None:
@@ -63,12 +60,12 @@ class Qwen3ToolParser(DeepSeekV4ReasoningParser):
         self._after_tool = False
         self._pending_whitespace = ""
 
-    def _consume(self, segments: Sequence[_Segment]) -> ParsedDelta:
+    def _consume(self, segments: Sequence[Segment]) -> ParsedDelta:
         reasoning: list[str] = []
         content: list[str] = []
         deltas: list[ToolCallDelta] = []
         for segment in segments:
-            if isinstance(segment, _TextSegment):
+            if isinstance(segment, TextSegment):
                 if self._inside_tool:
                     self._append_body(segment.text)
                 elif self._state == "reasoning":
@@ -97,17 +94,17 @@ class Qwen3ToolParser(DeepSeekV4ReasoningParser):
                 self._pending_whitespace = ""
             elif segment.kind == "tool_end":
                 raise ValueError("unexpected Qwen3 tool-call end")
-            elif segment.kind == _START_TERMINAL:
+            elif segment.kind == START_TERMINAL:
                 content.append(self._pending_whitespace)
                 self._pending_whitespace = ""
                 self._after_tool = False
                 self._state = "reasoning"
-            elif segment.kind == _END_TERMINAL:
+            elif segment.kind == END_TERMINAL:
                 content.append(self._pending_whitespace)
                 self._pending_whitespace = ""
                 self._after_tool = False
                 self._state = "content"
-            elif segment.kind != _DROP_TERMINAL:
+            elif segment.kind != DROP_TERMINAL:
                 raise ValueError(f"unexpected Qwen3 terminal {segment.kind!r}")
         return ParsedDelta(
             reasoning="".join(reasoning), content="".join(content),

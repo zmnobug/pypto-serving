@@ -14,9 +14,9 @@ import json
 import pytest
 
 from pypto_serving.model.deepseek.encoding import encode_messages
+from pypto_serving.model.qwen.encoding import Qwen3TokenizerAdapter
 from pypto_serving.model.tokenizer import (
     DeepSeekV4TokenizerAdapter,
-    Qwen3TokenizerAdapter,
     _load_fast_tokenizer_from_file,
     load_tokenizer,
 )

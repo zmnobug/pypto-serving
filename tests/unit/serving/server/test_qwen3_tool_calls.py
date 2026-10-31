@@ -15,8 +15,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from pypto_serving.serving.server.server import ChatCompletionRequest
-from pypto_serving.serving.reasoning.qwen3_tools import TOOL_END, TOOL_START
-from tests.unit.serving.reasoning.test_qwen3_tools import QwenToolTokenizer
+from pypto_serving.model.qwen.tool_parser import TOOL_END, TOOL_START
+from tests.unit.model.qwen.test_tool_parser import QwenToolTokenizer
 from tests.unit.serving.server.test_tool_calls import TOOLS, _assert_released, _collect_chat, _replay_server
 
 

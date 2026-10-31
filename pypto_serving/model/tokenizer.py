@@ -50,6 +50,11 @@ class TokenizerAdapter:
         """Return the Serving output parser registered for this tokenizer."""
         return None
 
+    @property
+    def output_parser_requires_tool_context(self) -> bool:
+        """Whether parsing is needed only for requests with tool context."""
+        return False
+
     def apply_chat_template(self, messages: list[dict[str, object]], **kwargs) -> str:
         """Encode chat messages into the model's generation prompt."""
         raise NotImplementedError
@@ -197,27 +202,6 @@ class DeepSeekV4TokenizerAdapter(TransformersTokenizerAdapter):
         return "deepseek_v4"
 
 
-@dataclass
-class Qwen3TokenizerAdapter(TransformersTokenizerAdapter):
-    """Qwen3 chat output uses thinking and JSON tool-call terminals."""
-
-    def apply_chat_template(self, messages: list[dict[str, object]], **kwargs) -> str:
-        """Pass saved assistant reasoning under the checkpoint template's field name."""
-        template_messages = []
-        for message in messages:
-            if message.get("role") == "assistant" and isinstance(message.get("reasoning"), str):
-                converted = dict(message)
-                converted["reasoning_content"] = converted.pop("reasoning")
-                template_messages.append(converted)
-            else:
-                template_messages.append(message)
-        return super().apply_chat_template(template_messages, **kwargs)
-
-    @property
-    def output_parser_id(self) -> str | None:
-        return "qwen3"
-
-
 def load_tokenizer(model_dir: str | Path, *, trust_remote_code: bool = False) -> TokenizerAdapter:
     """Load a local tokenizer and select any model-specific chat encoding."""
     model_path = Path(model_dir)
@@ -230,6 +214,8 @@ def load_tokenizer(model_dir: str | Path, *, trust_remote_code: bool = False) ->
     elif family == "deepseek_v4":
         adapter_cls = DeepSeekV4TokenizerAdapter
     elif model_config.get("model_type") == "qwen3":
+        from .qwen.encoding import Qwen3TokenizerAdapter
+
         adapter_cls = Qwen3TokenizerAdapter
     else:
         adapter_cls = TransformersTokenizerAdapter

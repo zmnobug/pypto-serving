@@ -13,7 +13,7 @@ import json
 import pytest
 
 from pypto_serving.serving.reasoning import OutputParserSpec, create_output_parser
-from pypto_serving.serving.reasoning.qwen3_tools import TOOL_END, TOOL_START
+from pypto_serving.model.qwen.tool_parser import TOOL_END, TOOL_START
 from tests.unit.serving.reasoning.test_deepseek_v4_tools import ToolTokenizer
 
 
@@ -21,6 +21,7 @@ class QwenToolTokenizer(ToolTokenizer):
     specials = ("<think>", "</think>", TOOL_START, TOOL_END, "<eos>")
     vocab = {text: index + 1 for index, text in enumerate(specials)}
     all_special_ids = tuple(vocab.values())
+    output_parser_requires_tool_context = True
 
 
 def _parser(*, thinking=False, choice="auto", include_reasoning=True):
