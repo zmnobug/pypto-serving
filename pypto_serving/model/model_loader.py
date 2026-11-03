@@ -437,15 +437,27 @@ def _validate_deepseek_v4_weight_index(weight_map: dict[str, str], config_data: 
         )
 
 
+class _LazyDeepSeekV41DirectoryLoader(SafetensorsDirectoryLoader):
+    """Recognise V4.1 without importing its executor or dtype-dependent weights."""
+
+    format_names = ("deepseek_v41", "deepseek-v41", "dsv41")
+
+    def _recognises(self, model_path: Path) -> bool:
+        return is_deepseek_v41_config(read_model_config(model_path))
+
+    def load(self, request: ModelLoadRequest) -> LoadedModel:
+        from .deepseek_v41.npu_executor import DeepSeekV41DirectoryLoader
+
+        return DeepSeekV41DirectoryLoader().load(request)
+
+
 class ModelLoader:
     """Registry that selects a model-format loader and loads models."""
 
     def __init__(self, format_loaders: list[ModelFormatLoader] | None = None) -> None:
         """Create a loader registry with optional custom format loaders."""
-        from .deepseek_v41.npu_executor import DeepSeekV41DirectoryLoader
-
         self._format_loaders = format_loaders or [
-            DeepSeekV41DirectoryLoader(), DeepSeekV4W8A8DirectoryLoader(), HuggingFaceDirectoryLoader(),
+            _LazyDeepSeekV41DirectoryLoader(), DeepSeekV4W8A8DirectoryLoader(), HuggingFaceDirectoryLoader(),
         ]
 
     def register(self, format_loader: ModelFormatLoader) -> None:
@@ -462,9 +474,7 @@ class ModelLoader:
     ) -> LoadedModel:
         """Load a model directory using an explicit or inferred format."""
         if is_deepseek_v41_config(read_model_config(model_dir)):
-            from .deepseek_v41.npu_executor import DeepSeekV41DirectoryLoader
-
-            if model_format is not None and not DeepSeekV41DirectoryLoader().supports_format(model_format):
+            if model_format is not None and not _LazyDeepSeekV41DirectoryLoader().supports_format(model_format):
                 raise ValueError("a V4.1 checkpoint requires model_format='deepseek_v41'")
         request = ModelLoadRequest(
             model_id=model_id,

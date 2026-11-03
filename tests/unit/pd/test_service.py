@@ -9,20 +9,24 @@
 """Essential PD transfer, Prefix and lease safety using existing cache fixtures."""
 
 import asyncio
+from dataclasses import asdict
+import json
 import math
 from types import SimpleNamespace
 
+import httpx
 import msgspec
 import pytest
 
-from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
+from pypto_serving.config.types import GenerateConfig, KVCacheGroupSpec, KVCacheSpec
 from pypto_serving.pd.adapter import CACHE_COMPONENTS, COMPONENTS, DeepSeekDSpark
 from pypto_serving.pd.config import Config, Endpoint
-from pypto_serving.pd.integration import Chunk
+from pypto_serving.pd.integration import Chunk, Server
 from pypto_serving.pd.planner import Geometry, plan_chunk, rank_mapping
 from pypto_serving.pd.protocol import Binding, Component, Completion, Continuation, Contract, Copy, Node, Placement, Plan, Topology, digest
 from pypto_serving.pd.service import Service
 from pypto_serving.pd.transfer import Mooncake, Region, TransferError
+from pypto_serving.serving.engine.async_engine import EngineConfig, TokenOutput
 from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from tests.unit.serving.test_grouped_prefix_cache import GEOMETRY
 
@@ -154,6 +158,69 @@ def service():
     result = Service(config, config.endpoint("decode"), "decode", None, core, None)
     result.node = d
     return result, p, d
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+@pytest.mark.parametrize("kind", ["completion", "chat"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_pd_http_uses_shared_request_and_response_helpers(role, kind, stream):
+    async def run():
+        s, p, d = service()
+        s.role, s.node = role, p if role == "prefill" else d
+        config = GenerateConfig(max_new_tokens=3, stream=stream, ignore_eos=kind == "completion")
+        continuations, generated, validated = [], [], []
+        s.adapter = SimpleNamespace(validate=validated.append)
+
+        async def prefill(entry, continuation, peer):
+            continuations.append(continuation)
+
+        async def outputs(request_id, prompt, config, **kwargs):
+            generated.append((request_id, config))
+            yield TokenOutput(text="answer", finished=True, finish_reason="FINISHED_LENGTH",
+                              prompt_tokens=2, completion_tokens=1)
+
+        s.prefill, s.outputs = prefill, outputs
+        engine = SimpleNamespace(
+            config=EngineConfig(model_id="model", agentinfer_mode="disabled"), metrics=None,
+            tokenizer=SimpleNamespace(apply_chat_template=lambda messages, **kwargs: messages[0]["content"]),
+            _tokenize_prompt=lambda prompt: [1, 2], start_profile=lambda: None, stop_profile=lambda: None,
+        )
+        server = Server(s, engine, GenerateConfig())
+        payload = {"max_tokens": 3, "stream": stream}
+        if kind == "chat":
+            payload["messages"] = [{"role": "user", "content": "hello"}]
+        else:
+            payload["prompt"] = "hello"
+        binding = Binding.create(p, d, payload)
+        if role == "decode":
+            entry = s.entry(binding, create=True)
+            entry.continuation = Continuation((1, 2), asdict(config), None, None)
+            entry.prepared.set()
+        context = {"binding": msgspec.to_builtins(binding),
+                   "peer": msgspec.to_builtins(d if role == "prefill" else p)}
+        path = "/v1/chat/completions" if kind == "chat" else "/v1/completions"
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://pd") as client:
+            response = await client.post(path, json=payload, headers={"x-pd-context": json.dumps(context)})
+
+        assert response.status_code == 200, response.text
+        if role == "prefill":
+            assert response.json() == {"request": binding.request, "status": "ready"}
+            assert validated == [config]
+            assert continuations == [Continuation((1, 2), asdict(config), None, None)]
+            assert generated == []
+        else:
+            assert generated == [(binding.request, config)]
+            if stream:
+                assert response.text.endswith("data: [DONE]\n\n")
+                assert "answer" in response.text
+            else:
+                body = response.json()
+                assert body["id"] == binding.request
+                choice = body["choices"][0]
+                assert (choice["message"]["content"] if kind == "chat" else choice["text"]) == "answer"
+                assert body["usage"]["completion_tokens"] == 1
+
+    asyncio.run(run())
 
 
 def test_status_reads_current_lease_without_changing_cache():
