@@ -282,6 +282,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     _validate_backend(args.backend)
+    if args.pd_role and args.agentinfer_mode == "enforce":
+        raise ValueError(
+            "PD deployment does not support --agentinfer-mode enforce; use --agentinfer-mode disabled"
+        )
     if args.max_num_seqs is None:
         if args.pd_role:
             from pypto_serving.pd.config import default_max_num_seqs
@@ -303,6 +307,10 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
     if model_family == "deepseek_v41":
+        if args.agentinfer_mode != "disabled":
+            raise ValueError(
+                "DeepSeek V4.1 does not support AgentInfer; use --agentinfer-mode disabled"
+            )
         return _build_v41_engine_config(args, model_dir, model_config_data, devices)
     model_variant = _resolve_model_variant(args)
     _validate_prefill_chunk_size(

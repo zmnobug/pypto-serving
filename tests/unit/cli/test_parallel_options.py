@@ -141,6 +141,18 @@ def test_agentinfer_mode_is_explicit_and_single_replica_only(tmp_path):
         ]))
 
 
+def test_agentinfer_cli_rejects_deepseek_v41(tmp_path):
+    model_dir = tmp_path / "deepseek-v41"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"deepseek_v41"}')
+    args = _parse_cli_args([
+        "--model", str(model_dir), "--agentinfer-mode", "enforce",
+    ])
+
+    with pytest.raises(ValueError, match="DeepSeek V4.1 does not support AgentInfer"):
+        cli.build_serving_engine_config(args)
+
+
 def test_agentinfer_cli_accepts_only_standard_deepseek_k1(tmp_path, monkeypatch):
     from pypto_serving.config.types import RuntimeConfig
 
@@ -190,6 +202,36 @@ def test_agentinfer_cli_accepts_dspark_k0_and_k7(tmp_path, monkeypatch, num_spec
 
     assert config.executor_cls == "PyptoDeepSeekV4DSparkExecutor"
     assert config.agentinfer_mode == "enforce"
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+@pytest.mark.parametrize("mode", ["disabled", "enforce"])
+def test_pd_dspark_requires_agentinfer_disabled(tmp_path, monkeypatch, role, mode):
+    from pypto_serving.config.types import RuntimeConfig
+
+    model_dir = tmp_path / "dspark"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"deepseek_v4"}')
+    monkeypatch.setattr(cli, "_validate_model_topology", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli, "_build_runtime_config", lambda *args, **kwargs: RuntimeConfig(num_speculative_tokens=7),
+    )
+    args = _parse_cli_args([
+        "--model", str(model_dir),
+        "--devices", ",".join(str(device) for device in range(16)),
+        "--dp", "4", "--ep", "16", "--tp", "4", "--max-num-seqs", "4",
+        "--speculative-config", '{"method":"dspark","num_speculative_tokens":7}',
+        "--pd-role", role, "--pd-config", str(tmp_path / "pd.json"),
+        "--agentinfer-mode", mode,
+    ])
+
+    if mode == "enforce":
+        with pytest.raises(ValueError, match="PD deployment does not support --agentinfer-mode enforce"):
+            cli.build_serving_engine_config(args)
+    else:
+        config = cli.build_serving_engine_config(args)
+        assert config.executor_cls == "PyptoDeepSeekV4DSparkExecutor"
+        assert config.agentinfer_mode == "disabled"
 
 
 def test_agentinfer_cli_rejects_dspark_without_prefix_cache(tmp_path, monkeypatch):
