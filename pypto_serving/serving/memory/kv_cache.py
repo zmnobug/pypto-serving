@@ -17,11 +17,16 @@ from dataclasses import dataclass, field, replace
 import torch
 
 from pypto_serving.config.types import KVCacheGroupSpec, KvAllocation, ModelConfig, RuntimeConfig
-from .checkpoint import GroupPrefixCheckpoints
+from .checkpoint import GroupCheckpointWriter, GroupPrefixCheckpoints
 from .reservation import GroupCacheReservation, GroupedCacheReservations
 
 
 NONE_HASH = hashlib.sha256(b"pypto-serving-prefix-root/v1").digest()
+
+
+def aligned_prefix_cache_boundary(token_count: int, alignment: int, *, replay_tokens: int = 0) -> int:
+    """Return the common page boundary before the required local replay."""
+    return max(0, token_count - max(1, replay_tokens)) // alignment * alignment
 
 
 class KVCacheCapacityError(RuntimeError):
@@ -185,6 +190,7 @@ class KvCacheManager:
         self._group_request_partitions: dict[str, int] = {}
         self._next_group_partition = 0
         self._group_checkpoints: GroupPrefixCheckpoints | None = None
+        self.checkpoint_writer = GroupCheckpointWriter(self)
         self._reservations: GroupedCacheReservations | None = None
         if num_blocks is not None:
             self._init_blocks(num_blocks, block_size)
@@ -751,7 +757,7 @@ class KvCacheManager:
     def group_prefix_cache_boundary(self, token_count: int, *, replay_tokens: int = 0) -> int:
         """Align a complete prompt's reuse limit after its required local replay."""
         alignment = self.group_prefix_cache_alignment
-        return max(0, token_count - max(1, replay_tokens)) // alignment * alignment
+        return aligned_prefix_cache_boundary(token_count, alignment, replay_tokens=replay_tokens)
 
     @property
     def has_eagle_groups(self) -> bool:
@@ -784,6 +790,25 @@ class KvCacheManager:
                 )
             ]
         return hashes
+
+    def group_history_prefix_hit(self, block_hashes, max_tokens):
+        """Find a shared full-history boundary for sparse state publication."""
+        if not self.enable_prefix_cache:
+            return 0
+        history = [pool for pool in self._group_pools.values() if pool.spec.sliding_window is None]
+        best = 0
+        for partition in range(self.group_partition_count):
+            candidate = max_tokens
+            for pool in history:
+                page = pool.spec.spec.token_capacity
+                count = 0
+                for value in block_hashes[pool.spec.name][:candidate // page]:
+                    if (partition, value) not in pool.hash_to_block:
+                        break
+                    count += 1
+                candidate = min(candidate, count * page)
+            best = max(best, candidate)
+        return best // self.group_prefix_cache_alignment * self.group_prefix_cache_alignment
 
     def acquire_group_prefix_blocks(
         self,
@@ -880,7 +905,17 @@ class KvCacheManager:
 
             candidate -= candidate % alignment
             candidate_blocks: dict[str, list[KVCacheBlock | None]] = {}
-            while candidate > 0:
+            if any(self._group_pools[name].spec.is_checkpoint_state for name in selected_names):
+                # State is materialized at sparse publication boundaries, not at
+                # every computed token. Validate only resident joint candidates.
+                keys = self._group_checkpoints.checkpoints if self._group_checkpoints is not None else ()
+                candidates = sorted({key[1] for key in keys
+                                     if key[0] == candidate_partition and key[1] <= candidate}, reverse=True)
+            else:
+                candidates = range(candidate, 0, -alignment)
+            candidate = 0
+            for boundary in candidates:
+                candidate = boundary
                 candidate_blocks = {}
                 valid = True
                 for name, pool in self._group_pools.items():
@@ -924,7 +959,7 @@ class KvCacheManager:
 
                 if valid:
                     break
-                candidate -= alignment
+                candidate = 0
 
             if candidate > best_hit_tokens:
                 best_partition = candidate_partition
@@ -1013,7 +1048,14 @@ class KvCacheManager:
                 safe_computed_tokens // pool.spec.spec.token_capacity,
                 len(hashes),
             )
+            if pool.spec.is_checkpoint_state:
+                if checkpoint_boundary is None:
+                    continue
+                completed = min(completed, checkpoint_boundary // pool.spec.spec.token_capacity)
             start = min(cached_counts.get(name, 0), completed)
+            if pool.spec.is_checkpoint_state:
+                start = max(start, max(0, checkpoint_boundary - pool.spec.sliding_window)
+                            // pool.spec.spec.token_capacity)
             if valid_from is not None:
                 token_capacity = pool.spec.spec.token_capacity
                 start = max(start, (valid_from.get(name, 0) + token_capacity - 1) // token_capacity)
@@ -1035,6 +1077,33 @@ class KvCacheManager:
             self._protect_group_checkpoint(request_id, block_hashes, num_computed_tokens, partition,
                                            valid_from, checkpoint_boundary)
         return cached_counts
+
+    def retain_group_prefill_history(self, request_id: str, token_count: int):
+        """Pin entry history before allocating the current Prefill write view."""
+        if token_count <= 0:
+            return {}, None
+        read_blocks = {}
+        pin_blocks = {name: [] for name in self._group_pools}
+        for name, pool in self._group_pools.items():
+            if not pool.spec.preserve_prefill_history:
+                continue
+            page = pool.spec.spec.token_capacity
+            owned = pool.request_blocks.get(request_id, ())
+            pages = {}
+            for logical in range(max(0, token_count - pool.spec.sliding_window) // page,
+                                 (token_count + page - 1) // page):
+                slot = logical % pool.spec.max_blocks_per_seq
+                block = owned[slot] if slot < len(owned) else None
+                if block is None:
+                    raise RuntimeError(f"Missing Prefill history for {name}:{logical}")
+                pages[logical] = pool.local_block_id(block)
+            read_blocks[name] = pages
+            pin_blocks[name] = list(dict.fromkeys(pages.values()))
+        if not read_blocks:
+            return {}, None
+        partition = self._group_request_partitions[request_id]
+        self.retain_group_block_snapshot(pin_blocks, partition)
+        return read_blocks, (pin_blocks, partition)
 
     def retain_group_block_snapshot(
         self,
@@ -1124,7 +1193,17 @@ class KvCacheManager:
                 safe_computed_tokens // pool.spec.spec.token_capacity,
                 len(hashes),
             )
+            if pool.spec.is_checkpoint_state:
+                if checkpoint_boundary is None:
+                    continue
+                completed = min(completed, checkpoint_boundary // pool.spec.spec.token_capacity)
             start = min(cached_counts.get(name, 0), completed)
+            if pool.spec.is_checkpoint_state:
+                start = max(start, max(0, checkpoint_boundary - pool.spec.sliding_window)
+                            // pool.spec.spec.token_capacity)
+                # A snapshot may already have wrapped beyond the checkpoint.
+                capacity = pool.spec.spec.token_capacity
+                start = max(start, (num_computed_tokens + capacity - 1) // capacity - len(block_ids))
             if valid_from is not None:
                 token_capacity = pool.spec.spec.token_capacity
                 start = max(start, (valid_from.get(name, 0) + token_capacity - 1) // token_capacity)
@@ -1147,7 +1226,7 @@ class KvCacheManager:
                                            valid_from, checkpoint_boundary)
         return cached_counts
 
-    def _protect_group_checkpoint(self, request_id, hashes, tokens, partition, valid_from, boundary):
+    def _protect_group_checkpoint(self, request_id, hashes, tokens, partition, valid_from, boundary, *, preferred=True):
         if boundary is None:
             # Publishers without a local replay target (e.g. an external fill)
             # retain the allocator's latest checkpoint for future requests.
@@ -1163,7 +1242,7 @@ class KvCacheManager:
         owner = request_id if request_id in self._group_request_partitions else None
         self._group_checkpoints.prune(self._group_pools)
         self._group_checkpoints.publish(owner, self._group_pools, hashes, tokens, partition,
-                                        boundary, valid_from)
+                                        boundary, valid_from, preferred=preferred)
 
     def _cache_group_block(
         self,

@@ -25,11 +25,12 @@ GEOMETRY = (
 )
 
 
-def manager(enabled=True, slots=3, partitions=4):
+def manager(enabled=True, slots=3, partitions=4, checkpoint_state=False):
     # Exact max_seq_len=655360, prefill=128, four partitions and 3 capacity
     # slots. Tensor widths are irrelevant to the Host page/ref-count contract.
     groups = tuple(KVCacheGroupSpec(name, (0,), KVCacheSpec(tokens, tokens // ratio, ratio),
-        blocks, num_partitions=partitions, sliding_window=window)
+        blocks, num_partitions=partitions, sliding_window=window,
+        is_checkpoint_state=checkpoint_state and name.endswith("state"))
         for name, tokens, ratio, blocks, window in GEOMETRY)
     cache = KvCacheManager(enable_prefix_cache=enabled)
     cache.init_groups(groups, max_batch_size=slots, primary_num_blocks=9 * slots)
@@ -93,7 +94,7 @@ def _finish_prefill(scheduler, request, *, expected_hit=None):
                 key = confirmed.scheduled_requests[0].cache_partition, boundary, identity
                 assert key in checkpoints.checkpoints
                 if not request.status.is_finished:
-                    assert checkpoints.owners[request.request_id] == key
+                    assert key in checkpoints.owners[request.request_id]
         if request.prefill_complete or request.status.is_finished:
             assert not pending
             if request.prefill_complete:
@@ -106,8 +107,11 @@ def _finish_prefill(scheduler, request, *, expected_hit=None):
 @pytest.mark.parametrize("length", [8192, 8193, 8205, 8319, 8320])
 @pytest.mark.parametrize("speculative,asynchronous", [(0, False), (7, False), (7, True)],
     ids=["prefill-target-only", "replica-k7-sync", "replica-k7-async"])
-def test_request_checkpoint_matches_full_prompt_replay_boundary(partitions, length, speculative, asynchronous):
-    cache = manager(partitions=partitions)
+@pytest.mark.parametrize("checkpoint_state", [False, True])
+def test_request_checkpoint_matches_full_prompt_replay_boundary(
+    partitions, length, speculative, asynchronous, checkpoint_state,
+):
+    cache = manager(partitions=partitions, checkpoint_state=checkpoint_state)
     scheduler = _prefill_scheduler(cache, speculative=speculative, asynchronous=asynchronous)
     for group in range(8):
         # Keep two documents per local partition, including in the larger topology.
@@ -121,6 +125,7 @@ def test_request_checkpoint_matches_full_prompt_replay_boundary(partitions, leng
         step, = output.scheduled_requests
         assert step.num_computed_tokens == boundary
         scheduler.abort_request(request.request_id)
+        scheduler.discard_scheduled_request(step)
     assert not cache._group_checkpoints.owners
     assert all(b.ref_cnt == 0 for pool in cache._group_pools.values() for b in pool.blocks)
 
@@ -143,6 +148,61 @@ def test_request_checkpoint_loses_joint_validity_when_a_member_is_evicted(name):
         cache.release_all_group_requests("query")
     assert hit < boundary
     assert cache._group_pools["cmp_c128"].hash_to_block
+
+
+@pytest.mark.parametrize("speculative,boundary", [(0, 49024), (7, 48896)])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_partial_49084_prompt_only_publishes_materialized_state(speculative, boundary, asynchronous):
+    from pypto_serving.model.deepseek_dspark.npu_runner import build_dspark_cache_group_specs
+
+    groups = build_dspark_cache_group_specs(3, (0, 4, 128), max_seq_len=100000,
+                                           max_prefill_tokens=8192, partitions=1)
+    groups = tuple(replace(g, spec=replace(g.spec, page_size_bytes=128)) for g in groups)
+    cache = KvCacheManager(enable_prefix_cache=True)
+    cache.init_groups(groups, max_batch_size=1, primary_num_blocks=3 * groups[0].max_blocks_per_seq)
+    scheduler = Scheduler(SchedulerConfig(max_num_running_reqs=1, max_num_scheduled_tokens=8192,
+        long_prefill_token_threshold=8192, max_prefill_tokens_per_request=8192, max_seq_len=100000,
+        num_speculative_tokens=speculative, speculative_prefix_cache_replay_tokens=128 if speculative else 0,
+        enable_prefix_cache=True, async_scheduling=asynchronous, stop_after_prefill=True), cache)
+    source = Request("source-49084", list(range(49084)), max_new_tokens=1)
+    scheduler.add_request(source)
+    publications = set()
+    while not source.status.is_finished:
+        output = scheduler.schedule()
+        step, = output.scheduled_requests
+        if step.checkpoint_plan:
+            publications.update(step.checkpoint_plan.boundaries)
+        if asynchronous:
+            scheduler.advance_after_schedule(output)
+        terminal = step.num_computed_tokens + step.num_new_tokens >= source.num_prompt_tokens
+        scheduler.update_from_output(output, {source.request_id: [11]} if terminal else {})
+        if source.prefill_complete:
+            scheduler.finish_prefilled_request(source.request_id)
+    assert boundary in publications
+    for name in ("hca_state", "csa_state", "csa_inner_state"):
+        pool = cache._group_pools[name]
+        page = pool.spec.spec.token_capacity
+        valid_pages = {q for end in publications
+                       for q in range(max(0, end - pool.spec.sliding_window) // page, end // page)}
+        hashes = source.group_block_hashes[name]
+        for q, value in enumerate(hashes):
+            if (0, value) in pool.hash_to_block:
+                assert q in valid_pages
+    consumer = Request("consumer-72706", list(range(49024)) + [2000000] * (72706 - 49024), max_new_tokens=1)
+    scheduler.add_request(consumer)
+    output = scheduler.schedule()
+    assert output.prefix_cache_hits == boundary
+    step, = output.scheduled_requests
+    assert step.num_computed_tokens == boundary
+    for name in ("hca_state", "csa_state", "csa_inner_state"):
+        pool = cache._group_pools[name]
+        page = pool.spec.spec.token_capacity
+        history = 4 if name.startswith("csa") else 128
+        for q in range((boundary - history) // page, boundary // page):
+            assert (0, source.group_block_hashes[name][q]) in pool.hash_to_block
+    scheduler.discard_scheduled_request(step)
+    scheduler.abort_request(consumer.request_id)
+    assert all(b.ref_cnt == 0 for pool in cache._group_pools.values() for b in pool.blocks)
 
 
 def paged_manager(partitions=4, enabled=True):

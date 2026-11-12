@@ -117,6 +117,7 @@ The HTTP completion path always ignores EOS. Chat requests can set `max_completi
 | Argument | Default | Description |
 | --- | --- | --- |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | enabled | Enable or disable prefix caching for supported paths. |
+| `--prefix-cache-retention-interval` | `8192` | DSpark periodic state checkpoint interval in source tokens; zero keeps replay/shared boundaries only. Must be a multiple of 128. |
 | `--enable-chunked-prefill` / `--no-enable-chunked-prefill` | enabled | Enable or disable chunked prefill. |
 | `--speculative-config JSON` | unset | Model-specific speculative decoding configuration; currently supported by DeepSeek V4. |
 | `--num-speculative-tokens K` | unset | Deprecated alias for the DeepSeek V4 MTP draft-token count. |

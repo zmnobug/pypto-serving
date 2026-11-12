@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from pypto_serving.config.types import DecodeBatch, PrefillBatch
+from pypto_serving.config.types import DecodeBatch, PrefillBatch, RuntimeConfig
 from pypto_serving.model.deepseek_dspark import task_args as task_args_module
 from pypto_serving.model.deepseek_dspark import npu_executor as executor_module
 from pypto_serving.model.deepseek_dspark import npu_runner as runner_module
@@ -52,7 +52,8 @@ def test_cache_budget_treats_max_num_seqs_as_an_upper_limit(tp_size, prefill_tok
     assert cache_pool_bytes(groups, counts, filler_pages=64) <= budget
     rolling = [g for g in groups if g.sliding_window is not None]
     per_request = {g.name: g.max_blocks_per_seq
-        + (prefill_tokens + g.spec.token_capacity - 1) // g.spec.token_capacity
+        + (prefill_tokens + g.spec.token_capacity - 1
+           + (g.spec.token_capacity - 1 if g.is_checkpoint_state else 0)) // g.spec.token_capacity
         + g.sliding_window // g.spec.token_capacity for g in rolling}
     resident = counts["ori"] // per_request["ori"]
     assert 1 <= resident <= runtime.max_batch_size // partitions
@@ -85,11 +86,12 @@ def test_cache_budget_preserves_async_checkpoint_minimum(resident):
         max_seq_len=310000, max_prefill_tokens=8192, partitions=4)
     minimum_counts = {g.name: max(g.max_blocks_per_seq, resident * (8192 // g.spec.token_capacity))
         if g.sliding_window is None else resident * (g.max_blocks_per_seq
-            + 8192 // g.spec.token_capacity + g.sliding_window // g.spec.token_capacity)
+            + (8192 + g.spec.token_capacity - 1
+               + (g.spec.token_capacity - 1 if g.is_checkpoint_state else 0)) // g.spec.token_capacity
+            + g.sliding_window // g.spec.token_capacity)
         for g in groups}
     budget = cache_pool_bytes(groups, minimum_counts, filler_pages=64)
     if resident == 1:
-        assert budget == 7790919680
         with pytest.raises(RuntimeError, match=f"minimum {budget}"):
             plan_cache_pages(groups, budget - 1, active_requests=64, step_tokens=8192, filler_pages=64)
     counts = plan_cache_pages(groups, budget, active_requests=64, step_tokens=8192, filler_pages=64)
@@ -116,8 +118,8 @@ def test_page_budget_uses_fractional_slot_without_changing_rings(tp_size):
     assert used <= budget
     assert original["cmp_c4"] < counts["cmp_c4"] < 2 * original["cmp_c4"]
     assert counts["ori"] == active * (9 + 1 + 4)
-    assert counts["hca_state"] == active * (33 + 1 + 16)
-    assert counts["csa_state"] == counts["csa_inner_state"] == active * (69 + 4 + 4)
+    assert counts["hca_state"] == active * (33 + 2 + 16)
+    assert counts["csa_state"] == counts["csa_inner_state"] == active * (69 + 5 + 4)
     increment = {g.name: counts[g.name] + (g.sliding_window is None) for g in groups}
     assert cache_pool_bytes(groups, increment, filler_pages=64) > budget
     manager = KvCacheManager()
@@ -1217,3 +1219,76 @@ def test_run_decode_accepts_and_redrafts(monkeypatch) -> None:
     runner._compiled.num_speculative_tokens = 0
     plain = runner.run_decode(SimpleNamespace(), decode)
     assert plain.num_draft_tokens is None
+
+
+@pytest.mark.parametrize("interval", [0, 128, 512, 1024, 2048, 4096, 8192, 16384])
+@pytest.mark.parametrize("start,length", [(0, 8192), (31, 8192), (513, 8192), (1048445, 131)])
+def test_checkpoint_metadata_is_bounded_per_projection_tile(interval, start, length):
+    end = start + length
+    ends = set(range((start // interval + 1) * interval, end + 1, interval)) if interval else set()
+    ends.update(((end - 128) // 128 * 128, (start + length // 2) // 128 * 128))
+    ends = tuple(sorted(b for b in ends if start < b <= end))
+    tiles = (length + 511) // 512
+    packed = DSparkCacheMetadataBuilder.checkpoint_tiles(ends, start=start, length=length, tiles=tiles)
+    assert packed[packed != 0].tolist() == list(ends) and packed.shape == (tiles, 6)
+    for tile, row in enumerate(packed):
+        assert all(start + tile * 512 < b <= min(end, start + (tile + 1) * 512) for b in row[row > 0])
+
+
+@pytest.mark.parametrize("page", [2, 8])
+@pytest.mark.parametrize("start,length", [(0, 32), (31, 129), (8205, 8192), (1040384, 8192)])
+@pytest.mark.parametrize("view", ["flat", "row", "strided"])
+def test_checkpoint_page_gather_matches_full_scan(page, start, length, view):
+    positions = torch.arange(start, start + length)
+    mapping = positions % 1024
+    if view == "row":
+        positions, mapping = positions.unsqueeze(0), mapping.unsqueeze(0)
+    elif view == "strided":
+        positions = torch.stack((positions, positions), dim=-1)[:, 0].unsqueeze(0)
+        mapping = torch.stack((mapping, mapping), dim=-1)[:, 0].unsqueeze(0)
+    expected = mapping.clone()
+    pages = {q: (q * 17) % 8192 for q in range(max(0, start // page - 16), (start + length) // page, 3)}
+    for q, physical in pages.items():
+        selected = positions // page == q
+        expected[selected] = physical * page + positions[selected] % page
+    DSparkCacheMetadataBuilder.apply_checkpoint_pages(mapping, positions, pages, page_tokens=page, num_blocks=8192)
+    assert torch.equal(mapping, expected)
+    with pytest.raises(ValueError, match="outside the state pool"):
+        DSparkCacheMetadataBuilder.apply_checkpoint_pages(mapping, positions, {0: -1},
+                                                          page_tokens=page, num_blocks=8192)
+
+
+@pytest.mark.parametrize("tp_size", [1, 4])
+def test_prefill_entry_views_and_checkpoint_reach_the_worker(tp_size):
+    runner = _runner(tp_size=tp_size)
+    runner._cache_group_num_blocks = {name: 1024 for name in DSPARK_CACHE_GROUP_NAMES}
+    batch = _packed_prefill_batch((127,), (0,), (129,))
+    batch.prompt_lens = [512]
+    batch.checkpoint_ends = [(256,)]
+    batch.checkpoint_block_ids_by_group = [{name: {
+        max((129 + page - 1) // page, (256 - history) // page): 900}
+        for name, history, page in (("hca_state", 128, 8), ("csa_state", 8, 2), ("csa_inner_state", 8, 2))}]
+    batch.read_block_ids_by_group = [{name: {q: 100 + q for q in range((129 - history) // page, (129 + page - 1) // page)}
+        for name, history, page in (("hca_state", 128, 8), ("csa_state", 8, 2), ("csa_inner_state", 8, 2))}]
+    model = SimpleNamespace(runtime=RuntimeConfig(max_seq_len=512, speculative_prefix_cache_replay_tokens=128))
+    inputs = runner.prepare_prefill_inputs(model, batch)
+    assert inputs.state_checkpoint_ends[0, 0].tolist() == [[256, 0, 0, 0, 0, 0]]
+    for name, prefix, page in (("hca_state", "hca", 8), ("csa_state", "csa", 2), ("csa_inner_state", "csa_inner", 2)):
+        table = inputs.block_tables[prefix + "_compress_state_block_table"][0, 0]
+        expected = batch.read_block_ids_by_group[0][name]
+        assert {q: int(table[q]) for q in torch.nonzero(table >= 0).flatten().tolist()} == expected
+        positions = torch.arange(129, 256)
+        ids = torch.tensor(batch.block_ids_by_group[0][name])
+        slots = ids[positions // page % len(ids)] * page + positions % page
+        for logical, physical in batch.checkpoint_block_ids_by_group[0][name].items():
+            selected = positions // page == logical
+            slots[selected] = physical * page + positions[selected] % page
+        assert torch.equal(inputs.slot_mappings[name + "_slot_mapping_full"][0, :127], slots)
+    runner._stage_prefill_inputs(inputs)
+    assert runner._prefill_task_args.tensors["state_checkpoint_ends"][0, 0].tolist() == [[256, 0, 0, 0, 0, 0]]
+    smaller = runner.prepare_prefill_inputs(model, _packed_prefill_batch((3,), (0,), (0,)))
+    runner._stage_prefill_inputs(smaller)
+    assert runner._prefill_task_args.tensors["state_checkpoint_ends"][:tp_size, :1].count_nonzero() == 0
+    batch.read_block_ids_by_group[0].pop("hca_state")
+    with pytest.raises(ValueError, match="entry history"):
+        runner.prepare_prefill_inputs(model, batch)

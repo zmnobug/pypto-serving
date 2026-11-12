@@ -25,6 +25,17 @@ pypto-serving \
 
 Set `num_speculative_tokens` to `7` to enable the DSpark speculative chain; other positive values are rejected. K=7 requires the checkpoint's three MTP layers and matching `dspark_target_layer_ids`, `dspark_noise_token_id`, and `dspark_markov_rank` metadata. `--enable-prefix-caching` is supported for both K=0 and K=7. Cached prefixes are aligned to 128 source tokens; K=7 keeps at least 128 trailing tokens for drafter reconstruction, so a prompt needs at least 256 tokens for its first possible hit. K=0 needs at least 129 tokens. See [Tool Calling](../../user-guide/tool-calling.md) for the client workflow and [Constrained Tool Deployment](tool-constraints.md) for the K=7 structural setup.
 
+Prefix reuse requires a complete recurrent-state checkpoint as well as the
+compressed KV pages. Serving passes the selected checkpoint boundaries to the
+prefill compressors and retains their state windows until eviction. Computed
+tokens alone do not make intermediate state pages reusable.
+
+`--prefix-cache-retention-interval` controls periodic checkpoint publication in
+source tokens (default: `8192`). It must be zero or a multiple of 128. Zero
+keeps only the prompt replay and known shared-prefix boundaries. A request may
+therefore reuse an earlier complete checkpoint than its longest matching token
+prefix.
+
 ## Verify
 
 ```bash

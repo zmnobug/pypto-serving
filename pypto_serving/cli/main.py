@@ -233,6 +233,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable prefix caching (default: True). Use --no-enable-prefix-caching to disable.",
     )
     parser.add_argument(
+        "--prefix-cache-retention-interval", type=int, default=8192,
+        help="DSpark sparse checkpoint interval in source tokens (default: 8192; 0 disables periodic points).",
+    )
+    parser.add_argument(
         "--enable-chunked-prefill",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -540,6 +544,7 @@ def _build_runtime_config(
         prefill_chunk_size_choices=prefill_chunk_size_choices,
         supports_chunked_prefill_with_speculation=supports_chunked_prefill_with_speculation,
         speculative_prefix_cache_replay_tokens=speculative_prefix_cache_replay_tokens,
+        prefix_cache_retention_interval=args.prefix_cache_retention_interval,
         requires_homogeneous_prefill_decode=requires_homogeneous_prefill_decode,
         num_speculative_tokens=num_speculative_tokens,
         kv_cache_groups=kv_cache_groups,
