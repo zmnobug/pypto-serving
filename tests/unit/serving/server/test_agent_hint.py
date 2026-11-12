@@ -8,18 +8,29 @@
 # -----------------------------------------------------------------------------------------------------------
 """Validate optional Agent session identity without changing Chat responses."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from pypto_serving.config.types import GenerateConfig
-from pypto_serving.serving.engine.async_engine import TokenOutput
+from pypto_serving.serving.agentinfer_admission import AgentInferAdmission
+from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig, TokenOutput
+from pypto_serving.serving.memory.kv_cache import KvCacheManager
 from pypto_serving.serving.reasoning import ParsedToolCall
+from pypto_serving.serving.sched.scheduler import Request, Scheduler, SchedulerConfig
 from pypto_serving.serving.server.server import ServingServer
 
 
 class _Tokenizer:
+    eos_token_id = 0
+    bos_token_id = 1
+
+    @staticmethod
+    def encode(text):
+        return [1] * len(text.split())
+
     @staticmethod
     def apply_chat_template(messages, **kwargs):
         return " ".join(message["content"] or "" for message in messages)
@@ -401,3 +412,123 @@ def test_parsed_tool_call_reports_continue_instead_of_terminal(stream):
         })
     assert response.status_code == 200
     assert engine.lifecycle == [("session-a", engine.calls[0][0], "continue")]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("lifecycle", ["continue", "terminal"])
+def test_replay_identity_and_length_completion_lifecycle(stream, lifecycle):
+    engine = _Engine(finish_reason="FINISHED_LENGTH")
+    server = ServingServer(engine, "test-model", GenerateConfig())
+    context = {
+        "program_id": "child", "session_id": "child", "task_id": "root",
+        "agent_id": "child", "agent_role": "subagent", "parent_program_id": "parent",
+        "blocks_parent": False, "expected_resume": lifecycle != "terminal",
+    }
+    with TestClient(server.app) as client:
+        for _ in range(2):
+            response = client.post("/v1/chat/completions", json={
+                "messages": [{"role": "user", "content": "Replay turn"}], "stream": stream,
+                "vllm_xargs": {"agentic_context": context},
+                "agent_response_lifecycle": lifecycle,
+            })
+            assert response.status_code == 200
+    identity = engine.calls[0][2]["agent_identity"]
+    assert identity.program_id == "child"
+    assert identity.task_id == "root"
+    assert identity.parent_program_id == "parent"
+    assert identity.agent_role == "subagent"
+    assert identity.blocks_parent is False
+    assert engine.calls[1][2]["agent_identity"] == identity
+    assert [event[2] for event in engine.lifecycle] == [lifecycle, lifecycle]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_replay_lifecycle_reaches_real_engine_and_admission(stream, monkeypatch):
+    engine = AsyncLLMEngine(EngineConfig(agentinfer_mode="enforce"), tokenizer=_Tokenizer())
+    core = engine.single_core()
+    manager = KvCacheManager(num_blocks=64, block_size=16)
+    admission = AgentInferAdmission(0, Scheduler(SchedulerConfig(), manager), manager)
+    core._agentinfer_admission = admission
+
+    async def complete_without_device(request_id, prompt, config, *, on_queued, prompt_token_ids, **kwargs):
+        request = Request(request_id, prompt_token_ids, max_new_tokens=1)
+        assert admission.arrive(request, kwargs["agent_identity"])
+        on_queued()
+        admission.complete(request)
+        yield TokenOutput(
+            text="OK", finished=True, finish_reason="FINISHED_LENGTH",
+            prompt_tokens=len(prompt_token_ids), completion_tokens=1,
+        )
+
+    # Only model execution is substituted; lifecycle forwarding uses both real engine layers.
+    monkeypatch.setattr(core, "add_request", complete_without_device)
+    server = ServingServer(engine, "test-model", GenerateConfig())
+    with TestClient(server.app) as client:
+        for lifecycle in ("continue", "terminal"):
+            response = client.post("/v1/chat/completions", json={
+                "messages": [{"role": "user", "content": "Replay turn"}], "stream": stream,
+                "vllm_xargs": {"agentic_context": {
+                    "program_id": "replay-session", "session_id": "replay-session",
+                    "task_id": "replay-session", "agent_role": "lead",
+                    "expected_resume": lifecycle == "continue",
+                }},
+                "agent_response_lifecycle": lifecycle,
+            })
+            assert response.status_code == 200
+            if stream:
+                chunks = [json.loads(line[6:]) for line in response.text.splitlines()
+                          if line.startswith("data: {")]
+                assert any(choice.get("finish_reason") == "length"
+                           for chunk in chunks for choice in chunk["choices"])
+                assert "data: [DONE]" in response.text
+            else:
+                assert response.json()["choices"][0]["finish_reason"] == "length"
+            assert admission.policy.registry.has_programs is (lifecycle == "continue")
+    assert engine._request_to_replica == {}
+
+
+@pytest.mark.parametrize("finish_reason", ["ABORTED", "FINISHED_ERROR", "FINISHED_REPETITION"])
+def test_replay_terminal_is_not_applied_to_unsuccessful_outputs(finish_reason):
+    engine = _Engine(finish_reason=finish_reason)
+    server = ServingServer(engine, "test-model", GenerateConfig())
+    server._observe_chat_lifecycle(
+        "child", "request", "explicit",
+        TokenOutput(text="", finished=True, finish_reason=finish_reason),
+        response_lifecycle="terminal",
+    )
+    assert engine.lifecycle == []
+
+
+def test_replay_terminal_is_not_applied_to_partial_output():
+    engine = _Engine()
+    server = ServingServer(engine, "test-model", GenerateConfig())
+    server._observe_chat_lifecycle(
+        "child", "request", "explicit", TokenOutput(text="partial", finished=False),
+        response_lifecycle="terminal",
+    )
+    assert engine.lifecycle == []
+
+
+def test_replay_lifecycle_requires_identity():
+    server = ServingServer(_Engine(), "test-model", GenerateConfig())
+    with TestClient(server.app) as client:
+        response = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Replay"}],
+            "agent_response_lifecycle": "terminal",
+        })
+    assert response.status_code == 422
+
+
+def test_disabled_admission_accepts_replay_payload_without_notifying_lifecycle():
+    engine = _Engine(finish_reason="FINISHED_LENGTH")
+    engine.config = SimpleNamespace(agentinfer_mode="disabled")
+    server = ServingServer(engine, "test-model", GenerateConfig())
+    with TestClient(server.app) as client:
+        response = client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "Replay"}],
+            "agent_hint": {"session_id": "child"},
+            "agent_response_lifecycle": "terminal",
+        })
+    assert response.status_code == 200
+    assert engine.lifecycle == []
+    assert "agent_identity" not in engine.calls[0][2]

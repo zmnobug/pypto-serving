@@ -63,6 +63,7 @@ from pypto_serving.model.deepseek_dspark.weight_loader import (
     DSparkWeightStore,
 )
 from pypto_serving.serving.sampling.stop_rules import blocked_token_ids
+from pypto_serving.serving.utils.token_trace import token_trace_enabled, trace_tokens
 from pypto_serving.tools.profile import profile_span
 
 logger = logging.getLogger(__name__)
@@ -4198,6 +4199,15 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 state.pending_confidence = [
                     float(value) for value in confidence[rank, index]
                 ]
+                if token_trace_enabled():
+                    trace_tokens(
+                        "dspark_next_drafts", row.request_id,
+                        verify_step=state.verify_steps, group=state.group,
+                        lease=state.lease, generation=state.generation,
+                        buffer_slot=buffer_slot, rank=rank, row=index,
+                        anchor=row.anchor, token_ids=state.pending_draft_tokens,
+                        confidence=state.pending_confidence,
+                    )
                 if os.environ.get("PYPTO_DSPARK_DEBUG_ACCEPT") == "1" and state.verify_steps <= 3:
                     logger.info(
                         "DSpark redraft debug: path=one_l2 request=%s verify=%d rank=%d "
@@ -4306,9 +4316,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         rows_by_rank: list[list[DSparkDrafterRequestRow]] = [
             [] for _ in range(layout.ranks)
         ]
-        for request_id, rank, local_row in zip(
+        for batch_index, (request_id, rank, local_row) in enumerate(zip(
             inputs.request_ids, inputs.owner_ranks, inputs.owner_rows, strict=True
-        ):
+        )):
             state = self._drafter_state(request_id)
             count = int(state_buffers.accepted_counts[rank, local_row].item())
             if count < 1 or count > layout.decode_seq:
@@ -4321,6 +4331,23 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 for token in state_buffers.accepted_token_ids[rank, local_row, :count]
             ]
             accepted.append(tokens)
+            if token_trace_enabled():
+                sample_rank, sample_row = inputs.sampled_slots[batch_index]
+                trace_tokens(
+                    "dspark_accept", request_id,
+                    verify_step=state.verify_steps + 1,
+                    prompt_len=state.prompt_len, committed_before=state.committed_count,
+                    group=state.group, lease=state.lease, generation=state.generation,
+                    rank=rank, row=local_row, buffer_slot=inputs.buffer_slot,
+                    sampled_token_ids=[
+                        int(sampled[sample_rank, sample_row + offset, 0].item())
+                        for offset in range(layout.decode_seq)
+                    ],
+                    accepted_token_ids=tokens,
+                    # This is the previous host mirror, not a device-state dump.
+                    previous_host_draft_token_ids=state.pending_draft_tokens,
+                    matched_drafts=count - 1,
+                )
             state.verify_steps += 1
             state.proposed_tokens += DSPARK_DRAFTER_QUERY_WIDTH
             state.matched_drafts += count - 1
@@ -7077,6 +7104,12 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         for request_id in request_ids:
             state = self._drafter_states.pop(request_id, None)
             if state is not None:
+                trace_tokens(
+                    "dspark_release", request_id, group=state.group,
+                    lease=state.lease, generation=state.generation,
+                    verifies=state.verify_steps, matched=state.matched_drafts,
+                    accepted=state.accepted_tokens, committed_count=state.committed_count,
+                )
                 if state.verify_steps:
                     logger.info(
                         "DSpark speculation finished: request=%s verifies=%d "

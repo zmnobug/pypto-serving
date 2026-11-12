@@ -252,6 +252,11 @@ class AgentInferAdmission:
             identity if isinstance(identity, AgentIdentity)
             else self._identity_type(program_id=identity, session_id=identity)
         )
+        logger.info(
+            "AgentInfer identity request=%s program=%s task=%s role=%s parent=%s blocks_parent=%s expected_resume=%s",
+            request.request_id, metadata.program_id, metadata.task_id, metadata.agent_role,
+            metadata.parent_program_id, metadata.blocks_parent, metadata.expected_resume,
+        )
         self._sessions[request.request_id] = metadata.program_id
         request.observe_prefix_cache = True
         try:

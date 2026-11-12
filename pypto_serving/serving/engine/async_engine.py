@@ -37,6 +37,7 @@ from pypto_serving.serving.utils.env import (
     worker_step_timeout_seconds,
 )
 from pypto_serving.serving.utils.gc_utils import freeze_gc_heap
+from pypto_serving.serving.utils.token_trace import token_trace_enabled, trace_tokens
 from pypto_serving.serving.sched.scheduler import (
     Request,
     RequestStatus,
@@ -639,6 +640,13 @@ class ReplicaEngineCore:
                 constraint_spec=constraint_spec,
             )
 
+            if token_trace_enabled():
+                trace_tokens(
+                    "request_start", request_id, prompt_token_ids=list(prompt_token_ids),
+                    max_new_tokens=request.max_new_tokens, min_tokens=request.min_tokens,
+                    ignore_eos=request.ignore_eos, eos_token_id=request.eos_token_id,
+                    agent_session_id=agent_session_id,
+                )
             if request_id in self._request_contexts:
                 raise ValueError(f"request {request_id!r} is already active")
             ctx = _RequestContext(
@@ -1387,6 +1395,12 @@ class ReplicaEngineCore:
                 admission.progress(ctx.request)
 
             if req_output.finished:
+                if token_trace_enabled():
+                    trace_tokens(
+                        "request_finish", req_output.request_id,
+                        output_token_ids=list(ctx.request.output_token_ids),
+                        finish_reason=req_output.finish_reason,
+                    )
                 # Flush the authoritative full decode: if generation ends while a
                 # multi-token character is incomplete (or a token legitimately
                 # decodes to U+FFFD), the incremental path withholds that tail
@@ -1953,7 +1967,7 @@ class AsyncLLMEngine:
         """Lifecycle routing is replica-local until AgentInfer multi-replica support exists."""
         if self.config.agentinfer_mode != "enforce":
             return False
-        return self._single_core().observe_agent_lifecycle(session_id, request_id, lifecycle)
+        return self.single_core().observe_agent_lifecycle(session_id, request_id, lifecycle)
 
     async def add_request(
         self,

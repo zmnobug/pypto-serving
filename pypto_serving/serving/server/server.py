@@ -155,6 +155,10 @@ class AgentLifecycleRequest(AgentSession):
 
 
 class ChatCompletionRequest(BaseModel):
+    agent_response_lifecycle: Literal["continue", "terminal"] | None = Field(
+        default=None,
+        description="Replay lifecycle fact applied only after a successful final output, including length stops.",
+    )
     model: str = ""
     messages: list[ChatMessage]
     max_tokens: int | None = None
@@ -504,6 +508,11 @@ class ServingServer:
     ) -> StreamingResponse | JSONResponse:
         agent_identity = self._agent_identity(request, http_request)
         agent_session_id = agent_identity.program_id if agent_identity is not None else None
+        if (
+            request.agent_response_lifecycle is not None and agent_identity is None
+            and getattr(getattr(self.engine, "config", None), "agentinfer_mode", None) != "disabled"
+        ):
+            raise HTTPException(status_code=422, detail="agent_response_lifecycle requires AgentInfer identity")
 
         with profile_span(
             "http.chat_completions",
@@ -523,6 +532,7 @@ class ServingServer:
                         agent_session_id=agent_session_id,
                         agent_identity=agent_identity,
                         agent_lifecycle_mode=request.agent_hint.lifecycle_mode if request.agent_hint else "explicit",
+                        agent_response_lifecycle=request.agent_response_lifecycle,
                     ),
                     media_type="text/event-stream",
                 )
@@ -557,7 +567,7 @@ class ServingServer:
                     self._observe_chat_lifecycle(
                         agent_session_id, request_id,
                         request.agent_hint.lifecycle_mode if request.agent_hint else "explicit",
-                        output,
+                        output, response_lifecycle=request.agent_response_lifecycle,
                     )
                     tool_calls = output.tool_calls if request.parallel_tool_calls else output.tool_calls[:1]
                     usage = ResponseUsage(
@@ -679,6 +689,7 @@ class ServingServer:
         agent_session_id: str | None = None,
         agent_identity: AgentIdentity | None = None,
         agent_lifecycle_mode: str = "explicit",
+        agent_response_lifecycle: str | None = None,
     ):
         # Once SSE headers have been sent, request-local parser failures must be
         # reported in the stream. Cancellation still propagates to engine cleanup.
@@ -688,6 +699,7 @@ class ServingServer:
             parallel_tool_calls=parallel_tool_calls, agent_session_id=agent_session_id,
             agent_identity=agent_identity,
             agent_lifecycle_mode=agent_lifecycle_mode,
+            agent_response_lifecycle=agent_response_lifecycle,
         )
         try:
             async with contextlib.aclosing(chunks):
@@ -711,6 +723,7 @@ class ServingServer:
         agent_session_id: str | None = None,
         agent_identity: AgentIdentity | None = None,
         agent_lifecycle_mode: str = "explicit",
+        agent_response_lifecycle: str | None = None,
     ):
         with profile_span("http.stream_chat_completion", cat="request", args={"request_id": request_id}):
             prev_text = ""
@@ -739,7 +752,10 @@ class ServingServer:
                         prev_reasoning = output.reasoning or prev_reasoning
                     finish_reason = self._chat_finish_reason(output) if output.finished else None
                     if output.finished:
-                        self._observe_chat_lifecycle(agent_session_id, request_id, agent_lifecycle_mode, output)
+                        self._observe_chat_lifecycle(
+                            agent_session_id, request_id, agent_lifecycle_mode, output,
+                            response_lifecycle=agent_response_lifecycle,
+                        )
                     tool_deltas = [
                         self._tool_delta(item) for item in output.tool_call_deltas
                         if parallel_tool_calls or item.index == 0
@@ -793,8 +809,13 @@ class ServingServer:
 
     def _observe_chat_lifecycle(
         self, session_id: str | None, request_id: str, mode: str, output: TokenOutput,
+        *, response_lifecycle: str | None = None,
     ) -> None:
-        if session_id is None:
+        if session_id is None or not output.finished:
+            return
+        if response_lifecycle is not None:
+            if output.finish_reason in ("FINISHED_LENGTH", "FINISHED_EOS", "FINISHED_STOP"):
+                self._notify_agent_lifecycle(session_id, request_id, response_lifecycle)
             return
         reason = self._chat_finish_reason(output)
         if output.tool_calls or reason == "tool_calls":

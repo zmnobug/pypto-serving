@@ -179,3 +179,40 @@ Scheduler and engine rejections are returned as HTTP 400 with:
 ## Shutdown
 
 Stop the server with the normal process signal for your environment. On a graceful shutdown, the server attempts to stop active profile recorders and merge available profile fragments when profiling is enabled.
+
+
+## AgentInfer replay metadata
+
+Chat replay clients can provide `vllm_xargs.agentic_context` with explicit
+`program_id`, `task_id`, `session_id`, `agent_id`, `agent_role`,
+`parent_program_id`, `blocks_parent`, and `expected_resume`. Use one stable
+Program ID per session, the same task ID throughout a tree, and the exact parent
+Program ID for nested agents. A parent relationship is not by itself a blocking
+join; use `blocks_parent=false` when the client cannot establish that fact.
+
+The optional Chat field `agent_response_lifecycle` accepts `continue` or
+`terminal`. It declares the replay client's known session progression and is
+applied only after successful generation ends (EOS, stop, or length). It is not
+applied on partial output, cancellation, error, or repetition termination. This
+allows length-limited trace replay to report completion without interpreting
+model-generated text as workflow state. Without this field, existing lifecycle
+behavior is preserved. AgentInfer-disabled serving ignores the hints.
+
+With the matching AgentX client, set `AIPERF_HTTP_AGENTINFER_METADATA=1` to
+populate this contract. The switch requires client-side support; setting it on
+an unmodified client does not add metadata. Clients that only send `X-Session-ID`
+still provide session identity, but not task trees or explicit replay completion.
+Warmup should use `continue`, and unfinished sessions at the benchmark deadline
+must not receive a synthetic `terminal`. Inspect the server's
+`AgentInfer identity` and `AgentInfer lifecycle` log records to verify the actual
+Program/parent/role mapping and release decisions.
+
+### Local token diagnostics
+
+Set `PYPTO_TOKEN_TRACE_DIR` to a local directory before starting the server to
+record prompt and final output token IDs and DSpark fused decode acceptance,
+target samples, next draft IDs, and request slot ownership in per-process JSONL
+files. This diagnostic option is disabled by default. Records contain the full
+request token data and add host-side I/O, so use them for debugging rather than
+performance measurements. Previous host draft mirrors are labeled separately
+from next drafts; they are not an authoritative dump of consumed device state.

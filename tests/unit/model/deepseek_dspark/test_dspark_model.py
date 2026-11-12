@@ -1074,7 +1074,11 @@ def test_prefix_cache_drafter_seeding_requires_replayed_window(monkeypatch, tail
     "anchor,drafts,accepted,expected",
     [(504, 7, 3, 7), (505, 7, 1, 0), (64, 0, 1, 0)],
 )
-def test_fused_reclaim_reports_consumed_drafts(monkeypatch, anchor, drafts, accepted, expected):
+@pytest.mark.parametrize("tracing", [False, True])
+def test_fused_reclaim_reports_consumed_drafts(monkeypatch, tmp_path, anchor, drafts, accepted, expected, tracing):
+    monkeypatch.delenv("PYPTO_TOKEN_TRACE_DIR", raising=False)
+    if tracing:
+        monkeypatch.setenv("PYPTO_TOKEN_TRACE_DIR", str(tmp_path))
     runner = _runner(speculative=True)
     state = runner._reserve_drafter_state("spec", group=0, prompt_len=64)
     state.committed_count = anchor
@@ -1087,9 +1091,11 @@ def test_fused_reclaim_reports_consumed_drafts(monkeypatch, anchor, drafts, acce
     runner._dspark_state_buffers = [SimpleNamespace(accepted_counts=counts, accepted_token_ids=tokens)]
     inputs = SimpleNamespace(
         request_ids=("spec",), speculative_flags=(True,), owner_ranks=(0,), owner_rows=(0,), buffer_slot=0,
+        sampled_slots=((0, 0),),
     )
     pending = runner_module._DSparkPendingDecode(
-        dispatch=SimpleNamespace(wait=lambda: None), inputs=inputs, sampled_ids=torch.empty(0),
+        dispatch=SimpleNamespace(wait=lambda: None), inputs=inputs,
+        sampled_ids=torch.arange(layout.decode_seq).reshape(1, layout.decode_seq, 1),
     )
     # Redrafting replaces the consumed drafts, including on a fallback step.
     # Metrics must use the pre-acceptance state and the actual position ceiling.
@@ -1101,6 +1107,20 @@ def test_fused_reclaim_reports_consumed_drafts(monkeypatch, anchor, drafts, acce
     assert result.accepted_token_ids == [list(range(100, 100 + accepted))]
     assert result.num_draft_tokens == [expected]
     assert state.committed_count == anchor + accepted
+    if tracing:
+        import json
+
+        records = [json.loads(line) for path in tmp_path.glob("*.jsonl") for line in path.read_text().splitlines()]
+        record = next(item for item in records if item["event"] == "dspark_accept")
+        assert record["sampled_token_ids"] == list(range(layout.decode_seq))
+        assert record["accepted_token_ids"] == result.accepted_token_ids[0]
+        assert record["previous_host_draft_token_ids"] == list(range(drafts))
+        assert record["committed_before"] == anchor
+        assert record["matched_drafts"] == accepted - 1
+        assert record["lease"] == state.lease
+        assert record["generation"] == state.generation
+    else:
+        assert not list(tmp_path.iterdir())
 
 
 def test_run_decode_accepts_and_redrafts(monkeypatch) -> None:
