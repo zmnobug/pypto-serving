@@ -11,7 +11,7 @@ Run from the Serving repository root on the NPU host. Requirements:
 
 - An existing, idle Python 3.10 Conda environment; its Python version is not changed.
 - CANN with `set_env.sh`, `ccec` and `aarch64-target-linux-gnu-g++`.
-- `git`, `uv`, `task-submit`, network access to the source repositories, PyPI,
+- `git`, `uv`, `curl`, `task-submit`, network access to the source repositories, PyPI,
   CPU Torch wheels, PTOAS releases, and the AgentX dataset.
 - A local model directory with config, safetensors index, every weight shard
   and tokenizer files. A separate local tokenizer directory is optional.
@@ -40,16 +40,35 @@ artifacts/regression-driver/bin/python scripts/run_deepseek_agentx_regression.py
 `--tokenizer` defaults to `--model`. `--port` defaults to 8232. General Python
 packages use the Tsinghua index by default (`--index-url` changes it); the CPU
 Torch wheel and pinned PTOAS wheel come from their respective upstream sources.
+PTOAS downloads use the host's `curl` with HTTP/1.1 and verify the pinned SHA256.
+Release wheels are cached under `~/.cache/deepseek-agentx/downloads` by checksum;
+every reuse is rehashed, and corrupt cache entries require a fresh download.
+This cache contains upstream release packages, not locally compiled source binaries.
+Each run records the wheel origin and installs its own PTOAS environment. The runner
+inherits the caller's proxy settings when the host requires them.
+Git downloads use HTTP/1.1, including recursive submodules, and retain transport
+diagnostics in the failure report.
+Checkouts and submodules use shallow fetches and still verify every selected SHA;
+inactive Git transfers have a bounded low-speed timeout.
 The command prints the run directory immediately and emits progress heartbeats.
 
 **The full command updates packages and editable installs in the selected Conda
 environment.** Before changing it, the runner saves Conda/pip package inventories
 and holds both a workspace lock and an environment-prefix lock through cleanup.
+Before rebuilding local projects it uninstalls the old PyPTO, simpler and Serving
+distributions, so their editable import finders cannot shadow the new build helpers.
+`pip check` validates the Conda environment with CANN's external `PYTHONPATH`
+removed; optional CANN analyzer packages remain outside that dependency check.
 It refuses an environment used by another running interpreter. Use a dedicated
 regression environment. Do not delete an old run's checkout while the environment
 still has editable installs referring to it. Preparation is not transactional;
 a failed build can leave updated packages, so inspect the retained inventories
 and install logs before reusing the environment.
+Activation clears old runtime variables both before and after Conda activation:
+Conda config variables and hooks must not restore a previous source path or
+`PYPTO_PROG_BUILD_DIR`. Build and worker use the same activation preamble, and
+host/worker identity checks require this run's JIT cache without an explicit
+rebuild directory. Build/codegen parallelism is bounded to two jobs.
 
 ## Version selection and workload
 
@@ -111,7 +130,9 @@ Each run creates `artifacts/dspark-regression/<run-id>/`:
 | `result.json`, `result.md` | Machine-readable and human-readable result |
 
 A small opt-in observer records already-loaded modules inside the actual model
-worker. It checks the selected interpreter, source SHAs, imported paths, native
+worker and its forked device processes. Recorded parent IDs distinguish these
+process roles; every observation and every logged device process is verified.
+It checks the selected interpreter, source SHAs, imported paths, native
 hashes, runtime build commit, PTO-ISA build provenance and PTOAS version against
 the fresh build. An HTTP observer on localhost forwards streaming responses and
 joins AgentX's `X-Request-ID` with Serving's response ID and usage. It also forwards

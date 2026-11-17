@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import signal
@@ -136,6 +137,13 @@ cd {shlex.quote(manifest['sources']['agentx']['path'])}
     return server, client
 
 
+def process_is_terminal(path):
+    try:
+        return bool(re.search(r"^State:\s+Z\b", (path / "status").read_text(), re.MULTILINE))
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+
+
 def own_processes(root):
     marker = ("DSPARK_REGRESSION_MANIFEST=" + str(root / "manifest.json")).encode()
     found, uncertain = [], []
@@ -144,6 +152,10 @@ def own_processes(root):
         if int(path.name) == os.getpid():
             continue
         try:
+            # A terminated child can remain as a zombie until its reaper runs;
+            # its environment may already be unreadable, but it cannot use an NPU.
+            if path.name in known and process_is_terminal(path):
+                continue
             if marker in (path / "environ").read_bytes().split(b"\0"):
                 found.append(int(path.name))
         except PermissionError:
@@ -162,12 +174,17 @@ def cleanup(root, port, budget):
             records[role] = tasks.stop(root, role, budget)
         except Exception as exc:
             records[role] = {"verified": False, "error": f"{type(exc).__name__}: {exc}"}
-    try:
-        remaining, uncertain = own_processes(root)
-    except (OSError, ValueError, KeyError) as exc:
-        remaining, uncertain = [], [str(exc)]
     owns_server = (root / "server-task.json").is_file()
-    listening = port_listening(port) if port and owns_server else False
+    deadline = time.monotonic() + budget
+    while True:
+        try:
+            remaining, uncertain = own_processes(root)
+        except (OSError, ValueError, KeyError) as exc:
+            remaining, uncertain = [], [str(exc)]
+        listening = port_listening(port) if port and owns_server else False
+        if not (remaining or uncertain or listening) or time.monotonic() >= deadline:
+            break
+        time.sleep(1)
     verified = all(value["verified"] for value in records.values()) and not (remaining or uncertain or listening)
     result = {"schema_version": 1, "at": now(), "tasks": records, "verified": verified,
               "port_listening": listening, "remaining_run_processes": remaining, "unreadable_worker_pids": uncertain}
@@ -297,7 +314,7 @@ def run(args, profile):
         busy = provision.environment_busy(prefix)
         if busy:
             raise RegressionError("SKIPPED_BUSY", f"Environment is in use by processes {busy}")
-        for name in ("git", "uv", "task-submit"):
+        for name in ("git", "uv", "curl", "task-submit"):
             if not shutil.which(name):
                 raise RegressionError("BLOCKED_SETUP", f"Missing executable: {name}")
         ensure_port_free(args.port)

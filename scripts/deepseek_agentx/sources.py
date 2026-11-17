@@ -72,18 +72,31 @@ def parse_ci(root, job_name):
         raise RegressionError("BLOCKED_COMPATIBILITY", f"Unsupported lib CI contract: {exc}") from exc
 
 
+def network_git(*args, timeout=120):
+    # Proxy paths can interrupt Git's HTTP/2 pack streams; HTTP/1.1 works for both paths.
+    return capture(["git", "-c", "http.version=HTTP/1.1", "-c", "http.lowSpeedLimit=1024",
+                    "-c", "http.lowSpeedTime=60", *args], timeout=timeout)
+
+
+def fetch_diagnostic(exc):
+    output = getattr(exc, "output", "") or ""
+    if isinstance(output, bytes):
+        output = output.decode(errors="replace")
+    return f"{exc}\n{output[-4000:]}"
+
+
 def clone(url, ref, destination):
     """Never reset/clean a user tree; destination must be new."""
     if destination.exists():
         raise RegressionError("BLOCKED_SETUP", f"Checkout already exists: {destination}")
     try:
-        capture(["git", "clone", "--no-checkout", url, destination], timeout=900)
-        git(destination, "fetch", "origin", ref)
+        network_git("clone", "--no-checkout", "--depth", "1", url, destination, timeout=900)
+        network_git("-C", destination, "fetch", "--depth", "1", "origin", ref)
         commit = git(destination, "rev-parse", "FETCH_HEAD")
         git(destination, "checkout", "--detach", commit)
         return commit
     except (subprocess.SubprocessError, OSError) as exc:
-        raise RegressionError("BLOCKED_FETCH", f"Unable to fetch {url} {ref}: {exc}") from exc
+        raise RegressionError("BLOCKED_FETCH", f"Unable to fetch {url} {ref}: {fetch_diagnostic(exc)}") from exc
 
 
 def gitlink(root, path):
@@ -133,7 +146,7 @@ def resolve(root, profile):
     clone(repos["pypto"], ci["pypto_ref"], pypto)
     runtime_sha = gitlink(pypto, "runtime")
     try:
-        capture(["git", "-C", pypto, "submodule", "update", "--init", "--recursive"], timeout=1800)
+        network_git("-C", pypto, "submodule", "update", "--init", "--recursive", "--depth", "1", timeout=1800)
         if git(pypto / "runtime", "rev-parse", "HEAD") != runtime_sha:
             raise ValueError("runtime checkout differs from PyPTO gitlink")
         original_lib = gitlink(serving, "pypto-lib")
@@ -147,10 +160,10 @@ def resolve(root, profile):
             for line in paths.splitlines():
                 path = line.split(None, 1)[1]
                 if path != "pypto-lib":
-                    capture(["git", "-C", serving, "submodule", "update", "--init", "--recursive", "--", path],
-                            timeout=1800)
+                    network_git("-C", serving, "submodule", "update", "--init", "--recursive", "--depth", "1", "--", path,
+                                timeout=1800)
     except (subprocess.SubprocessError, ValueError) as exc:
-        raise RegressionError("BLOCKED_FETCH", f"Unable to initialize pinned submodules: {exc}") from exc
+        raise RegressionError("BLOCKED_FETCH", f"Unable to initialize pinned submodules: {fetch_diagnostic(exc)}") from exc
     clone(repos["agentx"], "HEAD", checkouts / "agentx-harness")
     versions_file = pypto / "toolchain/versions.env"
     versions = dict(re.findall(r"^([A-Z0-9_]+)=([^\s#]+)", versions_file.read_text(), re.MULTILINE))

@@ -16,7 +16,6 @@ from pathlib import Path
 import re
 import shlex
 import shutil
-import urllib.request
 import time
 
 from .common import RegressionError, capture, clean_environment, git, run_command, sha256, write_json
@@ -91,12 +90,36 @@ def tokenizer_identity(tokenizer):
     return {"path": str(tokenizer.resolve()), "metadata_sha256": {p.name: sha256(p) for p in files}}
 
 
+def activation_preamble(manifest):
+    reset = """while IFS= read -r key; do
+  case "$key" in
+    PYPTO_*|PTOAS_*|PTO_ISA_*|SIMPLER_*|PYTHONPATH|PYTHONHOME|VIRTUAL_ENV|ASCEND_GLOBAL_LOG_LEVEL|TASKQUEUE_IGNORE_*)
+      unset "$key" ;;
+  esac
+done < <(compgen -e)
+"""
+    # Conda env config vars and activation hooks can restore a previous checkout.
+    # Reset again after activation, before CANN contributes its own Python paths.
+    return (reset + f"source {shlex.quote(manifest['conda_sh'])} >/dev/null\n"
+            + f"conda activate {shlex.quote(manifest['conda_prefix'])}\n" + reset
+            + f"source {shlex.quote(manifest['cann_env'])} >/dev/null\n")
+
+
+def activation_script(manifest, env):
+    text = "#!/usr/bin/env bash\nset -eo pipefail\n" + activation_preamble(manifest)
+    keys = ("PYPTO_LIB_ROOT", "PYPTO_ROOT", "PTOAS_ROOT", "PYPTO_CACHE", "PYPTO_CACHE_DIR",
+            "ASCEND_PROCESS_LOG_PATH", "PYTHONPATH", "PATH", "LD_LIBRARY_PATH",
+            "TORCH_DEVICE_BACKEND_AUTOLOAD", "PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED",
+            "CMAKE_BUILD_PARALLEL_LEVEL", "MAX_JOBS", "PYPTO_BUILD_JOBS", "PYPTO_TEST_JOBS",
+            "PYPTO_CODEGEN_MAX_WORKERS")
+    for key in keys:
+        text += f"export {key}={shlex.quote(env[key])}\n"
+    return text
+
+
 def activation_environment(manifest):
-    env = clean_environment()
-    args = ["bash", "-c", 'set -e; source "$1" >/dev/null; conda activate "$2"; '
-            'source "$3" >/dev/null; exec env -0', "regression", manifest["conda_sh"],
-            manifest["conda_prefix"], manifest["cann_env"]]
-    output = capture(args, env=env)
+    args = ["bash", "-c", "set -e\n" + activation_preamble(manifest) + "exec env -0"]
+    output = capture(args, env=clean_environment())
     env = dict(item.split("=", 1) for item in output.split("\0") if "=" in item)
     root = Path(manifest["run_dir"])
     sources = manifest["sources"]
@@ -104,6 +127,7 @@ def activation_environment(manifest):
                PTOAS_ROOT=str(root / "ptoas"), PYPTO_CACHE="1", PYPTO_CACHE_DIR=str(root / "jit/cache"),
                ASCEND_PROCESS_LOG_PATH=str(root / "server/ascend"),
                CMAKE_BUILD_PARALLEL_LEVEL="2", MAX_JOBS="2", PYPTO_BUILD_JOBS="2", PYPTO_TEST_JOBS="2",
+               PYPTO_CODEGEN_MAX_WORKERS="2",
                TORCH_DEVICE_BACKEND_AUTOLOAD="0", PYTHONUNBUFFERED="1", PYTHONNOUSERSITE="1",
                PYTHONDONTWRITEBYTECODE="1")
     env.pop("PTO_ISA_ROOT", None)  # The runtime's managed, pinned checkout is authoritative.
@@ -112,7 +136,8 @@ def activation_environment(manifest):
         root / "ptoas/bin", cann_root / "tools/hcc/bin")]) + os.pathsep + env["PATH"]
     ptoas_site = root / "ptoas/lib/python3.10/site-packages"
     server_site = Path(manifest["conda_prefix"]) / "lib/python3.10/site-packages"
-    env["PYTHONPATH"] = os.pathsep.join([str(server_site), str(ptoas_site), env.get("PYTHONPATH", "")])
+    cann_python = [path for path in env.get("PYTHONPATH", "").split(os.pathsep) if path]
+    env["PYTHONPATH"] = os.pathsep.join([str(server_site), str(ptoas_site), *cann_python])
     env["LD_LIBRARY_PATH"] = str(Path(manifest["conda_prefix"]) / "lib") + os.pathsep + env.get("LD_LIBRARY_PATH", "")
     return env
 
@@ -140,6 +165,43 @@ def exact_torch(requirement):
 
 def requirement_name(requirement):
     return re.split(r"[<>=!~;\[]", requirement, maxsplit=1)[0].strip().lower()
+
+
+def download_checked(url, destination, expected_sha256, execute, env, cache=None):
+    # Use the host's download tool so uv-managed Python does not need a second CA setup.
+    cached = Path(cache) / expected_sha256 / destination.name if cache is not None else None
+    if cached is not None and cached.is_file() and sha256(cached) == expected_sha256:
+        shutil.copyfile(cached, destination)
+        return "verified-cache"
+    execute(["curl", "--http1.1", "--fail", "--location", "--silent", "--show-error", "--retry", "2",
+             "--retry-all-errors", "--connect-timeout", "30", "--output", destination, url], env=env)
+    if sha256(destination) != expected_sha256:
+        raise RegressionError("BLOCKED_SETUP", "PTOAS wheel SHA256 differs from the compiler pin")
+    if cached is not None:
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cached.with_name(f".{cached.name}.{os.getpid()}.tmp")
+        shutil.copyfile(destination, temporary)
+        temporary.replace(cached)
+    return "download"
+
+
+def rebuild_projects(projects, runtime, python, execute, env, log):
+    pip = [python, "-m", "pip"]
+    # PEP 660 import finders from an old checkout can shadow the new build helpers.
+    # --force-reinstall alone removes them only after the replacement wheel is built.
+    execute([*pip, "uninstall", "-y", *(data["project"]["name"] for _, data in projects)], log, env=env)
+    for path, _ in projects:
+        command = [*pip, "install", "--no-deps", "--no-build-isolation", "--force-reinstall", "-e", path]
+        if path == runtime:
+            command.extend(["--config-settings=build.targets=build_package_a2a3"])
+        execute(command, log, env=env)
+
+
+def dependency_check_environment(env):
+    result = dict(env)
+    # CANN exports optional tools on PYTHONPATH; they are not Conda distributions.
+    result.pop("PYTHONPATH", None)
+    return result
 
 
 def prepare(manifest):
@@ -208,30 +270,20 @@ def prepare(manifest):
     wheel_name = f"ptoas-{version}-cp310-cp310-manylinux_2_34_{ptoas['architecture']}.whl"
     wheel = root / "environment" / wheel_name
     url = f"https://github.com/hw-native-sys/PTOAS/releases/download/{ptoas['version']}/{wheel_name}"
-    with urllib.request.urlopen(url, timeout=30) as response, wheel.open("wb") as output:
-        while True:
-            if time.monotonic() >= deadline:
-                raise RegressionError("BLOCKED_SETUP", "PTOAS download exceeded setup budget")
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            output.write(chunk)
-    if sha256(wheel) != ptoas["sha256"]:
-        raise RegressionError("BLOCKED_SETUP", "PTOAS wheel SHA256 differs from the compiler pin")
+    wheel_source = download_checked(url, wheel, ptoas["sha256"], execute, env,
+                                    Path.home() / ".cache/deepseek-agentx/downloads")
+    write_json(root / "environment/ptoas-wheel.json", {"url": url, "sha256": sha256(wheel), "source": wheel_source})
+    print(f"PTOAS wheel: {wheel_source}; pinned SHA256 verified", flush=True)
     execute([python, "-m", "venv", root / "ptoas"], log, env=env)
     execute([root / "ptoas/bin/python", "-m", "pip", "install", "--no-deps", wheel], log, env=env)
-    for path, _ in projects:
-        command = [*pip, "install", "--no-deps", "--no-build-isolation", "--force-reinstall", "-e", path]
-        if path == runtime:
-            command.extend(["--config-settings=build.targets=build_package_a2a3"])
-        execute(command, log, env=env, timeout=budget)
+    rebuild_projects(projects, runtime, python, execute, env, log)
     # Prevent the test runner's working directory from shadowing this editable install.
     tests = ["tests/unit/serving", "tests/unit/model/deepseek_dspark/test_dspark_model.py"]
     if any(not (serving / path).exists() for path in tests):
         raise RegressionError("BLOCKED_COMPATIBILITY", "Serving CPU test paths changed; update the adapter")
     execute([python, "-m", "pytest", "-q", "-n", "2", *tests], root / "environment/cpu-tests.log",
                 cwd=serving, env=env, timeout=budget)
-    execute([*pip, "check"], root / "environment/pip-check.log", env=env)
+    execute([*pip, "check"], root / "environment/pip-check.log", env=dependency_check_environment(env))
     execute([*pip, "freeze"], root / "environment/pip-after.txt", env=env)
     agentx = Path(manifest["sources"]["agentx"]["path"])
     client_env = clean_environment()
@@ -264,22 +316,7 @@ def prepare(manifest):
         absent = [arg for arg in command if arg.startswith("--") and arg not in help_text]
         if absent:
             raise RegressionError("BLOCKED_COMPATIBILITY", f"CLI flags no longer supported: {absent}")
-    activation = "#!/usr/bin/env bash\nset -eo pipefail\n"
-    activation += """while IFS= read -r key; do
-  case "$key" in
-    PYPTO_*|PTOAS_*|PTO_ISA_*|SIMPLER_*|PYTHONPATH|PYTHONHOME|VIRTUAL_ENV|ASCEND_GLOBAL_LOG_LEVEL|TASKQUEUE_IGNORE_*)
-      unset "$key" ;;
-  esac
-done < <(compgen -e)
-"""
-    activation += f"source {shlex.quote(manifest['conda_sh'])}\nconda activate {shlex.quote(str(prefix))}\n"
-    activation += f"source {shlex.quote(manifest['cann_env'])}\n"
-    keys = ("PYPTO_LIB_ROOT", "PYPTO_ROOT", "PTOAS_ROOT", "PYPTO_CACHE", "PYPTO_CACHE_DIR",
-            "ASCEND_PROCESS_LOG_PATH", "PYTHONPATH", "PATH", "LD_LIBRARY_PATH",
-            "TORCH_DEVICE_BACKEND_AUTOLOAD", "PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED")
-    for key in keys:
-        activation += f"export {key}={shlex.quote(env[key])}\n"
-    (root / "activate-run.sh").write_text(activation)
+    (root / "activate-run.sh").write_text(activation_script(manifest, env))
     execute(["bash", "-n", root / "activate-run.sh"], root / "environment/script-check.log")
     write_json(root / "environment/toolchain.json", {
         "ptoas_version": capture([root / "ptoas/bin/ptoas", "--version"], env=env),

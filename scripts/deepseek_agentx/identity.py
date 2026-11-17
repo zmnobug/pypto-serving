@@ -20,16 +20,17 @@ from .common import capture as command, git, read_json, sha256, write_json
 
 MODULES = ("pypto", "pypto.pypto_core", "simpler", "_task_interface", "pypto_serving", "torch")
 KEYS = ("repo_commits", "actual_imports", "runtime_native", "compiler_native", "pto_isa", "ptoas",
-        "torch_dependencies", "source_identity", "allocated_devices", "all_model_workers")
+        "torch_dependencies", "source_identity", "cache_isolation", "allocated_devices", "all_model_workers")
 
 
 def capture(manifest, label, with_imports=False, loaded_only=False):
-    record = {"schema_version": 1, "label": label, "pid": os.getpid(), "python": sys.executable,
+    record = {"schema_version": 1, "label": label, "pid": os.getpid(), "ppid": os.getppid(), "python": sys.executable,
               "argv": sys.argv, "sys_path": list(sys.path),
               "sys_prefix": str(Path(sys.prefix).resolve()), "python_version": sys.version,
               "at": datetime.now(timezone.utc).isoformat(), "repositories": {}, "imports": {},
               "environment": {k: os.environ.get(k) for k in (
-                  "PYPTO_LIB_ROOT", "PTOAS_ROOT", "TASK_DEVICE", "PYPTO_CACHE_DIR", "PYTHONPATH")}}
+                  "PYPTO_LIB_ROOT", "PTOAS_ROOT", "TASK_DEVICE", "PYPTO_CACHE", "PYPTO_CACHE_DIR", "PYTHONPATH",
+                  "PYPTO_PROG_BUILD_DIR", "PYPTO_RUNTIME_ROOT", "PYPTO_CODEGEN_MAX_WORKERS")}}
     for name, item in manifest["sources"].items():
         path = Path(item["path"])
         record["repositories"][name] = {"commit": git(path, "rev-parse", "HEAD"),
@@ -102,13 +103,34 @@ def checks(manifest, observed, built, expected_worker_count):
     result["ptoas"] = (bool(ptoas.get("sha256")) and ptoas.get("sha256") == reference.get("sha256")
         and bool(re.search(rf"(?<![\d.]){re.escape(version)}(?![\d.])", ptoas.get("version", ""))))
     result["torch_dependencies"] = observed.get("torch", "").split("+")[0] == manifest["ci"]["torch"].split("==")[-1]
+    env = observed.get("environment", {})
+    result["cache_isolation"] = (
+        env.get("PYPTO_CACHE") == "1" and env.get("PYPTO_CACHE_DIR") == str(Path(manifest["run_dir"]) / "jit/cache")
+        and not env.get("PYPTO_PROG_BUILD_DIR") and not env.get("PYPTO_RUNTIME_ROOT"))
     try:
-        devices = [int(x) for x in observed.get("environment", {}).get("TASK_DEVICE", "").split(",")]
+        devices = [int(x) for x in (observed.get("environment", {}).get("TASK_DEVICE") or "").split(",")]
         result["allocated_devices"] = len(devices) == len(set(devices)) == 16 and min(devices) >= 0
     except ValueError:
         pass
     result["all_model_workers"] = expected_worker_count > 0
     return result
+
+
+def model_worker_roots(records):
+    """Distinguish Serving workers from their observed forked device descendants."""
+    parents = {item.get("pid"): item.get("ppid") for item in records}
+    if (len(parents) != len(records)
+            or any(type(pid) is not int or type(ppid) is not int or min(pid, ppid) <= 0
+                   for pid, ppid in parents.items())):
+        return None
+    for pid in parents:
+        seen = set()
+        while pid in parents:
+            if pid in seen:
+                return None
+            seen.add(pid)
+            pid = parents[pid]
+    return {pid for pid, ppid in parents.items() if ppid not in parents}
 
 
 def validate_workers(manifest, root):
@@ -118,16 +140,24 @@ def validate_workers(manifest, root):
     expected = len(re.findall(r"\bWorker ready\b", log))
     workers = sorted((root / "environment/workers").glob("worker-*.json"))
     aggregate = {key: True for key in KEYS}
-    observations = []
+    observations, records = [], []
     for path in workers:
         observed = read_json(path)
+        records.append(observed)
         current = checks(manifest, observed, built, expected)
-        observations.append({"file": str(path.relative_to(root)), "pid": observed["pid"], "checks": current})
+        observations.append({"file": str(path.relative_to(root)), "pid": observed["pid"],
+                             "ppid": observed.get("ppid"), "checks": current})
         for key in KEYS:
             aggregate[key] &= current[key]
-    aggregate["all_model_workers"] = expected > 0 and len(workers) == expected
+    roots = model_worker_roots(records)
+    chip_pids = {int(pid) for pid in re.findall(r"\[chip_process pid=(\d+) dev=\d+\] ready", log)}
+    observed_pids = {item["pid"] for item in records}
+    aggregate["all_model_workers"] = (roots is not None and expected > 0 and len(roots) == expected
+                                      and chip_pids <= observed_pids - roots)
     if not workers:
         aggregate = dict.fromkeys(KEYS, False)
     write_json(root / "identity-checks.json", {"checks": aggregate, "workers": observations,
-                                               "expected_workers": expected})
+                                               "expected_workers": expected,
+                                               "model_worker_pids": sorted(roots or []),
+                                               "device_process_pids": sorted(chip_pids)})
     return aggregate

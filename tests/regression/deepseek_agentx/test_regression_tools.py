@@ -9,9 +9,11 @@
 """Offline failure-oriented tests; no NPU or service environment is needed."""
 
 import copy
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
+import os
 from pathlib import Path
 import signal
 import subprocess
@@ -28,6 +30,116 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from deepseek_agentx import assessment, engine, identity, sources, tasks  # noqa: E402
 from deepseek_agentx.common import RegressionError, exclusive_lock, load_profile, read_json, write_json  # noqa: E402
 from deepseek_agentx.traffic import observe_traffic  # noqa: E402
+
+
+@pytest.mark.parametrize("content", [b"expected wheel", b"corrupt wheel"])
+def test_download_uses_host_tool_and_checks_pinned_content(tmp_path, content):
+    from deepseek_agentx.provision import download_checked
+    destination = tmp_path / "ptoas.whl"
+    expected = hashlib.sha256(b"expected wheel").hexdigest()
+
+    def execute(args, **kwargs):
+        assert args[0] == "curl" and "--fail" in args and "--location" in args
+        assert "--insecure" not in args
+        assert kwargs["env"] == {"HTTPS_PROXY": "http://proxy.invalid:1234"}
+        destination.write_bytes(content)
+
+    if content == b"expected wheel":
+        download_checked("https://example.invalid/ptoas.whl", destination, expected, execute,
+                         {"HTTPS_PROXY": "http://proxy.invalid:1234"})
+    else:
+        with pytest.raises(RegressionError, match="SHA256"):
+            download_checked("https://example.invalid/ptoas.whl", destination, expected, execute,
+                             {"HTTPS_PROXY": "http://proxy.invalid:1234"})
+
+
+@pytest.mark.parametrize("cached_content", [b"release wheel", b"corrupt cached wheel"])
+def test_cached_release_is_revalidated_before_reuse(tmp_path, cached_content):
+    from deepseek_agentx.provision import download_checked
+    expected = hashlib.sha256(b"release wheel").hexdigest()
+    destination = tmp_path / "release.whl"
+    cache = tmp_path / "cache"
+    cached = cache / expected / destination.name
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(cached_content)
+    downloads = []
+
+    def execute(args, **_kwargs):
+        downloads.append(args)
+        destination.write_bytes(b"release wheel")
+
+    source = download_checked("https://example.invalid/release.whl", destination, expected, execute, {}, cache)
+    assert destination.read_bytes() == cached.read_bytes() == b"release wheel"
+    if cached_content == b"release wheel":
+        assert source == "verified-cache" and not downloads
+    else:
+        assert source == "download" and len(downloads) == 1
+
+
+def test_rebuild_removes_legacy_import_finders_before_replacement_builds(tmp_path):
+    from deepseek_agentx.provision import rebuild_projects
+    projects = [(tmp_path / "pypto", {"project": {"name": "pypto"}}),
+                (tmp_path / "runtime", {"project": {"name": "simpler"}}),
+                (tmp_path / "serving", {"project": {"name": "pypto-serving"}})]
+    legacy_finders = {data["project"]["name"] for _, data in projects}
+    built = []
+
+    def execute(args, *_args, **_kwargs):
+        if args[3] == "uninstall":
+            legacy_finders.difference_update(args[5:])
+        elif args[3] == "install":
+            assert not legacy_finders, "An old editable finder can shadow the new build helpers"
+            assert "--no-deps" in args and "--no-build-isolation" in args
+            built.append(args[args.index("-e") + 1])
+            if built[-1] == tmp_path / "runtime":
+                assert "--config-settings=build.targets=build_package_a2a3" in args
+
+    rebuild_projects(projects, tmp_path / "runtime", tmp_path / "python", execute, {}, tmp_path / "build.log")
+    assert built == [path for path, _ in projects]
+
+
+def test_service_dependency_check_excludes_external_cann_metadata(tmp_path):
+    from deepseek_agentx.provision import dependency_check_environment
+    package = tmp_path / "regression_external_cann-1.0.dist-info"
+    package.mkdir()
+    (package / "METADATA").write_text("Metadata-Version: 2.1\nName: regression-external-cann\nVersion: 1.0\n")
+    env = dict(os.environ, PYTHONPATH=str(tmp_path))
+    code = ("import importlib.metadata as m; "
+            "print(any(d.metadata['Name']=='regression-external-cann' for d in m.distributions()))")
+    assert subprocess.check_output([sys.executable, "-c", code], env=env, text=True).strip() == "True"
+    scoped = dependency_check_environment(env)
+    assert subprocess.check_output([sys.executable, "-c", code], env=scoped, text=True).strip() == "False"
+    assert env["PYTHONPATH"] == str(tmp_path)
+
+
+def test_conda_activation_cannot_restore_legacy_runtime_in_build_or_worker(tmp_path):
+    from deepseek_agentx.provision import activation_environment, activation_script
+    conda = tmp_path / "conda config.sh"
+    conda.write_text("""conda() {
+export PYPTO_PROG_BUILD_DIR=/old/build PYPTO_RUNTIME_ROOT=/old/runtime
+export PYPTO_LIB_ROOT=/old/lib PTOAS_ROOT=/old/ptoas PYTHONPATH=/old/src
+export PYPTO_CODEGEN_MAX_WORKERS=99 TASKQUEUE_IGNORE_WHITELIST=1
+}
+""")
+    cann = tmp_path / "cann.sh"
+    cann.write_text('export PYTHONPATH="/cann/python:${PYTHONPATH:-}"\n')
+    root = tmp_path / "run"
+    manifest = {"conda_sh": str(conda), "conda_prefix": str(tmp_path / "conda env"),
+                "cann_env": str(cann), "run_dir": str(root),
+                "sources": {name: {"path": str(root / name)} for name in ("pypto", "lib")}}
+    build = activation_environment(manifest)
+    script = tmp_path / "activate.sh"
+    script.write_text(activation_script(manifest, build))
+    output = subprocess.check_output(["bash", "-c", 'source "$1"; exec env -0', "test", str(script)], text=True)
+    worker = dict(item.split("=", 1) for item in output.split("\0") if "=" in item)
+    for env in (build, worker):
+        assert "PYPTO_PROG_BUILD_DIR" not in env and "PYPTO_RUNTIME_ROOT" not in env
+        assert "TASKQUEUE_IGNORE_WHITELIST" not in env
+        assert "/old/" not in env["PYTHONPATH"] and "/cann/python" in env["PYTHONPATH"]
+        assert "" not in env["PYTHONPATH"].split(os.pathsep)
+        assert env["PYPTO_CACHE_DIR"] == str(root / "jit/cache")
+        assert env["PYPTO_LIB_ROOT"] == str(root / "lib")
+        assert env["PYPTO_CODEGEN_MAX_WORKERS"] == env["PYPTO_BUILD_JOBS"] == "2"
 
 
 @pytest.fixture
@@ -257,6 +369,14 @@ def test_local_checkout_is_frozen_and_original_tree_is_preserved(tmp_path):
     assert (original / "model.py").read_text() == "VERSION = 1\n"
 
 
+def test_fetch_failure_retains_git_diagnostic(tmp_path, monkeypatch):
+    def fail(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(128, ["git", "clone"], output="specific transport diagnostic")
+    monkeypatch.setattr(sources, "capture", fail)
+    with pytest.raises(RegressionError, match="specific transport diagnostic"):
+        sources.clone("https://example.invalid/source.git", "HEAD", tmp_path / "checkout")
+
+
 def test_generated_commands_follow_profile_and_quote_paths(tmp_path):
     profile = load_profile()
     manifest = {"run_dir": str(tmp_path / "a path"), "conda_prefix": "/env path", "driver_root": "/driver path",
@@ -364,18 +484,22 @@ def test_every_new_python_file_has_project_header():
 @pytest.mark.parametrize("mutation,key", [
     ("native", "runtime_native"), ("compiler", "compiler_native"), ("import", "actual_imports"),
     ("isa", "pto_isa"), ("dirty", "source_identity"), ("devices", "allocated_devices"),
+    ("host_without_devices", "allocated_devices"), ("foreign_cache", "cache_isolation"),
+    ("forced_rebuild", "cache_isolation"), ("legacy_runtime", "cache_isolation"),
 ])
 def test_wrong_worker_identity_is_rejected(tmp_path, mutation, key):
     sources_ = {name: {"path": str(tmp_path / name), "commit": name + "-sha"}
                 for name in ("serving", "pypto", "runtime", "lib")}
     manifest = {"sources": sources_, "lib_override": False, "conda_prefix": str(tmp_path / "conda"),
-                "pto_isa": "isa-sha", "ptoas": {"version": "0.72"}, "ci": {"torch": "torch==2.10.0"}}
+                "pto_isa": "isa-sha", "ptoas": {"version": "0.72"}, "ci": {"torch": "torch==2.10.0"},
+                "run_dir": str(tmp_path)}
     observed = {"sys_prefix": manifest["conda_prefix"],
         "repositories": {name: {"commit": item["commit"], "status": ""} for name, item in sources_.items()},
         "imports": {module: {"path": str(Path(sources_[repo]["path"]) / "__init__.py"), "sha256": module}
                     for module, repo in (("pypto", "pypto"), ("simpler", "runtime"), ("pypto_serving", "serving"),
                                          ("pypto.pypto_core", "pypto"), ("_task_interface", "runtime"))},
-        "environment": {"PYPTO_LIB_ROOT": sources_["lib"]["path"], "TASK_DEVICE": ",".join(map(str, range(16)))},
+        "environment": {"PYPTO_LIB_ROOT": sources_["lib"]["path"], "TASK_DEVICE": ",".join(map(str, range(16))),
+                        "PYPTO_CACHE": "1", "PYPTO_CACHE_DIR": str(tmp_path / "jit/cache")},
         "isa": {"commit": "isa-sha", "status": ""},
         "isa_build": {"schema_version": 3, "required_commit_from_pin": "isa-sha", "actual_checkout_commit": "isa-sha",
                       "runtime_artifacts": {"a2a3/host": {"required_commit_from_pin": "isa-sha",
@@ -395,9 +519,63 @@ def test_wrong_worker_identity_is_rejected(tmp_path, mutation, key):
         observed["isa_build"]["actual_checkout_commit"] = "other-isa"
     elif mutation == "dirty":
         observed["repositories"]["lib"]["status"] = " M kernel.py"
-    else:
+    elif mutation == "devices":
         observed["environment"]["TASK_DEVICE"] = "0,1"
+    elif mutation == "foreign_cache":
+        observed["environment"]["PYPTO_CACHE_DIR"] = "/old/cache"
+    elif mutation == "forced_rebuild":
+        observed["environment"]["PYPTO_PROG_BUILD_DIR"] = "/old/build"
+    elif mutation == "legacy_runtime":
+        observed["environment"]["PYPTO_RUNTIME_ROOT"] = "/old/runtime"
+    else:
+        observed["environment"]["TASK_DEVICE"] = None
     assert identity.checks(manifest, observed, built, 1)[key] is False
+
+
+@pytest.mark.parametrize("mutation,passed", [
+    ("valid", True), ("extra_model", False), ("missing_device", False),
+    ("cycle", False), ("missing_parent", False), ("wrong_device_native", False),
+])
+def test_model_worker_and_forked_device_observations_are_all_verified(tmp_path, monkeypatch, mutation, passed):
+    (tmp_path / "environment/workers").mkdir(parents=True)
+    (tmp_path / "server").mkdir()
+    write_json(tmp_path / "environment/built.json", {})
+    records = [{"pid": 100, "ppid": 1}, {"pid": 200, "ppid": 100}, {"pid": 201, "ppid": 100}]
+    (tmp_path / "server/server.log").write_text(
+        "Worker ready\n[chip_process pid=200 dev=0] ready\n[chip_process pid=201 dev=1] ready\n")
+    if mutation == "extra_model":
+        records.append({"pid": 300, "ppid": 1})
+    elif mutation == "missing_device":
+        records.pop()
+    elif mutation == "cycle":
+        records[1]["ppid"], records[2]["ppid"] = 201, 200
+    elif mutation == "missing_parent":
+        records[1].pop("ppid")
+    elif mutation == "wrong_device_native":
+        records[1]["wrong_native"] = True
+    for record in records:
+        write_json(tmp_path / "environment/workers" / f"worker-{record['pid']}.json", record)
+
+    def check(_manifest, observed, _built, _expected):
+        result = dict.fromkeys(identity.KEYS, True)
+        result["runtime_native"] = not observed.get("wrong_native")
+        return result
+
+    monkeypatch.setattr(identity, "checks", check)
+    result = identity.validate_workers({}, tmp_path)
+    assert all(result.values()) is passed
+    if mutation == "valid":
+        report = read_json(tmp_path / "identity-checks.json")
+        assert report["model_worker_pids"] == [100]
+        assert report["device_process_pids"] == [200, 201]
+        assert len(report["workers"]) == 3
+
+
+@pytest.mark.parametrize("state,terminal", [("Z (zombie)", True), ("S (sleeping)", False), (None, True)])
+def test_shutdown_distinguishes_a_terminal_zombie_from_a_live_worker(tmp_path, state, terminal):
+    if state is not None:
+        (tmp_path / "status").write_text(f"Name:\tpython\nState:\t{state}\n")
+    assert engine.process_is_terminal(tmp_path) is terminal
 
 
 def test_streaming_observer_forwards_request_and_joins_sse(tmp_path):
