@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "name": "deepseek-agentx-full",
+  "repositories": {
+    "lib": "https://github.com/hw-native-sys/pypto-lib.git",
+    "pypto": "https://github.com/hw-native-sys/pypto.git",
+    "agentx": "https://github.com/SemiAnalysisAI/agentx-harness.git"
+  },
+  "ci_job": "serving-dspark",
+  "server": {
+    "model_name": "dsv4-flash-dspark-w8a8",
+    "devices": 16,
+    "dp": 4,
+    "tp": 4,
+    "ep": 16,
+    "block_size": 32,
+    "max_model_len": 310000,
+    "max_num_seqs": 16,
+    "max_num_batched_tokens": 10240,
+    "long_prefill_token_threshold": 8192,
+    "memory_utilization": 0.93,
+    "prefix_cache": true,
+    "speculative_tokens": 7,
+    "ring_heap": "2147483648,2147483648,4294967296,8589934592"
+  },
+  "agentx": {
+    "python": "3.12",
+    "scenario": "inferencex-agentx-mvp",
+    "dataset": "semianalysis_cc_traces_weka_062126",
+    "concurrency": 4,
+    "duration_seconds": 1800,
+    "warmup_requests": 4,
+    "seed": 20260707,
+    "cache_bust": "first_turn_prefix"
+  },
+  "budgets": {
+    "queue_seconds": 3600,
+    "setup_seconds": 14400,
+    "server_seconds": 14400,
+    "startup_seconds": 5400,
+    "client_seconds": 4500,
+    "fault_flush_seconds": 15,
+    "cleanup_seconds": 120,
+    "poll_seconds": 5
+  }
+}

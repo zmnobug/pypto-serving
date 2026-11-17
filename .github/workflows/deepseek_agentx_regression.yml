@@ -1,0 +1,135 @@
+name: DeepSeek + AgentX regression
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/deepseek_agentx/**'
+      - 'scripts/run_deepseek_agentx_regression.py'
+      - 'tests/regression/deepseek_agentx/**'
+      - '.github/workflows/deepseek_agentx_regression.yml'
+  workflow_dispatch:
+    inputs:
+      conda_env:
+        description: Existing service Conda environment
+        required: true
+      model_dir:
+        description: Model directory (empty uses runner PYPTO_DSV4_DSPARK_MODEL_DIR)
+        default: ''
+      cann_root:
+        description: CANN root (empty uses runner CANN_ROOT)
+        default: ''
+  schedule:
+    - cron: '17 18 * * 0'  # Monday 02:17 Asia/Shanghai; opt in with the repository variable below.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deepseek-agentx-${{ github.event_name == 'pull_request' && github.ref || 'full' }}
+  cancel-in-progress: false
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: python -m pip install -r scripts/deepseek_agentx/requirements.txt 'pytest<9.2'
+      - run: python -m pytest tests/regression/deepseek_agentx -q
+
+  full:
+    needs: offline
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' && vars.DEEPSEEK_AGENTX_ENABLE_SCHEDULE == 'true')
+    runs-on: [self-hosted, linux, arm64, npu]
+    timeout-minutes: 720
+    env:
+      REGRESSION_CONDA: ${{ inputs.conda_env || vars.DEEPSEEK_AGENTX_CONDA_ENV }}
+      MODEL_INPUT: ${{ inputs.model_dir }}
+      CANN_INPUT: ${{ inputs.cann_root }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+          persist-credentials: false
+
+      - name: Prepare driver and paths
+        id: paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$REGRESSION_CONDA" || { echo '::error::Set conda_env or DEEPSEEK_AGENTX_CONDA_ENV'; exit 1; }
+          command -v uv task-submit git conda
+          driver="$RUNNER_TEMP/deepseek-agentx-driver-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          run_dir="$GITHUB_WORKSPACE/artifacts/dspark-regression/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          echo "driver=$driver" >> "$GITHUB_OUTPUT"
+          echo "run_dir=$run_dir" >> "$GITHUB_OUTPUT"
+          uv venv --python 3.12 "$driver"
+          uv pip install --python "$driver/bin/python" -r scripts/deepseek_agentx/requirements.txt
+
+      - name: Run complete regression
+        env:
+          DRIVER: ${{ steps.paths.outputs.driver }}
+          RUN_DIR: ${{ steps.paths.outputs.run_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          model="${MODEL_INPUT:-${PYPTO_DSV4_DSPARK_MODEL_DIR:-}}"
+          cann="${CANN_INPUT:-${CANN_ROOT:-}}"
+          test -n "$model" && test -n "$cann"
+          "$DRIVER/bin/python" scripts/run_deepseek_agentx_regression.py full \
+            --work-root "$GITHUB_WORKSPACE" --run-dir "$RUN_DIR" \
+            --conda-env "$REGRESSION_CONDA" --model "$model" --cann-root "$cann" \
+            2>&1 | tee "$RUNNER_TEMP/deepseek-agentx-controller-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.log"
+
+      - name: Stop only this run's tasks
+        if: always()
+        env:
+          DRIVER: ${{ steps.paths.outputs.driver }}
+          RUN_DIR: ${{ steps.paths.outputs.run_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -x "$DRIVER/bin/python" ] && [ -d "$RUN_DIR" ]; then
+            "$DRIVER/bin/python" scripts/run_deepseek_agentx_regression.py cleanup --run-dir "$RUN_DIR"
+          fi
+
+      - name: Publish result
+        if: always()
+        env:
+          RUN_DIR: ${{ steps.paths.outputs.run_dir }}
+        shell: bash
+        run: |
+          if [ -f "$RUN_DIR/result.md" ]; then
+            cat "$RUN_DIR/result.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'No complete result was produced. Inspect driver/setup and cleanup logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload evidence (keep active editable source checkouts on the runner)
+        if: always() && steps.paths.outputs.run_dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-agentx-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 30
+          include-hidden-files: true
+          path: |
+            ${{ runner.temp }}/deepseek-agentx-controller-${{ github.run_id }}-${{ github.run_attempt }}.log
+            ${{ steps.paths.outputs.run_dir }}/*.json
+            ${{ steps.paths.outputs.run_dir }}/*.jsonl
+            ${{ steps.paths.outputs.run_dir }}/*.md
+            ${{ steps.paths.outputs.run_dir }}/*.sh
+            ${{ steps.paths.outputs.run_dir }}/*.log
+            ${{ steps.paths.outputs.run_dir }}/ci-sources/
+            ${{ steps.paths.outputs.run_dir }}/driver/
+            ${{ steps.paths.outputs.run_dir }}/environment/
+            !${{ steps.paths.outputs.run_dir }}/environment/**/*.whl
+            ${{ steps.paths.outputs.run_dir }}/server/
+            ${{ steps.paths.outputs.run_dir }}/agentx/
+            ${{ steps.paths.outputs.run_dir }}/replay/
+            ${{ steps.paths.outputs.run_dir }}/jit/
+          if-no-files-found: warn

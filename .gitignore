@@ -26,6 +26,7 @@ build_output/
 outputs/
 profile_out/
 artifacts/
+.deepseek-agentx.lock
 *.log
 
 # Local editor and agent metadata
