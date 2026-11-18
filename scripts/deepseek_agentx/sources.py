@@ -128,19 +128,109 @@ def snapshot_sources(manifest):
     return records
 
 
-def resolve(root, profile):
-    checkouts = root / "checkouts"
-    checkouts.mkdir()
-    repos = profile["repositories"]
-    lib_ci = checkouts / "lib-ci"
-    clone(repos["lib"], "HEAD", lib_ci)
-    ci = parse_ci(lib_ci, profile["ci_job"])
+def _copy_ci_sources(root, lib_ci, ci):
     ci_dir = root / "ci-sources"
     ci_dir.mkdir(exist_ok=True)
     for name in ci["files"]:
         target = ci_dir / name.removeprefix(".github/")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((lib_ci / name).read_bytes())
+    return ci_dir
+
+
+def _init_serving_submodules(serving):
+    modules = serving / ".gitmodules"
+    if not modules.is_file():
+        return
+    paths = capture(["git", "config", "-f", modules, "--get-regexp", r"^submodule\..*\.path$"])
+    for line in paths.splitlines():
+        path = line.split(None, 1)[1]
+        if path != "pypto-lib":
+            network_git("-C", serving, "submodule", "update", "--init", "--recursive", "--depth", "1", "--", path,
+                        timeout=1800)
+
+
+def _source_paths(checkouts):
+    return {"lib_ci": checkouts / "lib-ci", "serving": checkouts / "serving",
+            "lib": checkouts / "serving/pypto-lib", "pypto": checkouts / "pypto",
+            "runtime": checkouts / "pypto/runtime", "agentx": checkouts / "agentx-harness"}
+
+
+def _resolve_frozen(root, profile, frozen):
+    """Recreate a prior manifest's exact source and toolchain matrix."""
+    try:
+        expected = frozen["sources"]
+        required = {"lib_ci", "serving", "lib", "pypto", "runtime", "agentx"}
+        if set(expected) != required:
+            raise ValueError(f"Frozen manifest sources must be {sorted(required)}")
+        checkouts = root / "checkouts"
+        checkouts.mkdir()
+        paths = _source_paths(checkouts)
+        for name in ("lib_ci", "serving", "pypto"):
+            clone(expected[name]["url"], expected[name]["commit"], paths[name])
+        ci = frozen["ci"]
+        parsed_ci = parse_ci(paths["lib_ci"], profile["ci_job"])
+        for key in ("pypto_ref", "serving_url", "serving_ref", "torch", "python"):
+            if parsed_ci.get(key) != ci.get(key):
+                raise ValueError(f"Frozen CI contract differs for {key}")
+        _copy_ci_sources(root, paths["lib_ci"], ci)
+
+        runtime_sha = gitlink(paths["pypto"], "runtime")
+        if runtime_sha != expected["runtime"]["commit"]:
+            raise ValueError("Frozen runtime commit is not PyPTO's gitlink")
+        network_git("-C", paths["pypto"], "submodule", "update", "--init", "--recursive", "--depth", "1",
+                    timeout=1800)
+        if git(paths["pypto"] / "runtime", "rev-parse", "HEAD") != expected["runtime"]["commit"]:
+            raise ValueError("Runtime checkout differs from frozen commit")
+
+        original_lib = gitlink(paths["serving"], "pypto-lib")
+        if original_lib != frozen.get("lib_gitlink"):
+            raise ValueError("Serving's original lib gitlink differs from frozen manifest")
+        if (paths["serving"] / "pypto-lib").exists():
+            (paths["serving"] / "pypto-lib").rmdir()
+        clone(expected["lib"]["url"], expected["lib"]["commit"], paths["lib"])
+        _init_serving_submodules(paths["serving"])
+        if git(paths["lib"], "rev-parse", "HEAD") != expected["lib"]["commit"]:
+            raise ValueError("Lib checkout differs from frozen commit")
+        clone(expected["agentx"]["url"], expected["agentx"]["commit"], paths["agentx"])
+
+        versions_file = paths["pypto"] / "toolchain/versions.env"
+        isa_file = paths["runtime"] / "pto_isa.pin"
+        if sha256(versions_file) != frozen["ci_files"].get("versions.env"):
+            raise ValueError("Frozen toolchain versions.env changed")
+        isa = isa_file.read_text().strip()
+        if isa != frozen["pto_isa"]:
+            raise ValueError("Frozen PTO-ISA pin changed")
+        ci_dir = root / "ci-sources"
+        (ci_dir / "versions.env").write_bytes(versions_file.read_bytes())
+        (ci_dir / "pto_isa.pin").write_text(isa + "\n")
+        for name, path in paths.items():
+            if (path / "AGENTS.md").is_file():
+                (ci_dir / f"{name}-AGENTS.md").write_bytes((path / "AGENTS.md").read_bytes())
+        sources = {name: {**source_record(path), "url": expected[name]["url"]}
+                   for name, path in paths.items()}
+        result = {"sources": sources, "ci": ci, "ptoas": frozen["ptoas"], "pto_isa": isa,
+                  "lib_gitlink": original_lib,
+                  "lib_override": sources["lib"]["commit"] != original_lib,
+                  "ci_files": {str(p.relative_to(ci_dir)): sha256(p) for p in ci_dir.rglob("*") if p.is_file()},
+                  "replayed_from": frozen.get("run_dir")}
+        snapshot_sources(result)
+        write_json(root / "version-plan.json", result)
+        return result
+    except (KeyError, OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise RegressionError("BLOCKED_COMPATIBILITY", f"Unable to replay frozen sources: {fetch_diagnostic(exc)}") from exc
+
+
+def resolve(root, profile, frozen=None):
+    if frozen is not None:
+        return _resolve_frozen(root, profile, frozen)
+    checkouts = root / "checkouts"
+    checkouts.mkdir()
+    repos = profile["repositories"]
+    lib_ci = checkouts / "lib-ci"
+    clone(repos["lib"], "HEAD", lib_ci)
+    ci = parse_ci(lib_ci, profile["ci_job"])
+    ci_dir = _copy_ci_sources(root, lib_ci, ci)
     serving, pypto = checkouts / "serving", checkouts / "pypto"
     clone(ci["serving_url"], ci["serving_ref"], serving)
     clone(repos["pypto"], ci["pypto_ref"], pypto)
@@ -154,14 +244,7 @@ def resolve(root, profile):
             (serving / "pypto-lib").rmdir()
         clone(repos["lib"], git(lib_ci, "rev-parse", "HEAD"), serving / "pypto-lib")
         # Initialize other submodules without reverting the deliberate lib override.
-        modules = serving / ".gitmodules"
-        if modules.is_file():
-            paths = capture(["git", "config", "-f", modules, "--get-regexp", r"^submodule\..*\.path$"])
-            for line in paths.splitlines():
-                path = line.split(None, 1)[1]
-                if path != "pypto-lib":
-                    network_git("-C", serving, "submodule", "update", "--init", "--recursive", "--depth", "1", "--", path,
-                                timeout=1800)
+        _init_serving_submodules(serving)
     except (subprocess.SubprocessError, ValueError) as exc:
         raise RegressionError("BLOCKED_FETCH", f"Unable to initialize pinned submodules: {fetch_diagnostic(exc)}") from exc
     clone(repos["agentx"], "HEAD", checkouts / "agentx-harness")

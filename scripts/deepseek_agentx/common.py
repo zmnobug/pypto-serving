@@ -118,8 +118,7 @@ def exclusive_lock(path, blocking=False):
         yield
 
 
-def load_profile(path=PROFILE):
-    profile = read_json(path)
+def validate_profile(profile):
     if profile.get("schema_version") != 1:
         raise ValueError("Unsupported regression profile schema")
     budgets = profile["budgets"]
@@ -140,6 +139,10 @@ def load_profile(path=PROFILE):
     if profile["agentx"]["duration_seconds"] < 1800 or profile["agentx"]["concurrency"] != 4:
         raise ValueError("The full profile requires at least 1800 formal seconds and concurrency 4")
     return profile
+
+
+def load_profile(path=PROFILE):
+    return validate_profile(read_json(path))
 
 
 def clean_environment():
