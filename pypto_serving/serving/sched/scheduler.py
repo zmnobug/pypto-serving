@@ -221,6 +221,9 @@ class ScheduledRequest:
     num_new_tokens: int
     is_prefill: bool
     num_computed_tokens: int = 0
+    # Extra decode capacity reserved for speculative/MTP proposals.  This is
+    # a dispatch snapshot; accepted tokens are reported with the step outcome.
+    num_speculative_tokens: int = 0
     block_ids: list[int] = field(default_factory=list)
     block_ids_by_group: dict[str, list[int]] = field(default_factory=dict)
     cache_partition: int | None = None
@@ -521,11 +524,12 @@ class Scheduler:
             is_prefill = request.is_prefill
             scheduled = ScheduledRequest(request, num_new, is_prefill,
                                          num_computed_tokens=request.num_computed_tokens)
-            scheduled_tokens = num_new + self._speculative_tokens_for(request, scheduled)
+            speculative_tokens = self._speculative_tokens_for(request, scheduled)
+            scheduled.num_speculative_tokens = speculative_tokens
+            scheduled_tokens = num_new + speculative_tokens
             if scheduled_tokens > token_budget:
                 running_to_keep.append(request)
                 continue
-
             if not self._try_allocate_request_blocks(request, scheduled_tokens, scheduled=scheduled):
                 preempted = self._preempt_lowest_priority(
                     request, scheduled_req_ids, num_scheduled_tokens, output

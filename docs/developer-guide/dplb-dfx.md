@@ -1,8 +1,8 @@
 # DPLB Host Diagnostics
 
-This first increment of [issue #325](https://github.com/hw-native-sys/pypto-serving/issues/325)
-records grouped-cache placement and ownership in the serving process. It builds
-on the grouped DPLB policy and initial Host collector in
+This increment of [issue #325](https://github.com/hw-native-sys/pypto-serving/issues/325)
+records grouped-cache placement, ownership, and submitted Host step load in the
+serving process. It builds on the grouped DPLB policy and initial Host collector in
 [PR #336](https://github.com/hw-native-sys/pypto-serving/pull/336).
 Both the policy (`--enable-dplb`) and diagnostics are opt-in.
 
@@ -79,6 +79,8 @@ UIDs are not joins between independent captures.
 | `placement_failed` | Allocation raised before a placement commit; follow release/rollback events if ownership was partially allocated. |
 | `owner_change` | Acquisition, growth, baseline ownership, or release, with the resulting group load. |
 | `reservation_change` | Reserved, adopted, quarantined, or released reservation state. |
+| `step_plan` | The submitted `StepCommand`: participating requests, phase, token counts, speculative proposal budget, logical DP-group topology, and bounded request length snapshots. |
+| `step_outcome` | The ordered worker result: returned token counts and speculative proposed/accepted counts, or an error/discard status. |
 | `profile_control_ack` | Worker acknowledged the existing ordered start-profile command. |
 
 A placement decision has a replica-local `decision_id`, the actual policy
@@ -173,6 +175,65 @@ python examples/dfx/capture_dplb_host.py --output /tmp/dplb-host-example
 The manual NPU smoke starts a K7 server, warms compilation, sends mixed prompt
 lengths and a repeated prefix, and validates two capture windows. It requires
 actual prefix hits, contiguous event sequences, matching manifest byte/record
+counts, terminal events for placed requests, and zero remaining logical load.
+
+`step_plan` is emitted after the exact `StepCommand` is accepted by the engine
+input queue. Its `requests` rows distinguish prefill and decode work, record
+logical lengths before and after the planned tokens, and expose speculative
+proposal capacity separately from returned output. `row_extent.valid_rows` and
+`padded_rows` remain null because runner preparation has not been observed yet;
+the event records that limitation instead of treating table extent as executed
+attention work. `groups` includes logical DP-group topology and TP members when
+the serving layout can prove them. `step_outcome` is paired by `step_id` and
+`dispatch_ordinal`, and reports worker output without claiming device timing.
+Execution-slot fields remain explicitly unavailable until the worker-side
+prepare/submit hooks are added.
+
+This increment still does not connect asynchronous L3 invocations, SWA/HCA/CSA
+task semantics, per-rank device cost, or a report generator. `--dplb-dfx-level
+timing` fails explicitly. NPU smoke tests and measured overhead remain required
+before making performance claims. The next device prototype must verify runtime
+invocation identity, semantic coverage and clock domains on a matched, built
+stack before enabling timing.
+
+The local Host checks used Python 3.10, pytest 9.0.3, msgspec 0.22.0,
+FastAPI 0.162.5, NumPy 1.26.4, and Torch 2.6.0+cpu. This environment is not an
+NPU runtime baseline. Verification passed 172 placement/collector/engine/
+scheduler checks, 85 grouped-prefix/cache-metrics checks, and three DPLB CLI
+flag checks. Ruff, copyright headers, and English-content checks passed.
+Twenty-one other CLI checks and four program-acceptance checks were blocked
+by the missing PyPTO package. A pre-existing external PyPTO installation also
+failed to import because its Python source expected a `CommEngine` binding
+absent from its native extension; it was not used as validation evidence.
+The documentation site was not built because the shared theme was not present.
+
+## Follow-up validation (2026-11-17)
+
+The existing `zm_pypto` Conda environment resolved the earlier PyPTO import
+blocker. All 91 CLI and program-acceptance checks passed. An expanded Host
+run initially passed 518 of 530 cases; 12 DSpark cases required the missing
+Lib sources. Git submodule cloning failed over the network, so the exact
+gitlink commit `b67a5fd60ccbc1e7451e8b995293c7f1bc76426b` was obtained from
+GitHub's commit archive. The archive SHA256 was
+`7d0db48483faf3e348b217eefa676ae5afa0a76a60bab72d3825d84db5c72ef1`.
+It supplies source files in `pypto-lib/`; it is not an initialized Git checkout.
+No native artifacts were copied and no dependency gitlink was changed.
+
+After adding those sources, all 182 DSpark Host cases passed. Seven new
+smoke-verdict checks also passed: the combined, deduplicated result is 537
+cases with no remaining failures. This was a staged validation, not one run
+of 537 tests. The environment used Python 3.10.22, Torch 2.8.0+cpu,
+torch_npu 2.8.0, NumPy 2.2.6, and pytest 9.1.1. Packages were not changed.
+PyPTO came from the installed baseline checkout at
+`1dedb26c329407360c5c5ce6ecb495565c2f154e`; its runtime was
+`355ce3015e3e344d1fc3a61c206ee01823ce292c`. These differ from the original
+workspace source snapshots above; NPU compatibility is still unverified.
+
+The manual smoke checks the actual `TASK_DEVICE` allocation, starts a K7
+server, warms compilation, runs mixed prompt lengths and a repeated prefix,
+and validates two captures with repeated profile-start controls. The verdict
+requires actual prefix hits, contiguous event sequences, matching byte/record
+counts, terminal events for placed requests, and zero remaining logical load.
 counts, terminal events for placed requests, and zero remaining logical load.
 Each run uses a private program build directory to avoid pairing a regenerated
 kernel table with a previous run's orchestration library.
