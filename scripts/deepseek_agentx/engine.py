@@ -312,9 +312,15 @@ def run(args, profile):
     for name in ("environment/workers", "server/ascend", "agentx/report", "jit", "ci-sources"):
         (root / name).mkdir(parents=True, exist_ok=True)
     print(f"Regression artifacts: {root}", flush=True)
+    replay_manifest = getattr(args, "replay_manifest", None)
+    frozen = read_json(replay_manifest.resolve()) if replay_manifest else None
     budgets = task_budgets(profile, args)
     manifest = {"schema_version": 1, "run_dir": str(root), "profile": profile, "port": args.port,
                 "task_budgets": budgets}
+    if frozen is not None:
+        manifest["replay"] = {"manifest": str(replay_manifest.resolve()),
+                               "manifest_sha256": hashlib.sha256(replay_manifest.read_bytes()).hexdigest(),
+                               "source_run": frozen.get("run_dir")}
     write_json(root / "run.json", {"schema_version": 1, "profile": profile, "task_budgets": budgets,
                                     "mode": "latest-ci", "at": now()})
     locks = ExitStack()
@@ -340,12 +346,18 @@ def run(args, profile):
         cann = args.cann_root.resolve() / "set_env.sh"
         if not cann.is_file():
             raise RegressionError("BLOCKED_SETUP", f"Missing CANN environment: {cann}")
+        current_model = provision.model_identity(args.model.resolve())
+        current_tokenizer = provision.tokenizer_identity((args.tokenizer or args.model).resolve())
+        if frozen is not None:
+            if provision.identity_fingerprint(current_model) != provision.identity_fingerprint(frozen.get("model", {})):
+                raise RegressionError("BLOCKED_COMPATIBILITY", "Replay model identity differs from frozen manifest")
+            if provision.identity_fingerprint(current_tokenizer) != provision.identity_fingerprint(frozen.get("tokenizer", {})):
+                raise RegressionError("BLOCKED_COMPATIBILITY", "Replay tokenizer identity differs from frozen manifest")
         manifest.update(conda_prefix=str(prefix), conda_sh=str(conda_sh), conda_executable=str(conda_exe),
-                        cann_env=str(cann), model=provision.model_identity(args.model.resolve()),
-                        tokenizer=provision.tokenizer_identity((args.tokenizer or args.model).resolve()),
+                        cann_env=str(cann), model=current_model, tokenizer=current_tokenizer,
                         index_url=args.index_url)
         event(root, "preflight_complete")
-        manifest.update(sources.resolve(root, profile))
+        manifest.update(sources.resolve(root, profile, frozen))
         driver = root / "driver"
         (driver / "scripts").mkdir(parents=True)
         shutil.copy2(ROOT / "scripts/run_deepseek_agentx_regression.py", driver / "scripts")

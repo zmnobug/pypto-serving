@@ -90,6 +90,15 @@ def tokenizer_identity(tokenizer):
     return {"path": str(tokenizer.resolve()), "metadata_sha256": {p.name: sha256(p) for p in files}}
 
 
+def identity_fingerprint(value):
+    """Normalize host paths out of model/tokenizer identities for replay checks."""
+    if isinstance(value, dict):
+        return {key: identity_fingerprint(item) for key, item in value.items() if key != "path"}
+    if isinstance(value, list):
+        return [identity_fingerprint(item) for item in value]
+    return value
+
+
 def activation_preamble(manifest):
     reset = """while IFS= read -r key; do
   case "$key" in

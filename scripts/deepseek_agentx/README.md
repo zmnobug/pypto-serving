@@ -43,6 +43,32 @@ submits the exact `task-submit --timeout 0 --max-time 0` flags and disables its
 matching queue/startup/client watchdogs. Cleanup and explicit fault handling
 remain active.
 
+To replay the exact source and toolchain matrix from an earlier run, pass its
+manifest to a new run. The model and CANN paths may be different, but the model
+and tokenizer metadata must match the frozen manifest:
+
+```bash
+artifacts/regression-driver/bin/python scripts/run_deepseek_agentx_regression.py full \
+  --replay-manifest artifacts/dspark-regression/KNOWN_RUN/manifest.json \
+  --work-root "$PWD" --conda-env zm_pypto \
+  --model /path/to/dsv4-flash-dspark-w8a8 \
+  --cann-root /path/to/Ascend/cann
+```
+
+Compare two retained runs without starting a service:
+
+```bash
+artifacts/regression-driver/bin/python scripts/run_deepseek_agentx_regression.py compare \
+  --baseline artifacts/dspark-regression/KNOWN_RUN \
+  --candidate artifacts/dspark-regression/NEW_RUN
+```
+
+The comparison reports source and toolchain changes, workload/model drift,
+outcome and first-fault changes, and a single changed component as a bisect
+candidate. It deliberately does not claim that a changed component is the root
+cause; both runs must use the same workload and evidence before drawing that
+conclusion.
+
 `--tokenizer` defaults to `--model`. `--port` defaults to 8232. General Python
 packages use the Tsinghua index by default (`--index-url` changes it); the CPU
 Torch wheel and pinned PTOAS wheel come from their respective upstream sources.

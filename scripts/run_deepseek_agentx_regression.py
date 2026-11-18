@@ -13,7 +13,8 @@ import json
 from pathlib import Path
 import sys
 
-from deepseek_agentx.common import PROFILE, RegressionError, load_profile, now, read_json, write_json
+from deepseek_agentx.common import (PROFILE, RegressionError, load_profile, now, read_json, validate_profile,
+                                    write_json)
 
 
 def nonnegative_seconds(value):
@@ -48,6 +49,8 @@ def parser():
     full.add_argument("--cann-root", type=Path, required=True)
     full.add_argument("--port", type=int, default=8232)
     full.add_argument("--index-url", default="https://pypi.tuna.tsinghua.edu.cn/simple")
+    full.add_argument("--replay-manifest", type=Path,
+                      help="Rebuild the exact frozen source/toolchain matrix from a prior manifest")
     full.add_argument(
         "--task-timeout", type=nonnegative_seconds, default=None,
         help="Override task-submit --timeout; 0 waits indefinitely in the queue",
@@ -56,6 +59,11 @@ def parser():
         "--task-max-time", type=nonnegative_seconds, default=None,
         help="Override task-submit --max-time; 0 removes the task runtime limit",
     )
+    compare = sub.add_parser("compare", help="Compare two completed or partial regression runs")
+    compare.add_argument("--baseline", type=Path, required=True)
+    compare.add_argument("--candidate", type=Path, required=True)
+    compare.add_argument("--output", type=Path,
+                         help="JSON output path; defaults to candidate/comparison.json")
     return command
 
 
@@ -93,10 +101,22 @@ def main():
             result = assess(args.run_dir.resolve())
             print(json.dumps(result, indent=2))
             return 0 if result["outcome"] == "PASS_STABILITY" else 1
+        if args.action == "compare":
+            from deepseek_agentx.comparison import compare_runs, render_comparison
+            result = compare_runs(args.baseline.resolve(), args.candidate.resolve())
+            output = args.output.resolve() if args.output else args.candidate.resolve() / "comparison.json"
+            write_json(output, result)
+            render_comparison(output.with_suffix(".md"), result)
+            print(json.dumps(result, indent=2))
+            return 0
         if not 1 <= args.port <= 65535:
             raise ValueError("Port must be between 1 and 65535")
         from deepseek_agentx.engine import run
-        return run(args, load_profile(args.profile))
+        profile = load_profile(args.profile)
+        if args.replay_manifest:
+            frozen = read_json(args.replay_manifest.resolve())
+            profile = validate_profile(frozen.get("profile", {}))
+        return run(args, profile)
     except (RegressionError, ValueError, OSError) as exc:
         print(f"{getattr(exc, 'outcome', 'BLOCKED_SETUP')}: {exc}", file=sys.stderr)
         return 2

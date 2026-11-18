@@ -27,7 +27,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "scripts"))
-from deepseek_agentx import assessment, engine, identity, sources, tasks  # noqa: E402
+from deepseek_agentx import assessment, comparison, engine, identity, sources, tasks  # noqa: E402
 from deepseek_agentx.common import RegressionError, exclusive_lock, load_profile, read_json, write_json  # noqa: E402
 from deepseek_agentx.traffic import observe_traffic  # noqa: E402
 
@@ -295,6 +295,44 @@ def test_server_budget_includes_client_queue_wait(tmp_path):
         load_profile(path)
 
 
+def test_comparison_identifies_single_changed_component_without_claiming_root_cause(tmp_path):
+    baseline, candidate = tmp_path / "baseline", tmp_path / "candidate"
+    for root in (baseline, candidate):
+        root.mkdir()
+        write_json(root / "manifest.json", {
+            "sources": {name: {"commit": f"{name}-old"} for name in comparison.SOURCE_NAMES},
+            "profile": {"agentx": {"duration_seconds": 1800}},
+            "model": {"path": "/model", "metadata_sha256": {"config.json": "same"}},
+            "tokenizer": {"path": "/model", "metadata_sha256": {"tokenizer.json": "same"}},
+        })
+    candidate_manifest = read_json(candidate / "manifest.json")
+    candidate_manifest["sources"]["pypto"]["commit"] = "pypto-new"
+    write_json(candidate / "manifest.json", candidate_manifest)
+    write_json(baseline / "result.json", {"outcome": "PASS_STABILITY", "server_received": 10,
+                                            "server_finished": 10, "actual_prefix_hits": 5})
+    write_json(candidate / "result.json", {"outcome": "FAIL_DEVICE", "server_received": 4,
+                                            "server_finished": 0, "actual_prefix_hits": 0,
+                                            "first_fault": {"outcome": "FAIL_DEVICE", "text": "507018"}})
+    result = comparison.compare_runs(baseline, candidate)
+    assert result["classification"] == "BEHAVIOR_CHANGE_WITH_SOURCE_CHANGES"
+    assert result["likely_changed_components"] == ["pypto"]
+    assert "not proof of root cause" in result["causality"]
+
+
+def test_comparison_rejects_workload_drift_as_incomparable(tmp_path):
+    baseline, candidate = tmp_path / "baseline", tmp_path / "candidate"
+    for root in (baseline, candidate):
+        root.mkdir()
+        write_json(root / "manifest.json", {"sources": {}, "profile": {"server": {"tp": 4}}})
+        write_json(root / "result.json", {"outcome": "PASS_STABILITY"})
+    candidate_manifest = read_json(candidate / "manifest.json")
+    candidate_manifest["profile"]["server"]["tp"] = 8
+    write_json(candidate / "manifest.json", candidate_manifest)
+    result = comparison.compare_runs(baseline, candidate)
+    assert result["classification"] == "INCOMPARABLE_CONFIGURATION"
+    assert not result["likely_changed_components"]
+
+
 def test_unbounded_task_timeout_override_is_applied_to_queue_and_runtime():
     profile = load_profile()
     args = SimpleNamespace(task_timeout=0, task_max_time=0)
@@ -377,6 +415,63 @@ def test_local_checkout_is_frozen_and_original_tree_is_preserved(tmp_path):
     with pytest.raises(RegressionError, match="Source identity changed"):
         sources.snapshot_sources(manifest)
     assert (original / "model.py").read_text() == "VERSION = 1\n"
+
+
+def test_frozen_source_replay_uses_manifest_commits(tmp_path, monkeypatch):
+    commits = {name: f"{name}-sha" for name in ("lib_ci", "serving", "lib", "pypto", "runtime", "agentx")}
+    frozen = {
+        "run_dir": "/old/run",
+        "profile": load_profile(),
+        "ci": {"pypto_ref": "HEAD", "serving_url": "https://serving.invalid.git", "serving_ref": "main",
+                "torch": "torch==2.10.0", "python": "3.10", "files": []},
+        "ptoas": {"version": "0.74", "sha256": "a" * 64, "architecture": "aarch64"},
+        "pto_isa": commits["runtime"], "lib_gitlink": "original-lib",
+        "ci_files": {"versions.env": "versions-hash"},
+        "sources": {name: {"url": f"https://{name}.invalid.git", "commit": commit}
+                     for name, commit in commits.items()},
+    }
+    checkouts = tmp_path / "checkouts"
+    calls = []
+
+    def clone(url, ref, destination):
+        calls.append((url, ref, destination.name))
+        destination.mkdir(parents=True)
+        if destination.name == "pypto":
+            (destination / "runtime").mkdir()
+            (destination / "runtime/pto_isa.pin").write_text("runtime-sha\n")
+            (destination / "toolchain").mkdir()
+            (destination / "toolchain/versions.env").write_text("PTOAS_VERSION=0.74\n")
+        elif destination.name == "serving":
+            (destination / "pypto-lib").mkdir()
+        return ref
+
+    def fake_git(root, *args):
+        root = Path(root)
+        if args == ("rev-parse", "HEAD"):
+            name = "lib" if root.name == "pypto-lib" else root.name
+            return commits["runtime"] if name == "runtime" else commits.get(name, "")
+        return ""
+
+    monkeypatch.setattr(sources, "clone", clone)
+    monkeypatch.setattr(sources, "parse_ci", lambda *_: frozen["ci"])
+    monkeypatch.setattr(sources, "_copy_ci_sources", lambda root, *_: (root / "ci-sources").mkdir(exist_ok=True) or root / "ci-sources")
+    monkeypatch.setattr(sources, "_init_serving_submodules", lambda *_: None)
+    monkeypatch.setattr(sources, "gitlink", lambda root, path: "original-lib" if path == "pypto-lib" else commits["runtime"])
+    monkeypatch.setattr(sources, "network_git", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(sources, "git", fake_git)
+    monkeypatch.setattr(sources, "source_record", lambda path: {
+        "path": str(path), "commit": commits.get(Path(path).name, commits["lib"]), "date": "2026-01-01",
+        "subject": "test", "status": "M pypto-lib" if Path(path).name == "serving" else "",
+        "submodules": "", "diff": "", "staged_diff": ""})
+    monkeypatch.setattr(sources, "sha256", lambda path: "versions-hash" if Path(path).name == "versions.env" else "file-hash")
+    monkeypatch.setattr(sources, "snapshot_sources", lambda manifest: manifest["sources"])
+    result = sources._resolve_frozen(tmp_path, frozen["profile"], frozen)
+    assert [(name, ref) for _, ref, name in calls] == [(name, commits[key]) for name, key in
+                                                       (("lib-ci", "lib_ci"), ("serving", "serving"),
+                                                        ("pypto", "pypto"), ("pypto-lib", "lib"),
+                                                        ("agentx-harness", "agentx"))]
+    assert calls[-1][1] == commits["agentx"]
+    assert result["sources"]["lib"]["commit"] == commits["lib"]
 
 
 def test_fetch_failure_retains_git_diagnostic(tmp_path, monkeypatch):
