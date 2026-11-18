@@ -93,7 +93,8 @@ def tokenizer_identity(tokenizer):
 def identity_fingerprint(value):
     """Normalize host paths out of model/tokenizer identities for replay checks."""
     if isinstance(value, dict):
-        return {key: identity_fingerprint(item) for key, item in value.items() if key != "path"}
+        return {key: identity_fingerprint(item) for key, item in value.items()
+                if key not in {"path", "mtime_ns"}}
     if isinstance(value, list):
         return [identity_fingerprint(item) for item in value]
     return value

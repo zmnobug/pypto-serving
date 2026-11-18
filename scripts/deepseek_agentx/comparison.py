@@ -33,7 +33,8 @@ def _result(root):
 def _without_paths(value):
     if isinstance(value, dict):
         return {key: _without_paths(item) for key, item in value.items()
-                if key not in {"path", "run_dir", "driver_root", "conda_prefix", "conda_sh", "conda_executable"}}
+                if key not in {"path", "mtime_ns", "run_dir", "driver_root", "conda_prefix", "conda_sh",
+                               "conda_executable"}}
     if isinstance(value, list):
         return [_without_paths(item) for item in value]
     return value
