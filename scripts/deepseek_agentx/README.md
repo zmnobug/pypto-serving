@@ -37,6 +37,12 @@ artifacts/regression-driver/bin/python scripts/run_deepseek_agentx_regression.py
   --cann-root /path/to/Ascend/cann
 ```
 
+To wait indefinitely for the 16-device allocation and remove the queue task's
+runtime limit, append `--task-timeout 0 --task-max-time 0`. The runner then
+submits the exact `task-submit --timeout 0 --max-time 0` flags and disables its
+matching queue/startup/client watchdogs. Cleanup and explicit fault handling
+remain active.
+
 `--tokenizer` defaults to `--model`. `--port` defaults to 8232. General Python
 packages use the Tsinghua index by default (`--index-url` changes it); the CPU
 Torch wheel and pinned PTOAS wheel come from their respective upstream sources.

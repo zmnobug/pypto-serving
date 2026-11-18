@@ -295,6 +295,16 @@ def test_server_budget_includes_client_queue_wait(tmp_path):
         load_profile(path)
 
 
+def test_unbounded_task_timeout_override_is_applied_to_queue_and_runtime():
+    profile = load_profile()
+    args = SimpleNamespace(task_timeout=0, task_max_time=0)
+    budgets = engine.task_budgets(profile, args)
+    assert budgets["queue_seconds"] == 0
+    assert budgets["server_seconds"] == 0
+    assert budgets["client_seconds"] == 0
+    assert budgets["startup_seconds"] == 0
+
+
 @pytest.fixture
 def ci_tree(tmp_path):
     root = tmp_path / "lib"

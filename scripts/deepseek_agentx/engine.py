@@ -144,6 +144,21 @@ def process_is_terminal(path):
         return True
 
 
+def task_budgets(profile, args):
+    """Return task-submit/controller limits, preserving the profile by default."""
+    budgets = dict(profile["budgets"])
+    task_timeout = getattr(args, "task_timeout", None)
+    task_max_time = getattr(args, "task_max_time", None)
+    if task_timeout is not None:
+        budgets["queue_seconds"] = task_timeout
+    if task_max_time is not None:
+        budgets["server_seconds"] = task_max_time
+        budgets["client_seconds"] = task_max_time
+        if task_max_time == 0:
+            budgets["startup_seconds"] = 0
+    return budgets
+
+
 def own_processes(root):
     marker = ("DSPARK_REGRESSION_MANIFEST=" + str(root / "manifest.json")).encode()
     found, uncertain = [], []
@@ -193,7 +208,7 @@ def cleanup(root, port, budget):
 
 
 def wait_for(root, task, manifest, scanner, role, server_task=None):
-    budgets = manifest["profile"]["budgets"]
+    budgets = manifest.get("task_budgets", manifest["profile"]["budgets"])
     queued_at, running_at, heartbeat, identity_since = time.monotonic(), None, 0, None
     while True:
         fault = scanner.scan()
@@ -217,10 +232,11 @@ def wait_for(root, task, manifest, scanner, role, server_task=None):
             return
         if state == "unknown":
             raise RegressionError("INCOMPLETE", f"Unknown queue state for {task}: {current['text']}")
-        if running_at is None and time.monotonic() - queued_at > budgets["queue_seconds"]:
+        if (running_at is None and budgets["queue_seconds"] > 0
+                and time.monotonic() - queued_at > budgets["queue_seconds"]):
             raise RegressionError("BLOCKED_QUEUE", f"{role} queue budget exceeded")
         limit = budgets["startup_seconds"] if role == "server" else budgets["client_seconds"]
-        if running_at is not None and time.monotonic() - running_at > limit:
+        if running_at is not None and limit > 0 and time.monotonic() - running_at > limit:
             raise RegressionError("INCOMPLETE", f"{role} execution budget exceeded")
         if role == "server" and state == "running" and healthy(manifest["port"], manifest["profile"]["server"]["model_name"]):
             if identity_since is None:
@@ -296,8 +312,11 @@ def run(args, profile):
     for name in ("environment/workers", "server/ascend", "agentx/report", "jit", "ci-sources"):
         (root / name).mkdir(parents=True, exist_ok=True)
     print(f"Regression artifacts: {root}", flush=True)
-    manifest = {"schema_version": 1, "run_dir": str(root), "profile": profile, "port": args.port}
-    write_json(root / "run.json", {"schema_version": 1, "profile": profile, "mode": "latest-ci", "at": now()})
+    budgets = task_budgets(profile, args)
+    manifest = {"schema_version": 1, "run_dir": str(root), "profile": profile, "port": args.port,
+                "task_budgets": budgets}
+    write_json(root / "run.json", {"schema_version": 1, "profile": profile, "task_budgets": budgets,
+                                    "mode": "latest-ci", "at": now()})
     locks = ExitStack()
     previous_handlers = {}
 
@@ -343,14 +362,17 @@ def run(args, profile):
         server_script, _ = write_scripts(manifest)
         command = "bash " + shlex.quote(str(server_script))
         write_json(root / "server-submission-intent.json", {"command": command})
-        server_task = tasks.submit(root, "server", command, 16, profile["budgets"])
+        server_task = tasks.submit(root, "server", command, 16, budgets)
         scanner = assessment.FaultScanner(root)
         wait_for(root, server_task, manifest, scanner, "server")
-        with observe_traffic(root, args.port, profile["budgets"]["client_seconds"]) as proxy_port:
+        # A task-submit max-time of zero is unbounded; retain a finite socket
+        # timeout so a stalled individual HTTP connection remains diagnosable.
+        observer_timeout = budgets["client_seconds"] or profile["budgets"]["client_seconds"]
+        with observe_traffic(root, args.port, observer_timeout) as proxy_port:
             _, client_script = write_scripts(manifest, proxy_port)
             command = "bash " + shlex.quote(str(client_script))
             write_json(root / "agentx-submission-intent.json", {"command": command})
-            client_task = tasks.submit(root, "agentx", command, None, profile["budgets"])
+            client_task = tasks.submit(root, "agentx", command, None, budgets)
             wait_for(root, client_task, manifest, scanner, "agentx", server_task)
         write_json(root / "finish-reason.json", {"outcome": "COMPLETED", "at": now()})
     except BaseException as exc:

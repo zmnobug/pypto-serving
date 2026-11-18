@@ -16,6 +16,16 @@ import sys
 from deepseek_agentx.common import PROFILE, RegressionError, load_profile, now, read_json, write_json
 
 
+def nonnegative_seconds(value):
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected an integer number of seconds") from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError("seconds must be non-negative")
+    return number
+
+
 def parser():
     command = argparse.ArgumentParser(description=__doc__)
     command.add_argument("--profile", type=Path, default=PROFILE)
@@ -38,6 +48,14 @@ def parser():
     full.add_argument("--cann-root", type=Path, required=True)
     full.add_argument("--port", type=int, default=8232)
     full.add_argument("--index-url", default="https://pypi.tuna.tsinghua.edu.cn/simple")
+    full.add_argument(
+        "--task-timeout", type=nonnegative_seconds, default=None,
+        help="Override task-submit --timeout; 0 waits indefinitely in the queue",
+    )
+    full.add_argument(
+        "--task-max-time", type=nonnegative_seconds, default=None,
+        help="Override task-submit --max-time; 0 removes the task runtime limit",
+    )
     return command
 
 
