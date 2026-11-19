@@ -6,6 +6,8 @@ on:
       - 'scripts/deepseek_agentx/**'
       - 'scripts/run_deepseek_agentx_regression.py'
       - 'tests/regression/deepseek_agentx/**'
+      - 'tests/test_deepseek_dspark_accuracy.py'
+      - 'tests/test_deepseek_v4_accuracy.py'
       - '.github/workflows/deepseek_agentx_regression.yml'
   workflow_dispatch:
     inputs:

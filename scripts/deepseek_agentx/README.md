@@ -102,6 +102,52 @@ Conda config variables and hooks must not restore a previous source path or
 host/worker identity checks require this run's JIT cache without an explicit
 rebuild directory. Build/codegen parallelism is bounded to two jobs.
 
+## Minimal prefix-cache smoke
+
+`tests/test_deepseek_dspark_accuracy.py::test_dspark_http_prefix_cache_minimal`
+starts one fresh K7 server with prefix caching enabled. It sends two fixed
+prompts, A then B: both describe the same lake and bridge, but ask different
+questions. Each generates at most 16 tokens with greedy sampling. A must start
+with a cold prefix; B must reuse at least one aligned 128-token grouped prefix.
+Both HTTP IDs must join uniquely to their own receipt/completion logs, with
+matching usage and a normal nonempty completion. The test also requires the
+fused K7 decode compilation and actual speculation progress markers.
+The small server profile uses max context 8192, max sequences 8 and 128-token
+prefill chunks; the default topology remains 16-card DP4/TP4/EP16. This has its
+own `PASS_PREFIX_CACHE_SMOKE` result and does not produce `PASS_STABILITY`.
+
+Run from the checkout being tested after activating an existing compatible
+service environment and its CANN/toolchain settings. Set the local model and
+the source directory of the runtime installed in that environment:
+
+```bash
+export PYPTO_DSV4_DSPARK_MODEL_DIR=/path/to/dsv4-flash-dspark-w8a8
+export PYPTO_DSPARK_EP_SIZE=16
+export PYPTO_DSV4_STARTUP_TIMEOUT_SECONDS=5400
+export PYPTO_DSV4_OVERALL_TIMEOUT_SECONDS=7200
+DSPARK_RUNTIME_ROOT=/path/to/pypto/runtime
+PREFIX_SMOKE_ARTIFACTS="$PWD/artifacts/prefix-cache-smoke-$(date +%Y%m%d-%H%M%S)"
+printf -v PREFIX_SMOKE_COMMAND 'cd %q && bash %q a2a3 && python -m pytest %q -q -s --basetemp %q' \
+  "$PWD" "$DSPARK_RUNTIME_ROOT/.claude/skills/onboard-arch-precheck/check.sh" \
+  tests/test_deepseek_dspark_accuracy.py::test_dspark_http_prefix_cache_minimal \
+  "$PREFIX_SMOKE_ARTIFACTS/pytest"
+task-submit --device auto --device-num 16 --timeout 0 --max-time 0 \
+  --run "$PREFIX_SMOKE_COMMAND"
+```
+
+The test stops its own server. Its pytest case directory retains
+`prefix-cache-minimal-result.json` (commands, both prompts/responses, IDs and
+hit tokens), `dspark-prefix-cache-minimal-k7-server.log` and `ascend/` CANN logs.
+CPU fixtures in `tests/regression/deepseek_agentx/test_prefix_cache_smoke.py`
+guard against unrelated cache hits, bad boundaries, incomplete completions and
+missing cleanup; they run in the offline CI job. The new NPU case is selected
+explicitly and does not add another server boot to the existing CI guard.
+
+This is a cache execution smoke test. Cached/cold numerical equivalence remains
+`NOT_RUN`, and passing does not guarantee reproduction or prevention of the
+historical 507018 failure. It uses fewer requests than AgentX; model compilation
+and loading still contribute to the total runtime.
+
 ## Version selection and workload
 
 The runner fetches lib's remote default branch and reads its `serving-dspark`
