@@ -213,7 +213,7 @@
 
 - terminal Prefill、两个 Decode step、request terminal 和 capture end 已在同一次 8 卡任务中闭环，runtime coverage 不再缺少 serial prefill。
 - 任务 exit=0，HTTP 返回 200，profile 生成 17 个 DFX 事件。
-- 进程退出时仍出现 `resource_tracker` 的 8 个 leaked shared_memory objects 告警。该告警来自底层 runtime 的 shared-memory 生命周期，尚未完成修复或独立排除，因此 PR5 资源清理验收暂不勾选完成。
+- 进程退出时仍出现 `resource_tracker` 的 8 个 leaked shared_memory objects 告警。初步定位到实际加载的 runtime checkout 中 `simpler/chip_process.py` 的 chip bootstrap mailbox 映射，每个 chip child 一份，数量与告警一致。候选修复需要改为不注册 Python resource tracker 的映射方式，因此属于 runtime/SimplER 侧，PR5 资源清理验收暂不勾选完成。
 
 ### 下一步
 
