@@ -48,6 +48,64 @@ from pypto_serving.serving.server.serving_worker import WorkerProcess
 from ..device_sampling_fakes import _FixedSampler, _ImmediateEosExecutor, _model
 
 
+def test_worker_reports_runtime_prepared_work_or_explicit_gap():
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.executor = SimpleNamespace(
+        describe_prepared_work=lambda batch, prepared: {
+            "status": "observed",
+            "phase": "decode",
+            "request_ids": list(batch.request_ids),
+            "valid_rows": 1,
+            "physical_rows": 4,
+            "padded_rows": 3,
+        }
+    )
+    command = StepCommand(
+        new_requests=[], prefill_requests=[], decode_requests=[],
+        finished_request_ids=[], step_id=5,
+    )
+    batch = SimpleNamespace(request_ids=["req"])
+    prepared = serving_worker._PreparedDecodeWork(
+        prepared=object(), buffer_slot=1, batch=batch,
+    )
+    observed = worker._describe_prepared_work(command, prepared)
+    assert observed["status"] == "observed"
+    assert observed["buffer_slot"] == 1
+    assert observed["valid_rows"] == 1
+
+    unavailable = worker._describe_prepared_work(command, None)
+    assert unavailable["status"] == "unavailable"
+    assert unavailable["reason"] == "runtime_prepare_not_observed"
+
+
+def test_worker_close_clears_request_mirrors_when_executor_close_fails():
+    closed = []
+
+    class Executor:
+        def close(self):
+            closed.append(True)
+            raise RuntimeError("native close failed")
+
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.executor = Executor()
+    worker._constraint_states = {}
+    worker._accepted_output_lengths = {"req": 2}
+    worker._req_cache = {"req": SimpleNamespace()}
+    worker._last_tokens = {"req": [7]}
+    worker._pending_decode_request_counts = {"req": 1}
+    worker._pending_prefill_request_counts = {"req": 1}
+
+    with pytest.raises(RuntimeError, match="native close failed"):
+        worker.close()
+
+    assert closed == [True]
+    assert worker.executor is None
+    assert not worker._req_cache
+    assert not worker._last_tokens
+    assert not worker._pending_decode_request_counts
+    assert not worker._pending_prefill_request_counts
+
+
 def test_step_command_preserves_grouped_cache_metadata_on_preempted_restart():
     core = ReplicaEngineCore.__new__(ReplicaEngineCore)
     core._request_contexts = {}

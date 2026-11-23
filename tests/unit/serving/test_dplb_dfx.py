@@ -94,7 +94,8 @@ def test_capture_preserves_choices_tables_and_rotation(capture, enabled):
         assert observed._group_request_partitions == plain._group_request_partitions
         assert observed._next_group_partition == plain._next_group_partition
     observed.ensure_group_blocks("tiny", 256)
-    observed.release_all_group_requests("long")
+    for request_id in ("long", "short", "incoming", "tiny"):
+        observed.release_all_group_requests(request_id)
     events = records(capture)
     decision = next(e for e in events if e["event"] == "placement_commit" and e["request_id"] == "incoming")
     assert decision["reason"] == ("long_logical_load" if enabled else "request_count")
@@ -894,3 +895,75 @@ def test_cli_rejects_unsupported_dfx_modes(level, profile, error):
 def test_invalid_limits_are_rejected(limits):
     with pytest.raises(ValueError):
         DplbDfxConfig(**limits)
+
+
+def test_capture_with_open_request_is_incomplete_and_exposes_coverage(tmp_path):
+    recorder = DplbDfxRecorder(DplbDfxConfig(level="load"), tmp_path)
+    assert recorder.start("open")
+    recorder.request_fields("live")
+    recorder.stop(reason="requested")
+    assert recorder.close()
+    status = json.loads(recorder.sink.path.with_suffix(".manifest.json").read_text())
+    assert status["open_request_count"] == 1
+    assert status["complete"] is False
+    assert status["runtime_coverage"]["verdict"] == "unavailable"
+
+
+def test_runtime_coverage_counts_prepared_work(tmp_path):
+    recorder = DplbDfxRecorder(DplbDfxConfig(level="load"), tmp_path)
+    assert recorder.start("runtime")
+    recorder.emit("step_plan", step_id=7)
+    recorder.emit(
+        "step_outcome",
+        step_id=7,
+        prepared_work={
+            "status": "observed",
+            "valid_rows": 3,
+            "physical_rows": 8,
+            "padded_rows": 5,
+        },
+    )
+    recorder.stop(reason="requested")
+    assert recorder.close()
+    status = json.loads(recorder.sink.path.with_suffix(".manifest.json").read_text())
+    coverage = status["runtime_coverage"]
+    assert coverage["verdict"] == "complete"
+    assert coverage["planned_steps"] == 1
+    assert coverage["observed_steps"] == 1
+    assert coverage["runtime_observed_steps"] == 1
+    assert coverage["runtime_valid_rows"] == 3
+    assert coverage["runtime_physical_rows"] == 8
+    assert coverage["runtime_padded_rows"] == 5
+
+
+def test_runtime_coverage_marks_capture_end_in_flight_steps_partial(tmp_path):
+    recorder = DplbDfxRecorder(DplbDfxConfig(level="load"), tmp_path)
+    assert recorder.start("in-flight")
+    recorder.emit("step_plan", step_id=11)
+    recorder.stop(reason="requested", in_flight_step_ids=[11])
+    assert recorder.close()
+    status = json.loads(recorder.sink.path.with_suffix(".manifest.json").read_text())
+    coverage = status["runtime_coverage"]
+    assert coverage["verdict"] == "partial"
+    assert coverage["capture_end_in_flight_step_ids"] == [11]
+    assert coverage["missing_step_ids"] == [11]
+
+
+def test_capture_drains_late_step_and_terminal_events(tmp_path):
+    recorder = DplbDfxRecorder(DplbDfxConfig(level="load", drain_timeout=1), tmp_path)
+    assert recorder.start("drain")
+    recorder.request_fields("live")
+    recorder.emit("step_plan", step_id=11)
+    recorder.stop(reason="duration", in_flight_step_ids=[11])
+    assert recorder.capturing
+    recorder.emit(
+        "step_outcome",
+        step_id=11,
+        prepared_work={"status": "observed", "valid_rows": 1},
+    )
+    recorder.terminal("live", "finished_length")
+    assert not recorder.capturing
+    assert recorder.close()
+    status = json.loads(recorder.sink.path.with_suffix(".manifest.json").read_text())
+    assert status["open_request_count"] == 0
+    assert status["runtime_coverage"]["verdict"] == "complete"

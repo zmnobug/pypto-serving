@@ -289,6 +289,14 @@ class PyptoExecutor(ModelExecutor, ABC):
                 return bool(requires(prepared))
         return super().prepared_decode_requires_token(prepared)
 
+    def describe_prepared_work(self, batch, prepared: object) -> dict | None:
+        """Delegate runtime prepared-work metadata to the active runner."""
+        for runner in self._runners.values():
+            describe = getattr(runner, "describe_prepared_work", None)
+            if callable(describe):
+                return describe(batch, prepared)
+        return super().describe_prepared_work(batch, prepared)
+
     def close(self) -> None:
         """Release runtime resources held by registered model runners."""
         for model_id, runner in self._runners.items():

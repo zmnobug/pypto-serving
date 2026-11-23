@@ -93,6 +93,7 @@ class _PendingDecodeOutput:
     buffer_slot: int
     batch: DecodeBatch
     started_ns: int = 0
+    prepared_work: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,7 @@ class _PendingPrefillOutput:
     scheduled: tuple[PrefillRequest, ...]
     pending: object
     buffer_slot: int
+    prepared_work: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,7 @@ class _CompletedStepOutput:
 
     result: StepResult
     buffer_slot: int | None = None
+    prepared_work: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -424,6 +427,83 @@ class WorkerProcess:
             device_thread.join()
             output_thread.join()
 
+    def _describe_prepared_work(
+        self, cmd: StepCommand, prepared: _PreparedDecodeWork | None
+    ) -> dict:
+        """Describe runtime prepared work or publish an explicit gap.
+
+        The worker never derives effective rows from the scheduler command.
+        Unsupported or serial paths retain a structured unavailable record so
+        the offline report can distinguish a missing runtime observation from a
+        zero-row dispatch.
+        """
+        if not isinstance(cmd, StepCommand):
+            return {"status": "unavailable", "reason": "not_a_step_command"}
+        if prepared is None:
+            return {
+                "status": "unavailable",
+                "reason": "runtime_prepare_not_observed",
+                "phase": "mixed" if cmd.prefill_requests and cmd.decode_requests else (
+                    "prefill" if cmd.prefill_requests else "decode"
+                ),
+                "request_ids": [
+                    request.request_id
+                    for request in (*cmd.prefill_requests, *cmd.decode_requests)
+                ],
+            }
+        if prepared.error is not None:
+            return {
+                "status": "unavailable",
+                "reason": "runtime_prepare_failed",
+                "error": prepared.error,
+            }
+        batch = prepared.prefill_batch or prepared.batch
+        plan = prepared.prefill_prepared or prepared.prepared
+        if batch is None or plan is None:
+            return {
+                "status": "unavailable",
+                "reason": "runtime_prepare_not_observed",
+                "phase": "mixed" if cmd.prefill_requests and cmd.decode_requests else (
+                    "prefill" if cmd.prefill_requests else "decode"
+                ),
+            }
+        describe = getattr(self.executor, "describe_prepared_work", None)
+        if not callable(describe):
+            return {
+                "status": "unavailable",
+                "reason": "executor_prepared_work_contract_unavailable",
+            }
+        try:
+            result = describe(batch, plan)
+        except Exception as exc:
+            logger.warning("Prepared-work DFX description failed: %s", exc, exc_info=True)
+            return {
+                "status": "unavailable",
+                "reason": "executor_prepared_work_contract_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        if not isinstance(result, dict):
+            return {
+                "status": "unavailable",
+                "reason": "executor_prepared_work_unavailable",
+            }
+        result = dict(result)
+        result.setdefault("buffer_slot", prepared.buffer_slot)
+        result.setdefault("request_ids", list(getattr(batch, "request_ids", ())))
+        return result
+
+    @staticmethod
+    def _attach_prepared_work(result: StepResult, prepared_work: dict | None) -> StepResult:
+        if not prepared_work:
+            return result
+        return StepResult(
+            new_tokens=result.new_tokens,
+            error=result.error,
+            step_id=result.step_id,
+            num_draft_tokens=result.num_draft_tokens,
+            prepared_work=prepared_work,
+        )
+
     def _device_execution_loop(
         self,
         work_queue: queue.Queue[
@@ -452,6 +532,7 @@ class WorkerProcess:
                 barrier.completed.wait()
                 continue
             assert isinstance(cmd, StepCommand)
+            prepared_work = self._describe_prepared_work(cmd, prepared)
             try:
                 self._wait_for_pending_decode_reclaims(cmd.finished_request_ids)
                 accepted_lengths = getattr(self, "_accepted_output_lengths", {})
@@ -490,6 +571,7 @@ class WorkerProcess:
                     _CompletedStepOutput(
                         StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id),
                         buffer_slot=prepared.buffer_slot if prepared is not None else None,
+                        prepared_work=prepared_work,
                     )
                 )
                 continue
@@ -507,12 +589,14 @@ class WorkerProcess:
                     output_work_queue.put(_PendingPrefillOutput(
                         cmd=cmd, scheduled=tuple(cmd.prefill_requests),
                         pending=pending, buffer_slot=prepared.buffer_slot,
+                        prepared_work=prepared_work,
                     ))
                 except Exception as exc:
                     logger.error("Worker prefill dispatch failed: %s", exc, exc_info=True)
                     output_work_queue.put(_CompletedStepOutput(
                         StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id),
                         buffer_slot=prepared.buffer_slot,
+                        prepared_work=prepared_work,
                     ))
                 continue
             if self._can_split_decode_output(cmd, prepared):
@@ -546,6 +630,7 @@ class WorkerProcess:
                             buffer_slot=prepared.buffer_slot,
                             batch=dispatch_batch,
                             started_ns=started_ns,
+                            prepared_work=prepared_work,
                         )
                     )
                 except Exception as exc:
@@ -554,6 +639,7 @@ class WorkerProcess:
                         _CompletedStepOutput(
                             StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id),
                             buffer_slot=prepared.buffer_slot,
+                            prepared_work=prepared_work,
                         )
                     )
                 continue
@@ -566,6 +652,7 @@ class WorkerProcess:
                 _CompletedStepOutput(
                     result,
                     buffer_slot=prepared.buffer_slot if prepared is not None else None,
+                    prepared_work=prepared_work,
                 )
             )
 
@@ -592,19 +679,21 @@ class WorkerProcess:
                     work.completed.set()
                 continue
             if isinstance(work, _CompletedStepOutput):
-                result = work.result
+                result = self._attach_prepared_work(work.result, work.prepared_work)
                 buffer_slot = work.buffer_slot
             elif isinstance(work, _PendingDecodeOutput):
                 try:
                     result = self._reclaim_pending_decode(work)
                 finally:
                     self._finish_pending_decode_reclaims(work.scheduled)
+                result = self._attach_prepared_work(result, work.prepared_work)
                 buffer_slot = work.buffer_slot
             elif isinstance(work, _PendingPrefillOutput):
                 try:
                     result = self._reclaim_pending_prefill(work)
                 finally:
                     self._finish_pending_prefill_reclaims(work.scheduled)
+                result = self._attach_prepared_work(result, work.prepared_work)
                 buffer_slot = work.buffer_slot
             else:
                 raise TypeError(f"unexpected output work item: {type(work).__name__}")
@@ -1513,6 +1602,14 @@ class WorkerProcess:
             self._constraint_states.clear()
         if hasattr(self, "_accepted_output_lengths"):
             self._accepted_output_lengths.clear()
+        for name in ("_req_cache", "_last_tokens"):
+            mirror = getattr(self, name, None)
+            if mirror is not None:
+                mirror.clear()
+        for name in ("_pending_decode_request_counts", "_pending_prefill_request_counts"):
+            pending = getattr(self, name, None)
+            if pending is not None:
+                pending.clear()
         executor = self.executor
         self.executor = None
         if executor is None:
@@ -1520,7 +1617,15 @@ class WorkerProcess:
 
         close = getattr(executor, "close", None)
         if callable(close):
-            close()
+            try:
+                close()
+            finally:
+                # The mirrors above must not retain request tensors when a
+                # backend close fails partway through native teardown.
+                for name in ("_req_cache", "_last_tokens"):
+                    mirror = getattr(self, name, None)
+                    if mirror is not None:
+                        mirror.clear()
 
     def _sample_result_row(
         self,

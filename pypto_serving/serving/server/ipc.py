@@ -178,6 +178,9 @@ class StepResult(msgspec.Struct, tag="step"):
     # Echoes the originating StepCommand.step_id (pipeline ordering guard).
     step_id: int = 0
     num_draft_tokens: dict[str, int] = msgspec.field(default_factory=dict)
+    # Runtime-prepared work observed before dispatch.  The field is optional so
+    # older workers and serial paths remain wire-compatible.
+    prepared_work: dict = msgspec.field(default_factory=dict)
 
 
 class ReleaseResult(msgspec.Struct, tag="release"):

@@ -3897,6 +3897,120 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 plan = replace(plan, dispatch_inputs=inputs)
             return plan
 
+    def describe_prepared_work(self, batch: DecodeBatch | PrefillBatch, prepared: object) -> dict | None:
+        """Return JSON-safe effective and physical row counts for DPLB DFX.
+
+        The values come from the runner-owned prepared plan.  Host scheduler
+        estimates are intentionally not used here because they cannot see the
+        TP-aligned kernel extents or owner rows.
+        """
+        layout = self._compiled.layout
+        if isinstance(prepared, DSparkPreparedPrefillPlan):
+            inputs = prepared.inputs
+            actual_tokens = [int(value) for value in inputs.actual_tokens]
+            groups = [int(value) for value in inputs.groups]
+            group_valid = [0] * layout.partitions
+            for group, value in zip(groups, actual_tokens, strict=True):
+                group_valid[group] += value
+            physical = int(inputs.physical_tokens)
+            group_rows = [
+                {
+                    "group_id": group,
+                    "valid_rows": valid,
+                    "physical_rows": physical,
+                    "padded_rows": max(0, physical - valid),
+                }
+                for group, valid in enumerate(group_valid)
+            ]
+            request_rows = [
+                {
+                    "request_id": request_id,
+                    "group_id": group,
+                    "valid_rows": valid,
+                    "physical_rows": None,
+                    "padded_rows": None,
+                    "table_extent": {name: len(values) for name, values in blocks.items()},
+                }
+                for request_id, group, valid, blocks in zip(
+                    inputs.request_ids, groups, actual_tokens, prepared.blocks, strict=True
+                )
+            ]
+            return {
+                "status": "observed",
+                "phase": "prefill",
+                "source": type(prepared).__name__,
+                "request_ids": list(inputs.request_ids),
+                "groups": groups,
+                "request_rows": request_rows,
+                "group_rows": group_rows,
+                "valid_rows": sum(actual_tokens),
+                "physical_rows": physical * layout.partitions,
+                "padded_rows": sum(row["padded_rows"] for row in group_rows),
+                "physical_extent": "per_logical_dp_group",
+            }
+
+        if isinstance(prepared, DSparkPreparedDecodePlan):
+            inputs = prepared.dispatch_inputs
+            request_ids = list(prepared.request_ids)
+            groups = [int(value) for value in prepared.groups]
+            owner_ranks = list(inputs.owner_ranks if inputs is not None else prepared.owner_ranks)
+            owner_rows = list(inputs.owner_rows if inputs is not None else prepared.owner_rows)
+            speculative = list(
+                inputs.speculative_flags if inputs is not None
+                else (False,) * len(request_ids)
+            )
+            decode_seq = int(layout.decode_seq)
+            valid_rows_by_rank = [0] * layout.ranks
+            request_rows = []
+            for request_id, group, rank, row, is_speculative, blocks in zip(
+                request_ids, groups, owner_ranks, owner_rows, speculative, prepared.request_blocks, strict=True
+            ):
+                valid = decode_seq if is_speculative else 1
+                if 0 <= rank < layout.ranks:
+                    valid_rows_by_rank[rank] += valid
+                request_rows.append(
+                    {
+                        "request_id": request_id,
+                        "group_id": group,
+                        "owner_rank": int(rank),
+                        "owner_row": int(row),
+                        "valid_rows": valid,
+                        "physical_rows": None,
+                        "padded_rows": None,
+                        "table_extent": {name: len(values) for name, values in blocks.items()},
+                    }
+                )
+            physical_rows = int(layout.ranks * layout.decode_local_batch * decode_seq)
+            valid_rows = sum(valid_rows_by_rank)
+            group_rows = []
+            for group in range(layout.partitions):
+                ranks = range(group * layout.tp_size, (group + 1) * layout.tp_size)
+                valid = sum(valid_rows_by_rank[rank] for rank in ranks)
+                physical = int(layout.tp_size * layout.decode_local_batch * decode_seq)
+                group_rows.append(
+                    {
+                        "group_id": group,
+                        "valid_rows": valid,
+                        "physical_rows": physical,
+                        "padded_rows": max(0, physical - valid),
+                    }
+                )
+            return {
+                "status": "observed",
+                "phase": "decode",
+                "source": type(prepared).__name__,
+                "request_ids": request_ids,
+                "groups": groups,
+                "request_rows": request_rows,
+                "group_rows": group_rows,
+                "valid_rows": valid_rows,
+                "physical_rows": physical_rows,
+                "padded_rows": max(0, physical_rows - valid_rows),
+                "valid_rows_by_rank": valid_rows_by_rank,
+                "physical_extent": "fixed_decode_tile",
+            }
+        return None
+
     def run_prepared_decode(
         self, model: RuntimeModel, batch: DecodeBatch, prepared: object
     ) -> DecodeResult:

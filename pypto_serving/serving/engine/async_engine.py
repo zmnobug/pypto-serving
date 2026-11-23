@@ -581,6 +581,7 @@ class ReplicaEngineCore:
         scheduler_output: SchedulerOutput,
         new_tokens: dict[str, int | list[int]],
         num_draft_tokens: dict[str, int] | None = None,
+        prepared_work: dict | None = None,
         *,
         status: str = "completed",
         error: str | None = None,
@@ -594,6 +595,11 @@ class ReplicaEngineCore:
         if context is None or context["capture_id"] != dfx.capture_id:
             return
         drafts = num_draft_tokens or {}
+        runtime_rows = {
+            row.get("request_id"): row
+            for row in (prepared_work or {}).get("request_rows", [])
+            if isinstance(row, dict) and row.get("request_id") is not None
+        }
         outcomes = []
         for scheduled, identity in zip(scheduler_output.scheduled_requests, context["requests"]):
             request_id = scheduled.request.request_id
@@ -613,6 +619,7 @@ class ReplicaEngineCore:
                     speculative_accepted_tokens=(
                         max(0, returned - 1) if proposed else 0
                     ) if status == "completed" else None,
+                    runtime_prepared_work=runtime_rows.get(request_id),
                 )
             )
         dfx.emit(
@@ -626,6 +633,7 @@ class ReplicaEngineCore:
             dispatch_ordinal=context["dispatch_ordinal"],
             status=status,
             error=error,
+            prepared_work=prepared_work or {},
             requests=outcomes,
         )
 
@@ -737,6 +745,15 @@ class ReplicaEngineCore:
         finally:
             dfx = getattr(self, "_dplb_dfx", None)
             if dfx is not None:
+                # Engine shutdown is a terminal lifecycle boundary.  Requests
+                # that have not reached the normal KV release path still need
+                # an explicit diagnostic terminal event before the writer is
+                # sealed, otherwise a clean process stop appears as an open
+                # request in the capture manifest.
+                for request_id in tuple(
+                    getattr(getattr(self, "scheduler", None), "requests", {})
+                ):
+                    dfx.terminal(request_id, "engine_shutdown")
                 await asyncio.to_thread(dfx.close)
         if reaped:
             logger.info("ReplicaEngineCore stopped")
@@ -805,6 +822,10 @@ class ReplicaEngineCore:
                           max_scheduled_tokens=self.config.max_num_scheduled_tokens,
                           speculative_tokens=self._runtime.num_speculative_tokens,
                           prefix_cache=self.config.enable_prefix_cache),
+            in_flight_step_ids=sorted(
+                sid for sid, context in self._dfx_step_contexts.items()
+                if context["capture_id"] == capture_id
+            ),
             counters_start=self._dfx_counters(),
         )
         if started:
@@ -1351,6 +1372,7 @@ class ReplicaEngineCore:
             scheduler_output,
             new_tokens,
             step_result.num_draft_tokens,
+            prepared_work=step_result.prepared_work,
         )
         with profile_span(
             "scheduler.process_step_output",

@@ -141,6 +141,16 @@ class ModelExecutor(ABC):
         """Return whether dispatch still needs the prior host-sampled token."""
         return True
 
+    def describe_prepared_work(self, batch, prepared: object) -> dict | None:
+        """Describe runtime-prepared rows without reading device outputs.
+
+        Backends may expose effective and physical row counts for their
+        prepared plan.  Returning ``None`` keeps unsupported backends explicit
+        in DPLB diagnostics instead of fabricating a Host estimate.
+        """
+        del batch, prepared
+        return None
+
     @property
     def supports_async_prefill_reclaim(self) -> bool:
         return False
