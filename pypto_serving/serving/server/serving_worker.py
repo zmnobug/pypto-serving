@@ -492,6 +492,30 @@ class WorkerProcess:
         result.setdefault("request_ids", list(getattr(batch, "request_ids", ())))
         return result
 
+    def _describe_last_prefill_work(self, cmd: StepCommand) -> dict | None:
+        """Collect a serial prefill plan after the runner has prepared it."""
+        describe = getattr(self.executor, "describe_last_prefill_work", None)
+        if not callable(describe):
+            return None
+        try:
+            result = describe()
+        except Exception as exc:
+            logger.warning("Serial prefill DFX description failed: %s", exc, exc_info=True)
+            return {
+                "status": "unavailable",
+                "reason": "executor_prefill_work_contract_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        if not isinstance(result, dict):
+            return None
+        result = dict(result)
+        result.setdefault("phase", "prefill")
+        result.setdefault(
+            "request_ids",
+            [request.request_id for request in cmd.prefill_requests],
+        )
+        return result
+
     @staticmethod
     def _attach_prepared_work(result: StepResult, prepared_work: dict | None) -> StepResult:
         if not prepared_work:
@@ -648,6 +672,10 @@ class WorkerProcess:
             except Exception as exc:
                 logger.error("Worker step failed: %s", exc, exc_info=True)
                 result = StepResult(new_tokens={}, error=str(exc), step_id=cmd.step_id)
+            if cmd.prefill_requests:
+                serial_prefill_work = self._describe_last_prefill_work(cmd)
+                if serial_prefill_work is not None:
+                    prepared_work = serial_prefill_work
             output_work_queue.put(
                 _CompletedStepOutput(
                     result,

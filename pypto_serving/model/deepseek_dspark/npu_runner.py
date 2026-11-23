@@ -1550,6 +1550,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self._prefill_prepare_buffers: _DSparkPrefillPrepareBuffers | None = None
         self._prefill_descriptor_slots: list[torch.Tensor] = []
         self._prefill_prepared_device: dict[str, StackedDeviceTensor] = {}
+        self._last_serial_prefill_plan: DSparkPreparedPrefillPlan | None = None
         self._decode_task_args: list[TaskArgs] = []
         self._decode_table_rows: list[dict[tuple[int, str], DecodeTableRows]] = []
         self._default_grammar_args: dict[str, StaticDeviceTensor] = {}
@@ -3066,6 +3067,22 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             else:
                 inputs = self.prepare_prefill_inputs(model, batch)
                 self._stage_prefill_inputs(inputs, task_args=task_args)
+                self._last_serial_prefill_plan = DSparkPreparedPrefillPlan(
+                    buffer_slot=buffer_slot,
+                    inputs=inputs,
+                    request_ids=tuple(batch.request_ids),
+                    chunk_starts=tuple(batch.chunk_starts),
+                    chunk_lens=tuple(batch.chunk_lens),
+                    prompt_lens=tuple(batch.prompt_lens),
+                    token_ids=tuple(int(token) for token in batch.token_ids.tolist()),
+                    groups=tuple(batch.cache_partitions),
+                    blocks=tuple(
+                        self._normalize_group_block_ids(
+                            batch.block_ids_by_group,
+                            actual_batch=len(batch.request_ids),
+                        )
+                    ),
+                )
             if self._compiled.prefill_capture is not None:
                 self._grant_prefill_generations(inputs.request_ids)
                 self._stage_prefill_capture_descriptors(inputs, buffer_slot=buffer_slot)
@@ -4010,6 +4027,14 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 "physical_extent": "fixed_decode_tile",
             }
         return None
+
+    def describe_last_prefill_work(self) -> dict | None:
+        """Describe the most recent synchronous prefill prepare once."""
+        prepared = self._last_serial_prefill_plan
+        self._last_serial_prefill_plan = None
+        if prepared is None:
+            return None
+        return self.describe_prepared_work(None, prepared)
 
     def run_prepared_decode(
         self, model: RuntimeModel, batch: DecodeBatch, prepared: object

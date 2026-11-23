@@ -151,6 +151,10 @@ class ModelExecutor(ABC):
         del batch, prepared
         return None
 
+    def describe_last_prefill_work(self) -> dict | None:
+        """Return metadata from the most recent serial prefill prepare."""
+        return None
+
     @property
     def supports_async_prefill_reclaim(self) -> bool:
         return False

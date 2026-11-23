@@ -78,6 +78,35 @@ def test_worker_reports_runtime_prepared_work_or_explicit_gap():
     assert unavailable["reason"] == "runtime_prepare_not_observed"
 
 
+def test_worker_can_collect_serial_prefill_work_after_execution():
+    worker = WorkerProcess.__new__(WorkerProcess)
+    worker.executor = SimpleNamespace(
+        describe_last_prefill_work=lambda: {
+            "status": "observed",
+            "phase": "prefill",
+            "valid_rows": 4,
+            "physical_rows": 8,
+            "padded_rows": 4,
+        }
+    )
+    command = StepCommand(
+        new_requests=[],
+        prefill_requests=[PrefillRequest("req", [1, 2, 3, 4], 0, [])],
+        decode_requests=[],
+        finished_request_ids=[],
+        step_id=6,
+    )
+    observed = worker._describe_last_prefill_work(command)
+    assert observed == {
+        "status": "observed",
+        "phase": "prefill",
+        "valid_rows": 4,
+        "physical_rows": 8,
+        "padded_rows": 4,
+        "request_ids": ["req"],
+    }
+
+
 def test_worker_close_clears_request_mirrors_when_executor_close_fails():
     closed = []
 

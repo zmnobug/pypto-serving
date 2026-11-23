@@ -297,6 +297,14 @@ class PyptoExecutor(ModelExecutor, ABC):
                 return describe(batch, prepared)
         return super().describe_prepared_work(batch, prepared)
 
+    def describe_last_prefill_work(self) -> dict | None:
+        """Delegate serial prefill metadata from the active runner."""
+        for runner in self._runners.values():
+            describe = getattr(runner, "describe_last_prefill_work", None)
+            if callable(describe):
+                return describe()
+        return super().describe_last_prefill_work()
+
     def close(self) -> None:
         """Release runtime resources held by registered model runners."""
         for model_id, runner in self._runners.items():
