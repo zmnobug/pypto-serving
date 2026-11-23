@@ -199,3 +199,23 @@
 - 补 terminal prefill 的 runtime prepared-work 描述，使同一 capture 的 coverage 从 `partial` 提升到 `complete`。
 - 刷新 M3 离线报告，纳入 valid/physical/padded rows 和 open-request/terminal 结果。
 - 再执行 DFX off/load 开销与现有 DPLB 策略 off/on 受控对照，进入 PR6。
+
+## 2026-11-23（PR5 serial prefill 收尾复核）
+
+### 已完成
+
+- 在 `feat/dplb-dfx-pr5-runtime-wrapup` 分支补齐 serial prefill 的 prepared-work 观测。worker 在同步 prefill 执行后从 executor/DSpark runner 取回实际计划，并写入统一的 `StepResult.prepared_work`。
+- `zm_pypto` 环境下 PR5 相关 Serving 回归扩大到 125 项，全部通过。Python 编译检查和 `git diff --check` 通过。
+- 新提交 `f1581a3` 已记录 serial prefill 观测，叠加前置 runtime 收尾提交 `fde8269`。
+- NPU 任务 `task_20261123_204936_10074416772` 的 manifest 已达到 `complete=true`、`open_request_count=0`，runtime coverage 为 `complete`。3 个 step 均为 observed，累计 `valid_rows=20`、`physical_rows=2056`、`padded_rows=2036`。
+
+### 当前效果
+
+- terminal Prefill、两个 Decode step、request terminal 和 capture end 已在同一次 8 卡任务中闭环，runtime coverage 不再缺少 serial prefill。
+- 任务 exit=0，HTTP 返回 200，profile 生成 17 个 DFX 事件。
+- 进程退出时仍出现 `resource_tracker` 的 8 个 leaked shared_memory objects 告警。该告警来自底层 runtime 的 shared-memory 生命周期，尚未完成修复或独立排除，因此 PR5 资源清理验收暂不勾选完成。
+
+### 下一步
+
+- 继续确认底层 runtime shared-memory 告警的实际 owner 和清理入口，必要时提交 runtime 侧最小修复并用同一命令重跑。
+- 清理问题闭环后刷新 M3 离线报告，再进入 PR6 的 DFX 开销和 DPLB off/on 受控对照。
