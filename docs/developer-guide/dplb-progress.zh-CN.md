@@ -219,3 +219,25 @@
 
 - 继续确认底层 runtime shared-memory 告警的实际 owner 和清理入口，必要时提交 runtime 侧最小修复并用同一命令重跑。
 - 清理问题闭环后刷新 M3 离线报告，再进入 PR6 的 DFX 开销和 DPLB off/on 受控对照。
+
+## 2026-11-24（M3 报告刷新与 shared-memory 遗留登记）
+
+### 已完成
+
+- 使用 NPU 任务 `task_20261123_204936_10074416772` 刷新 PR5 r6 的 M3 JSON/Markdown 报告，报告目录为 `artifacts/dplb-pr5-runtime/20261123-pr5-runtime-r6/m3-report/`。
+- 报告串联 Serving 请求、Host profile invocation、scheduled-load snapshot 和 8 个 rank 的 runtime raw records。
+- 结果为 HTTP 200，prompt 4、输出 2；profile 69 个事件、3 个 invocation；SWA 2 层、CSA 21 层、HCA 20 层。
+- scheduled-load 17 个事件全部写入，manifest `complete=true`、`open_request_count=0`。Serving runtime coverage 为 `complete`，`valid_rows=20`、`physical_rows=2056`、`padded_rows=2036`。
+- 8 个 rank 共读取 864680 条有效 AICore raw records。group 0 busy union max 为 84903.72µs，group 1 为 24997.32µs。
+
+### 当前效果
+
+- 现在已经有一份可以展示整体链路的 M3 报告，能够说明一次请求如何经过 placement、scheduled work、Host invocation、runtime rank/task 和逻辑 DP 组。
+- runtime 设备时间仍为 observed，raw 文件缺少 retained-run coverage envelope，因此通信、MoE、等待和 full-step 仍未计算。
+- shared-memory 告警已登记为后续 runtime/SimplER 遗留项。它暂不阻塞整体效果汇报，PR5 资源收尾仍保留待办。
+
+### 下一步
+
+- 基于这份报告设计 DFX off、load 和 detailed timing 的开销对照。
+- 继续补齐 Issue #325 要求的 TTFT、吞吐、token 间隔、idle/wait 和 full-step 归因。
+- 后续单独修复 shared-memory 清理并用同一 NPU 任务复跑。
