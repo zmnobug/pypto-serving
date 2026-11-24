@@ -241,3 +241,77 @@
 - 基于这份报告设计 DFX off、load 和 detailed timing 的开销对照。
 - 继续补齐 Issue #325 要求的 TTFT、吞吐、token 间隔、idle/wait 和 full-step 归因。
 - 后续单独修复 shared-memory 清理并用同一 NPU 任务复跑。
+
+## 全部进展汇总（截至 2026-11-24）
+
+### 已完成的开发工作
+
+- 以 PR #336 的 grouped DPLB 策略为前置基线，完成 Host placement DFX，记录分组选择、容量、Prefix 命中、reservation、adopt、rollback、释放和请求终态。
+- 完成 scheduled-load snapshot，并建立 Serving → worker → runner → L3 invocation 的跨层关联，能够追踪 Step、invocation、执行槽位、pipeline generation、阶段和 token 信息。
+- 完成 M3 离线分析报告，能够汇总 placement、scheduled-load、Host invocation、runtime rank/task、DP 组时间和 coverage 状态，已生成 JSON 和中文版 Markdown 报告。
+- 完成 M4 P2 真实 fused L3 的语义 sidecar 和 runtime identity adapter，能够识别 attention block、SWA、CSA、HCA 以及 rank-local runtime 记录。
+- 完成 PR5 runtime 收尾的主要代码，包括 serial prefill prepared-work、runtime coverage verdict、有效行/物理行/padding 行区分、request terminal、profile stop 顺序、capture end 和 worker 请求引用清理。
+
+### PR 状态
+
+- **PR #336**：外部前置策略依赖，负责 grouped DPLB 策略，仍需跟进上游合入和基线复验。
+- **PR #347（PR1）**：M1 Host placement DFX 已完成，当前需要完成 Draft 评审和合入。
+- **PR #358（PR2）**：M2 scheduled-load 和 invocation bridge 已完成主要开发，当前为 Draft，后续需要完成评审和验收收口。
+- **PR3**：M3 离线分析报告已有首版和刷新版，Issue 完整验收项仍未全部补齐。
+- **PR #359（PR4）**：M4 P2 语义 sidecar 和 runtime identity adapter 已完成 observed 级验证，逐类成本及完整 coverage 仍待补齐。
+- **PR5**：runtime 收尾代码已在本地分支 `feat/dplb-dfx-pr5-runtime-wrapup` 完成主要实现，shared-memory 清理问题闭环后再完成最终验收和正式提交。
+- **PR6**：第一轮效果矩阵已启动并完成，后续需要重复实验、补齐正式开销指标和 Issue 验收项，不新增策略公式。
+
+### 当前验证结果
+
+- `zm_pypto` 环境下 PR5 相关 Serving 回归共 **125 项通过**，Python 编译检查和 `git diff --check` 通过。
+- 8 卡 NPU 任务 `task_20261123_204936_10074416772` 使用 `--max-time 0 --timeout 0` 完成，任务 exit=0，服务返回 HTTP 200。
+- 同一次采集中生成 **69 个 profile 事件、3 个 invocation、17 个 scheduled-load 事件**，8 个 rank 共读取 **864680 条有效 AICore raw records**。
+- manifest 为 `complete=true`、`open_request_count=0`，runtime coverage 为 `complete`，累计 `valid_rows=20`、`physical_rows=2056`、`padded_rows=2036`。
+- 已能形成从 placement 决策、scheduled work、Host invocation 到 runtime rank/task 和 DP 组时间的完整展示链路。当前设备时间属于 observed 结果，group 0 busy union max 为 **84903.72µs**，group 1 为 **24997.32µs**。
+
+### 尚未完成的问题
+
+- runtime raw records 还缺少 retained-run coverage envelope，因此通信、MoE、等待、full-step 和完整 duration 归因尚未完成。
+- SWA、CSA、HCA 的逐类成本统计，以及 TTFT、吞吐、token 间隔、Host CPU/RSS、事件量和丢数率等正式开销指标尚未完成。
+- DFX off/load 和现有 DPLB 策略 off/on 已完成第一轮 smoke 对照，正式重复实验、detailed timing、性能归因和最终收益结论仍未完成。
+- NPU 进程退出时仍出现 **8 个 shared-memory 泄漏告警**，初步定位到 runtime/SimplER 的 chip bootstrap mailbox 映射。该问题已登记，当前不阻塞整体效果展示，但会影响 PR5 的最终资源清理验收。
+- off/load 重跑能够正常生成结果，但并发严格文本一致率为 9/10、串行复核为 8/10，当前不能将其表述为硬件输出等价或正式性能验收通过。
+
+### 下一步工作
+
+1. 将当前 PR5 runtime 收尾代码整理为正式 PR，保留 shared-memory 问题的已知遗留说明。
+2. 固定预热和统计窗口，重复 DFX off/load 与 DPLB off/on 对照，补齐正式开销指标。
+3. 在重复实验中统计 TTFT、token 间隔、吞吐、Host CPU/RSS、设备时长和覆盖率，并形成 PR6 报告。
+4. 补齐 Issue #325 的通信、等待、full-step、duration 和完整 coverage 验收项，形成 PR6 报告。
+5. 最后修复 runtime/SimplER shared-memory 清理问题，用同一 8 卡命令复跑并完成 PR5 资源生命周期验收。
+
+## 2026-11-24（第一轮整体效果对照）
+
+### 已完成
+
+- 在统一 8 卡、`zm_pypto`、`--max-time 0 --timeout 0`、并发度 4、10 个请求和 320 个输出 token 的条件下，完成 DPLB off/on × DFX off/load 四组第一轮对照。
+- DPLB off + DFX off：任务 `task_20261124_124108_10302018920`，exit=0，两轮吞吐为 14.340、28.366 token/s。
+- DPLB off + DFX load：任务 `task_20261124_131607_274654923628`，exit=0，两轮吞吐为 18.090、32.777 token/s；两个 capture 的 scheduled-load 分别为 24/24、30/30 配对，Prefix hit 4 次。
+- DPLB on + DFX off：任务 `task_20261124_140209_3695156149`，exit=0，两轮吞吐为 15.177、29.449 token/s。
+- DPLB on + DFX load：任务 `task_20261124_133857_313568624473`，exit=0，两轮吞吐为 17.263、31.095 token/s；两个 capture 的 scheduled-load 分别为 24/24、28/28 配对，Prefix hit 4 次。
+- 四组请求均正常完成，DFX load 两组的 capture 均通过完整性校验，DFX off 两组没有生成 DPLB JSONL capture，符合关闭路径预期。
+
+### 当前效果
+
+- 已完成第一轮整体效果矩阵，证明 DPLB 和 DFX 开关组合都能在当前 Serving 主链路上运行。
+- 本轮 smoke wall-time 结果受首次启动、缓存和请求调度影响，四组吞吐差异方向不稳定，暂时不能据此判断 DPLB 策略收益或 DFX 正式开销。
+- DFX load 两组共生成 4 个完整 capture，DPLB off 组累计 281 个采集事件，DPLB on 组累计 271 个采集事件。
+- shared-memory 告警在 DPLB off 两组中出现，DPLB on 两组本轮未复现，不能据此认定底层资源问题已修复，仍保留为 runtime/SimplER 遗留项。
+
+### 结果文件
+
+- 第一轮 JSON 汇总：`artifacts/dplb-effect/20261124-effect-r7/effect-summary.json`
+- 第一轮中文版报告：`artifacts/dplb-effect/20261124-effect-r7/effect-summary.zh-CN.md`
+
+### 下一步
+
+- 固定预热和统计窗口，重复四组实验至少两到三轮，补齐均值、波动、TTFT、ITL、Host CPU/RSS 和设备时长。
+- 将 DFX off/load 事件量、丢数率、coverage 和请求指标写入 PR6 正式报告。
+- `--dplb-dfx-level timing` 当前仍为保留/拒绝状态，详细设备 timing 暂不纳入本轮正式性能结论。
+- 最后处理 shared-memory 清理并用同一 8 卡命令复跑资源生命周期。
