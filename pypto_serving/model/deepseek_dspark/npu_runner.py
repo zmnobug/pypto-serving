@@ -26,6 +26,7 @@ from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 from enum import IntEnum, IntFlag
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -1528,6 +1529,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         self.cache_metadata = DSparkCacheMetadataBuilder(layout=compiled.layout)
         self._init_l3_dispatch(stacked=True)
         self._decode_run_config: Any = None
+        self._dplb_device_capture_dir: Path | None = None
         self._cache_group_specs: tuple[KVCacheGroupSpec, ...] = ()
         self._cache_group_num_blocks: dict[str, int] = {}
         self._decode_device_cache: dict[str, StackedDeviceTensor] | None = None
@@ -1637,11 +1639,18 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
         # generation is useful for diagnosing the fused decode graph itself.
         decode_dep_gen = os.environ.get("PYPTO_DSPARK_ENABLE_DEP_GEN", "0") == "1"
         decode_chip_swimlane = int(os.environ.get("PYPTO_DSPARK_CHIP_SWIMLANE", "0"))
+        capture_dir = os.environ.get("PYPTO_DSPARK_DPLB_TIMING_DIR") if self._compiled.decode_full_fused else None
+        self._dplb_device_capture_dir = Path(capture_dir) if capture_dir else None
         self._decode_run_config = RunConfig(
             ring_heap=decode_ring_heap,
-            enable_dep_gen=decode_dep_gen,
-            enable_chip_swimlane=decode_chip_swimlane,
+            enable_dep_gen=decode_dep_gen if not capture_dir else False,
+            enable_chip_swimlane=max(decode_chip_swimlane, 2) if capture_dir else decode_chip_swimlane,
+            enable_scope_stats=bool(capture_dir),
         )
+        if capture_dir:
+            from pypto_serving.observability.dplb_dspark_timing import enable_single_pass_capture
+
+            enable_single_pass_capture(self._decode_run_config)
         if self.speculative:
             # Markov does not allocate the target's HCA attention partials.
             self._drafter_run_config = RunConfig(
@@ -3966,8 +3975,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 "physical_extent": "per_logical_dp_group",
             }
 
-        if isinstance(prepared, DSparkPreparedDecodePlan):
-            inputs = prepared.dispatch_inputs
+        if isinstance(prepared, (DSparkPreparedDecodePlan, DSparkPreparedDecodeInputs)):
+            inputs = prepared if isinstance(prepared, DSparkPreparedDecodeInputs) else prepared.dispatch_inputs
             request_ids = list(prepared.request_ids)
             groups = [int(value) for value in prepared.groups]
             owner_ranks = list(inputs.owner_ranks if inputs is not None else prepared.owner_ranks)
@@ -3979,9 +3988,9 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
             decode_seq = int(layout.decode_seq)
             valid_rows_by_rank = [0] * layout.ranks
             request_rows = []
-            for request_id, group, rank, row, is_speculative, blocks in zip(
-                request_ids, groups, owner_ranks, owner_rows, speculative, prepared.request_blocks, strict=True
-            ):
+            for index, (request_id, group, rank, row, is_speculative) in enumerate(zip(
+                request_ids, groups, owner_ranks, owner_rows, speculative, strict=True
+            )):
                 valid = decode_seq if is_speculative else 1
                 if 0 <= rank < layout.ranks:
                     valid_rows_by_rank[rank] += valid
@@ -3994,7 +4003,8 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                         "valid_rows": valid,
                         "physical_rows": None,
                         "padded_rows": None,
-                        "table_extent": {name: len(values) for name, values in blocks.items()},
+                        "table_extent": ({name: len(values) for name, values in prepared.request_blocks[index].items()}
+                                         if isinstance(prepared, DSparkPreparedDecodePlan) else None),
                     }
                 )
             physical_rows = int(layout.ranks * layout.decode_local_batch * decode_seq)
@@ -4255,6 +4265,7 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                     self._compiled.decode,
                     *args,
                     config=self._decode_run_config,
+                    invocation=batch.invocation,
                 )
         except RuntimeError as exc:
             raise RuntimeError(
@@ -4262,6 +4273,17 @@ class DSparkModelRunner(L3DispatchMixin, ModelRunner):
                 f"(actual_batch={len(batch.request_ids)})"
             ) from exc
         self._track_pending_decode_dispatch(inputs.buffer_slot, dispatch)
+        capture_dir = self._dplb_device_capture_dir
+        if capture_dir is not None and dispatch.invocation is not None:
+            from pypto_serving.observability.dplb_dspark_timing import retain_capture
+
+            try:
+                retain_capture(
+                    capture_dir, self._compiled.decode.compiled, dispatch.invocation,
+                    self.describe_prepared_work(batch, inputs),
+                )
+            except (OSError, ValueError):
+                logger.exception("Cannot retain DSpark DPLB device capture for step %d", dispatch.invocation.step_id)
         return _DSparkPendingDecode(
             dispatch=dispatch,
             inputs=inputs,

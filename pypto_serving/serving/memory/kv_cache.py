@@ -1849,7 +1849,7 @@ class KvCacheManager:
         self._group_request_partitions.pop(request_id, None)
         self._group_request_tokens.pop(request_id, None)
         self._maintain_group_checkpoints()
-        if assigned_partition is not None and self._dfx_active():
+        if assigned_partition is not None and self._dfx_lifecycle_active(request_id):
             self.dplb_dfx.emit(
                 "owner_change", **self.dplb_dfx.request_fields(request_id), action="released",
                 group_id=assigned_partition, logical_tokens=logical_tokens, reason=reason,
@@ -1859,7 +1859,10 @@ class KvCacheManager:
             self.dfx_terminal(request_id, reason)
 
     def _dfx_active(self) -> bool:
-        return self.dplb_dfx is not None and self.dplb_dfx.capturing
+        return self.dplb_dfx is not None and self.dplb_dfx.accepting_new_events
+
+    def _dfx_lifecycle_active(self, request_id: str) -> bool:
+        return self.dplb_dfx is not None and self.dplb_dfx.captures_request_lifecycle(request_id)
 
     def _dfx_policy(self) -> dict:
         return dict(name="deepinfer_count_length" if self.enable_dplb else "count_rotating",
@@ -1926,11 +1929,12 @@ class KvCacheManager:
                 self._dfx_owner(request_id, "baseline", partition)
 
     def dfx_terminal(self, request_id: str, reason: str) -> None:
-        if self._dfx_active():
+        if self._dfx_lifecycle_active(request_id):
             self.dplb_dfx.terminal(request_id, reason)
 
     def dfx_reservation(self, reservation: GroupCacheReservation, action: str) -> None:
-        if self._dfx_active():
+        if self._dfx_active() or (action in {"released", "quarantined"}
+                                  and self._dfx_lifecycle_active(reservation.request_id)):
             self.dplb_dfx.emit(
                 "reservation_change", **self.dplb_dfx.request_fields(reservation.request_id),
                 reservation_id=reservation.reservation_id, action=action,

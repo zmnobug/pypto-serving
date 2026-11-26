@@ -223,10 +223,6 @@ class DplbDfxRecorder:
     No worker command mirrors or device durations are claimed by this collector.
     """
 
-    _LATE_EVENTS = frozenset({
-        "step_outcome", "request_terminal", "owner_change", "reservation_change",
-    })
-
     def __init__(self, config: DplbDfxConfig, output: Path, replica: int = 0):
         self.config = config
         self.output = Path(output)
@@ -279,6 +275,15 @@ class DplbDfxRecorder:
         with self._lock:
             return (not self.capturing and self.config.level != "off"
                     and self._pending_end is None and (self.sink is None or self.sink.done.is_set()))
+
+    @property
+    def accepting_new_events(self) -> bool:
+        with self._lock:
+            return self.capturing and self._active
+
+    def captures_request_lifecycle(self, request_id: str) -> bool:
+        with self._lock:
+            return self.capturing and (self._active or request_id in self._requests)
 
     def start(self, capture_id: str | None = None, **metadata) -> bool:
         with self._lock:
@@ -336,9 +341,10 @@ class DplbDfxRecorder:
 
     def emit(self, event: str, *, expected_capture_id: str | None = None, **fields) -> bool:
         with self._lock:
-            if (not (self._active or (self._draining and event in self._LATE_EVENTS))
-                    or self.sink is None
+            if (self.sink is None
                     or (expected_capture_id is not None and expected_capture_id != self.capture_id)):
+                return False
+            if not self._active and not (self._draining and self._is_pending_event(event, fields)):
                 return False
             self._sequence += 1
             payload = dict(
@@ -360,6 +366,21 @@ class DplbDfxRecorder:
                 if event == "step_outcome":
                     self._maybe_complete_drain()
             return written
+
+    def _emit(self, event: str, **fields) -> bool:
+        """Emit an event while the profile-control lifecycle owns the lock."""
+        return self.emit(event, **fields)
+
+    def _is_pending_event(self, event: str, fields: dict) -> bool:
+        if event == "step_outcome":
+            return fields.get("step_id") in self._draining_step_ids
+        if fields.get("request_id") not in self._requests:
+            return False
+        if event == "request_terminal":
+            return True
+        if event == "owner_change":
+            return fields.get("action") == "released"
+        return event == "reservation_change" and fields.get("action") in {"released", "quarantined"}
 
     def _record_coverage(self, event: str, fields: dict) -> None:
         """Track runtime coverage without making the capture path blocking."""
@@ -422,8 +443,6 @@ class DplbDfxRecorder:
                 drain_pending_step_ids=sorted(self._draining_step_ids),
                 **self._drain_fields,
             )
-            )
-        )
 
     def _coverage_snapshot(self, open_request_count: int) -> dict:
         planned = int(self._coverage.get("planned_steps", 0))
@@ -453,6 +472,9 @@ class DplbDfxRecorder:
         with self._lock:
             state = self._requests.get(request_id)
             if state is None:
+                if not self._active:
+                    return dict(request_id=request_id, request_uid=None, admission_epoch=None,
+                                identity_status="outside_capture")
                 if len(self._requests) >= self.config.max_requests:
                     self._untracked_requests += 1
                     return dict(
@@ -469,7 +491,7 @@ class DplbDfxRecorder:
                     identity_status="preexisting" if preexisting else "captured",
                 )
                 self._requests[request_id] = state
-            if acquire:
+            if acquire and self._active:
                 state["admission_epoch"] += 1
             return dict(state)
 
@@ -487,6 +509,21 @@ class DplbDfxRecorder:
 
     def _end_collection(self, **fields) -> dict:
         self._active = False
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        final_fields = dict(
+            ended_ns=time.monotonic_ns(),
+            untracked_requests=self._untracked_requests,
+            open_request_count=len(self._requests),
+            runtime_coverage=self._coverage_snapshot(len(self._requests)),
+            **fields,
+        )
+        self._requests.clear()
+        return final_fields
+
+    def _seal(self, reason: str, **fields) -> None:
+        self._active = False
         self._draining = False
         self._draining_step_ids.clear()
         if self._timer is not None:
@@ -502,9 +539,6 @@ class DplbDfxRecorder:
             runtime_coverage=self._coverage_snapshot(len(self._requests)),
             **fields,
         )
-        self._active = False
-        self._draining = False
-        self._draining_step_ids.clear()
         self._requests.clear()
         self._drain_stop_reason = None
         self._drain_fields = {}
@@ -519,12 +553,13 @@ class DplbDfxRecorder:
             if expected_capture_id is not None and expected_capture_id != self.capture_id:
                 return
             if self._active:
+                pending = self._planned_step_ids - self._observed_step_ids
+                if "in_flight_step_ids" in fields:
+                    pending.intersection_update(fields["in_flight_step_ids"])
+                fields["in_flight_step_ids"] = sorted(pending)
                 self.emit("capture_end", reason=reason, **fields)
-                in_flight = fields.get("in_flight_step_ids", ())
                 self._active = False
-                self._draining_step_ids = {
-                    value for value in in_flight if type(value) is int
-                }
+                self._draining_step_ids = pending
                 if self._requests or self._draining_step_ids:
                     self._draining = True
                     self._drain_stop_reason = reason
@@ -570,14 +605,25 @@ class DplbDfxRecorder:
     def close(self, *, reason: str = "shutdown", timeout: float = 2.0) -> bool:
         self.stop(reason=reason)
         if self._draining:
-            self._drain_complete.wait(timeout=max(0.0, timeout))
             with self._lock:
-                if self._draining:
+                drain_reason = self._drain_stop_reason or reason
+                if drain_reason == "shutdown":
+                    self._requests.clear()
+                    self._draining_step_ids.clear()
                     self._seal(
-                        self._drain_stop_reason or reason,
-                        drain_timeout=True,
-                        drain_pending_step_ids=sorted(self._draining_step_ids),
+                        drain_reason,
+                        drain_pending_step_ids=[],
                         **self._drain_fields,
                     )
+            if drain_reason != "shutdown":
+                self._drain_complete.wait(timeout=max(0.0, timeout))
+                with self._lock:
+                    if self._draining:
+                        self._seal(
+                            drain_reason,
+                            drain_timeout=True,
+                            drain_pending_step_ids=sorted(self._draining_step_ids),
+                            **self._drain_fields,
+                        )
         sink = self.sink
         return sink is None or sink.close(timeout)

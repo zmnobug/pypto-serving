@@ -220,6 +220,7 @@ class L3DispatchMixin:
         callable_spec: Any,
         *args: Any,
         config: Any = None,
+        invocation: DispatchInvocation | None = None,
     ) -> PendingL3Dispatch:
         """Submit one L3 program and transfer argument ownership to its handle.
 
@@ -227,7 +228,13 @@ class L3DispatchMixin:
         hand the per-dispatch uploads to the pending handle so they are freed
         only after ``wait()`` reclaims the outputs.
         """
-        span_args = self._callable_span_args(callable_spec)
+        if invocation is None:
+            invocation = getattr(self, "_invocation_context", None)
+        span_args = {
+            "aicpu_thread_num": callable_spec.aicpu_thread_num,
+            **(invocation.as_profile_args() if invocation is not None else {}),
+            **self._semantic_span_args(callable_spec),
+        }
         if callable_spec.block_dim is not None:
             span_args["block_dim"] = callable_spec.block_dim
         run_config = self._l3_run_config if config is None else config
@@ -263,7 +270,7 @@ class L3DispatchMixin:
             handle=handle,
             uploaded=tuple(uploaded),
             name=callable_spec.name,
-            invocation=getattr(self, "_invocation_context", None),
+            invocation=invocation,
             profile_args=dict(span_args),
         )
 

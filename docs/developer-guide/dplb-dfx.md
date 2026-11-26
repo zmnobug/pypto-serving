@@ -43,7 +43,8 @@ the current capture while any replica is still collecting. Once all replicas
 have stopped collecting, retry start if any previous writer is still finishing.
 A new capture starts with a baseline of existing owners and requests.
 The Host window starts before the ordered worker profile command. An explicit
-stop ends Host observations before sending the stop command. If the Host window
+stop ends Host observations before sending the stop command, and the manifest
+waits for the worker acknowledgement before it is sealed. If the Host window
 ends while a start or stop command is pending, the manifest waits for the worker
 reply. For a coordinated start, it waits for all replicas. A failed start marks
 the coordinated capture's pending manifests with `stop_reason=profile_control_failed`
@@ -53,6 +54,50 @@ A failed stop marks the affected replica's pending manifest the same way.
 
 The duration limit stops only the Host collector, including when no requests
 arrive. Call `/stop_profile` to stop and merge ordinary profiling as usual.
+After the Host window ends, only outcomes for recorded steps still in flight
+and releases or terminal events for tracked requests can drain into that capture.
+The capture end records the pending steps. The next capture gets its own
+baseline for requests that are still live.
+
+## Reproduce the local DSpark NPU kernel source
+
+The local DSpark A2/A3 NPU experiments used the pinned `pypto-lib` sources with
+an additional guard-column fix for `tile.rems` in the decode indexer. To reproduce
+those kernel sources from a fresh clone, run from the Serving repository root:
+
+```bash
+git submodule update --init --recursive
+git -C pypto-lib apply --check ../examples/dfx/dspark-a2a3-decode-indexer.patch
+git -C pypto-lib apply ../examples/dfx/dspark-a2a3-decode-indexer.patch
+```
+
+## DSpark detailed device diagnostic
+
+Set `PYPTO_DSPARK_DPLB_TIMING_DIR` to a fresh output directory before starting
+an onboard DSpark server with the fused decode program. Run a short, bounded
+workload with the profile and Host capture above. The runner retains the
+AICore timing, scheduler timing, runtime scope records and compiled
+orchestration for each decode step under its invocation identity. The
+diagnostic uses the pinned PyPTO runtime's timing pass directly. It runs
+the mutable fused decode once and leaves raw records for offline processing.
+The setting applies for the life of the server and can increase execution
+time and disk use.
+
+Run `python examples/dfx/report_dplb_device.py CASE --output-dir REPORT` with
+`CASE` containing `profile/` and `device/`, or pass the DPLB off and on case
+directories together. The report joins the serving step to the AICore and scope records of
+the same timing run. It merges overlapping device intervals separately on each
+rank, then reports the maximum rank duration per logical DP group. It reports
+dispatch-to-start wait and gaps in the observed device window separately.
+The report can also read `service.json` and before/after snapshots from
+`/metrics/json` stored in `metrics.jsonl`. The paired harness takes these
+snapshots after one single-token warmup and at the end of the measured requests.
+Prepared rows identify empty groups. In mixed steps the decode launch has
+its own row counts and the serving outcome can retain the prefill extents.
+Unsupported compiled layouts, loss in
+scope records, and missing rank data are reported as unavailable. The current
+diagnostic covers the fused DSpark decode attention branches and includes any
+operators executed inside each branch.
 
 ## Record contract (schema version 1)
 

@@ -517,7 +517,7 @@ class ReplicaEngineCore:
     ) -> None:
         """Record the exact Host command submitted for one scheduling step."""
         dfx = getattr(self, "_dplb_dfx", None)
-        if dfx is None or not dfx.capturing:
+        if dfx is None or not dfx.accepting_new_events:
             return
         capture_id = dfx.capture_id
         request_rows = self._dfx_step_request_rows(scheduler_output)
@@ -533,13 +533,10 @@ class ReplicaEngineCore:
                 )} for row in request_rows
             ],
         )
-        if not hasattr(self, "_dfx_step_contexts"):
-            self._dfx_step_contexts = {}
-        self._dfx_step_contexts[step_command.step_id] = context
         stages = {row["stage"] for row in request_rows}
         prefill_lengths = [row["num_new_tokens"] for row in request_rows if row["is_prefill"]]
         decode_lengths = [row["logical_length_after"] for row in request_rows if not row["is_prefill"]]
-        dfx.emit(
+        written = dfx.emit(
             "step_plan",
             expected_capture_id=capture_id,
             view="scheduler_planned",
@@ -574,6 +571,10 @@ class ReplicaEngineCore:
             requests=request_rows,
             submission_status="submitted",
         )
+        if written:
+            if not hasattr(self, "_dfx_step_contexts"):
+                self._dfx_step_contexts = {}
+            self._dfx_step_contexts[step_command.step_id] = context
 
     def _emit_dfx_step_outcome(
         self,
@@ -1284,7 +1285,7 @@ class ReplicaEngineCore:
                 raise
             self._input_queue.put(encoded)
         dfx = getattr(self, "_dplb_dfx", None)
-        if dfx is not None and dfx.capturing:
+        if dfx is not None and dfx.accepting_new_events:
             self._dfx_dispatch_ordinal = getattr(self, "_dfx_dispatch_ordinal", 0) + 1
             self._dfx_dispatch_ordinals[self._step_counter] = self._dfx_dispatch_ordinal
             self._emit_dfx_step_plan(

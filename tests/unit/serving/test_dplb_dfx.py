@@ -14,6 +14,7 @@ import queue
 import threading
 from types import SimpleNamespace
 
+import msgspec
 import pytest
 
 from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
@@ -214,6 +215,10 @@ def test_step_snapshot_records_scheduled_load_and_worker_outcome(capture):
     )
 
     core._emit_dfx_step_plan(scheduler_output, command, dispatch_ordinal=3)
+    capture.stop(in_flight_step_ids=[7])
+    core._emit_dfx_step_plan(scheduler_output, msgspec.structs.replace(command, step_id=8), dispatch_ordinal=4)
+    core._emit_dfx_step_outcome(8, scheduler_output, {"decode": [12]})
+    assert set(core._dfx_step_contexts) == {7}
     core._emit_dfx_step_outcome(
         7,
         scheduler_output,
@@ -221,7 +226,9 @@ def test_step_snapshot_records_scheduled_load_and_worker_outcome(capture):
         {"decode": 2},
     )
 
+    capture.terminal("decode", "finished_length")
     events = records(capture)
+    assert [event["step_id"] for event in events if event["event"] == "step_outcome"] == [7]
     plan = next(event for event in events if event["event"] == "step_plan")
     row = plan["requests"][0]
     assert plan["step_id"] == 7
@@ -952,15 +959,23 @@ def test_runtime_coverage_marks_capture_end_in_flight_steps_partial(tmp_path):
 def test_capture_drains_late_step_and_terminal_events(tmp_path):
     recorder = DplbDfxRecorder(DplbDfxConfig(level="load", drain_timeout=1), tmp_path)
     assert recorder.start("drain")
-    recorder.request_fields("live")
+    manager = cache()
+    manager.dplb_dfx = recorder
+    manager.ensure_group_blocks("live", 16)
     recorder.emit("step_plan", step_id=11)
-    recorder.stop(reason="duration", in_flight_step_ids=[11])
-    assert recorder.capturing
-    recorder.emit(
+    recorder.stop(reason="duration")
+    assert recorder.capturing and not recorder.accepting_new_events
+    manager.ensure_group_blocks("live", 32)
+    manager.ensure_group_blocks("post-stop", 16)
+    manager.release_all_group_requests("post-stop")
+    assert recorder.request_fields("post-stop")["request_uid"] is None
+    assert not recorder.emit("step_outcome", step_id=12)
+    assert recorder.emit(
         "step_outcome",
         step_id=11,
         prepared_work={"status": "observed", "valid_rows": 1},
     )
+    assert not recorder.emit("step_outcome", step_id=11)
     recorder.terminal("live", "finished_length")
     assert not recorder.capturing
     assert recorder.close()
