@@ -13,6 +13,7 @@ The external documentation lives under [`docs/`](docs/index.md). Start with:
 - [CLI Reference](docs/cli-reference/pypto-serving.md)
 - [Models](docs/models/index.md)
 - [GLM-5.3-Flash](docs/models/glm53.md)
+- [DeepSeek + AgentX automatic regression](scripts/deepseek_agentx/README.md)
 
 ## Layout
 
